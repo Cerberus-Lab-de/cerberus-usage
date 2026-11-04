@@ -1,0 +1,21 @@
+{
+  "as_of": "2026-11-04",
+  "unit": "milli-USD per MTok (tokens x rate = nano-USD)",
+  "source": "Anthropic pricing documentation, checked 2026-11-04",
+  "notes": [
+    "Footnote 3: Sonnet 5 at $2/$10 per MTok is now the standard price; the announced increase did not happen.",
+    "Footnote 2: Opus 5.5 and Sonnet 5.5 cache hits are 0.05x base input ($0.20 and $0.10 per MTok).",
+    "Haiku 5.5 is tiered by prompt length (input + cache_read + cache_5m + cache_1h): up to 100000 tokens low tier, above that high tier.",
+    "Fast speed and US-only inference (inference_geo us) are priced differently and are not estimated."
+  ],
+  "models": [
+    { "id": "claude-fable-5",    "input": 10000, "cache_5m": 12500, "cache_1h": 20000, "cache_read": 1000, "output": 50000 },
+    { "id": "claude-opus-5-5",   "input": 4000,  "cache_5m": 5000,  "cache_1h": 8000,  "cache_read": 200,  "output": 20000 },
+    { "id": "claude-opus-5",     "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
+    { "id": "claude-opus-4-8",   "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
+    { "id": "claude-sonnet-5-5", "input": 2000,  "cache_5m": 2500,  "cache_1h": 4000,  "cache_read": 100,  "output": 10000 },
+    { "id": "claude-sonnet-5",   "input": 2000,  "cache_5m": 2500,  "cache_1h": 4000,  "cache_read": 200,  "output": 10000 },
+    { "id": "claude-haiku-5-5",  "max_prompt_tokens": 100000, "input": 100, "cache_5m": 125, "cache_1h": 200, "cache_read": 10, "output": 500 },
+    { "id": "claude-haiku-5-5",  "input": 500, "cache_5m": 625, "cache_1h": 1000, "cache_read": 50, "output": 2500 }
+  ]
+}
