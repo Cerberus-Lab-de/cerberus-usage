@@ -6,3 +6,7 @@ pub mod report;
 pub mod launcher;
 pub mod secrets;
 pub mod worker;
+pub mod format;
+pub mod single_instance;
+pub mod tray;
+pub mod ui;
