@@ -3,14 +3,17 @@
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 
+use crate::analytics::{ApiPoller, ApiStatus, Http};
 use crate::log_scan::{ScanState, load_state, save_state, scan};
 use crate::pricing::PriceTable;
 use crate::report::{Report, build};
+use crate::secrets::SecretStore;
 
 /// Minimum gap between intermediate progress snapshots.
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(200);
@@ -18,13 +21,19 @@ const PROGRESS_THROTTLE: Duration = Duration::from_millis(200);
 /// Default pause between two scans.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone)]
+/// No `Debug` on purpose: it holds the secret store.
+#[derive(Clone)]
 pub struct WorkerConfig {
     pub logs_root: PathBuf,
     pub state_path: PathBuf,
     pub prices_path: PathBuf,
     /// Pause between scans (see [`DEFAULT_INTERVAL`]).
     pub interval: Duration,
+    /// Where the admin key is read from (fresh on every API poll).
+    pub secrets: Arc<dyn SecretStore + Send + Sync>,
+    pub http: Arc<dyn Http + Send + Sync>,
+    /// Pause between API polls (see `analytics::DEFAULT_API_INTERVAL`; raised to at least one minute).
+    pub api_interval: Duration,
 }
 
 /// What the UI gets from the worker. `report` is `None` only while the very
@@ -36,10 +45,12 @@ pub struct Snapshot {
     pub total_files: usize,
     pub scan_error: Option<String>,
     pub updated: DateTime<Local>,
+    /// Real API cost. `None` without an admin key or before the first poll.
+    pub api: Option<ApiStatus>,
 }
 
 impl Snapshot {
-    /// Single construction point, so new fields (e.g. API cost status) are added in one place.
+    /// Single construction point, so new fields are added in one place.
     fn new(
         report: Option<Report>,
         scanned_files: usize,
@@ -52,6 +63,7 @@ impl Snapshot {
             total_files,
             scan_error,
             updated: Local::now(),
+            api: None,
         }
     }
 }
@@ -77,9 +89,10 @@ fn run(cfg: WorkerConfig, notify: Box<dyn Fn() + Send>, tx: Sender<Snapshot>) {
     let mut state = load_state(&cfg.state_path);
     let prices = PriceTable::load(&cfg.prices_path);
     let mut last_report: Option<Report> = None;
+    let mut api = ApiPoller::new(Arc::clone(&cfg.secrets), Arc::clone(&cfg.http), cfg.api_interval);
 
     loop {
-        if !tick(&cfg, &mut state, &prices, &mut last_report, &tx, notify.as_ref()) {
+        if !tick(&cfg, &mut state, &prices, &mut last_report, &mut api, &tx, notify.as_ref()) {
             return;
         }
         std::thread::sleep(cfg.interval);
@@ -92,6 +105,7 @@ fn tick(
     state: &mut ScanState,
     prices: &PriceTable,
     last_report: &mut Option<Report>,
+    api: &mut ApiPoller,
     tx: &Sender<Snapshot>,
     notify: &dyn Fn(),
 ) -> bool {
@@ -145,12 +159,24 @@ fn tick(
     };
     *last_report = Some(report.clone());
 
-    deliver(tx, notify, Snapshot::new(Some(report), files, files, error))
+    // The report goes out first with the last known API figures; the network call (up to
+    // 30 s per request) must not hold it back. A changed API status follows as a second snapshot.
+    let mut snapshot = Snapshot::new(Some(report), files, files, error);
+    snapshot.api = api.current().cloned();
+    if !deliver(tx, notify, snapshot.clone()) {
+        return false;
+    }
+    if api.due(Instant::now()) && api.refresh(Instant::now(), Local::now()) {
+        snapshot.api = api.current().cloned();
+        return deliver(tx, notify, snapshot);
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::testing::{FakeHttp, FakeStore, ok};
     use chrono::Utc;
     use serde_json::json;
     use std::fs;
@@ -200,7 +226,23 @@ mod tests {
             state_path: dir.join("data").join("state.json"),
             prices_path: dir.join("data").join("prices.json"),
             interval,
+            secrets: Arc::new(FakeStore::new(None)),
+            http: Arc::new(FakeHttp::new(vec![])),
+            api_interval: crate::analytics::DEFAULT_API_INTERVAL,
         }
+    }
+
+    /// Config with an admin key and a scripted API; also returns the fake to inspect its requests.
+    fn config_with_api(
+        dir: &Path,
+        admin: Option<&str>,
+        responses: Vec<Result<(u16, String), crate::analytics::NetError>>,
+    ) -> (WorkerConfig, Arc<FakeHttp>) {
+        let http = Arc::new(FakeHttp::new(responses));
+        let mut cfg = config(dir, Duration::from_secs(60));
+        cfg.secrets = Arc::new(FakeStore::new(admin));
+        cfg.http = http.clone();
+        (cfg, http)
     }
 
     fn noop() -> Box<dyn Fn() + Send> {
@@ -333,5 +375,32 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Timeout) => panic!("worker did not exit"),
             }
         }
+    }
+
+    #[test]
+    fn snapshot_has_no_api_without_admin_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, http) = config_with_api(dir.path(), None, vec![]);
+        let rx = spawn_worker(cfg, noop());
+        let (_, snap) = until_report(&rx);
+        assert!(snap.api.is_none());
+        assert_eq!(http.request_count(), 0, "no admin key must mean no HTTP call");
+    }
+
+    #[test]
+    fn delivers_api_status_after_report_when_admin_key_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"data":[],"has_more":false,"next_page":null}"#;
+        let (cfg, http) = config_with_api(dir.path(), Some("sk-ant-admin01-NICHTECHT-1234"), vec![ok(body)]);
+        let rx = spawn_worker(cfg, noop());
+
+        // The report is not held back by the API call: first full snapshot has no status yet.
+        let (_, first) = until_report(&rx);
+        assert!(first.api.is_none());
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let api = second.api.expect("api status missing");
+        assert_eq!((api.today_nano, api.month_nano, api.error), (0, 0, None));
+        assert!(second.report.is_some());
+        assert_eq!(http.request_count(), 1);
     }
 }

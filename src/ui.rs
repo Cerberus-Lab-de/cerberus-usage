@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32, RichText};
 
+use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::format::{
     COST_NOTE, format_count, outcome_message, pause_text, progress_text, unpriced_text,
 };
@@ -246,6 +247,9 @@ impl CerberusApp {
                 state_path: data_dir.join("scan_state.json"),
                 prices_path,
                 interval: DEFAULT_INTERVAL,
+                secrets: Arc::new(KeyringStore::new()),
+                http: Arc::new(UreqHttp::new()),
+                api_interval: DEFAULT_API_INTERVAL,
             },
             Box::new(move || notify_ctx.request_repaint()),
         );
