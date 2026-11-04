@@ -58,9 +58,9 @@ pub struct Report {
     pub month: Bucket,
     /// Requests in the window (now - 5h, now]; exactly 5h old no longer counts.
     pub last_5h: Bucket,
-    /// Sorted by cost descending, ties by name ascending.
+    /// Current local calendar month (same scope as `month`). Sorted by cost descending, ties by name ascending.
     pub by_project: Vec<(String, Bucket)>,
-    /// Sorted by cost descending, ties by name ascending.
+    /// Current local calendar month (same scope as `month`). Sorted by cost descending, ties by name ascending.
     pub by_model: Vec<(String, Bucket)>,
     /// Last 31 local days including today, only days with usage, newest day first.
     pub by_day: Vec<(NaiveDate, Bucket)>,
@@ -95,6 +95,8 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
         }
         if day.year() == today.year() && day.month() == today.month() {
             report.month.add(r, cost);
+            by_project.entry(r.project.clone()).or_default().add(r, cost);
+            by_model.entry(r.model.clone()).or_default().add(r, cost);
         }
         if r.ts > window_start && r.ts <= now_utc {
             report.last_5h.add(r, cost);
@@ -102,8 +104,6 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
         if day >= first_day && day <= today {
             by_day.entry(day).or_default().add(r, cost);
         }
-        by_project.entry(r.project.clone()).or_default().add(r, cost);
-        by_model.entry(r.model.clone()).or_default().add(r, cost);
     }
 
     report.by_project = sorted_by_cost(by_project);
@@ -316,6 +316,24 @@ mod tests {
         assert_eq!(projects, ["dear", "cheap", "alpha", "beta"]);
         let models: Vec<_> = rep.by_model.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(models, ["claude-sonnet-5-5", "claude-opus-5-5", "aaa", "zzz"]);
+    }
+
+    #[test]
+    fn by_project_and_model_cover_current_month_only() {
+        let st = state(
+            vec![
+                rec("old", "2026-10-20T10:00:00Z", "old-model", "old-project"),
+                rec("new", "2026-11-03T10:00:00Z", "new-model", "new-project"),
+            ],
+            vec![],
+        );
+        let rep = build(&st, &PriceTable::embedded(), cet("2026-11-04T12:00:00Z"));
+        let projects: Vec<_> = rep.by_project.iter().map(|(n, _)| n.as_str()).collect();
+        let models: Vec<_> = rep.by_model.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(projects, ["new-project"]);
+        assert_eq!(models, ["new-model"]);
+        // by_day still reaches back 31 days.
+        assert_eq!(rep.by_day.len(), 2);
     }
 
     #[test]
