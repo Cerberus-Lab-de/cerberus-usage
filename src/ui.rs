@@ -57,7 +57,8 @@ pub struct Notice {
     pub text: String,
 }
 
-/// Everything the window shows. Deliberately holds no key material.
+/// Everything the window shows. The only key material is the typed text in `key_input` until it is saved
+/// (or deleted); a stored key is never kept here.
 pub struct AppState {
     pub snapshot: Option<Snapshot>,
     pub mode: ModeDisplay,
@@ -152,6 +153,19 @@ pub fn save_api_key(store: &dyn SecretStore, input: &str) -> Result<(), String> 
 /// Presence check only; the value is dropped immediately.
 fn api_key_stored(store: &dyn SecretStore) -> Option<bool> {
     store.get(Slot::ApiKey).ok().map(|v| v.is_some())
+}
+
+/// Fixed id of the key field, so its widget state can be found again.
+fn key_field_id() -> egui::Id {
+    egui::Id::unique("api-key-field")
+}
+
+/// Empties the key field *and* drops its egui widget state. egui keeps the undo history of a text edit
+/// (also of password fields) in the context for the process lifetime, so clearing only the string would
+/// let Ctrl+Z bring the key back.
+fn wipe_key_field(ctx: &egui::Context, input: &mut String) {
+    input.clear();
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(key_field_id()));
 }
 
 enum LaunchMsg {
@@ -292,10 +306,10 @@ impl CerberusApp {
         self.launch_rx = Some(spawn_launch(mode, confirmed_close, ctx.clone()));
     }
 
-    fn save_key(&mut self) {
+    fn save_key(&mut self, ctx: &egui::Context) {
         match save_api_key(&self.store, &self.state.key_input) {
             Ok(()) => {
-                self.state.key_input.clear();
+                wipe_key_field(ctx, &mut self.state.key_input);
                 self.state.key_stored = Some(true);
                 self.state.notice = Some(Notice { kind: NoticeKind::Info, text: "API-Key gespeichert.".into() });
             }
@@ -305,8 +319,8 @@ impl CerberusApp {
         }
     }
 
-    fn delete_key(&mut self) {
-        self.state.key_input.clear();
+    fn delete_key(&mut self, ctx: &egui::Context) {
+        wipe_key_field(ctx, &mut self.state.key_input);
         match self.store.delete(Slot::ApiKey) {
             Ok(()) => {
                 self.state.key_stored = Some(false);
@@ -506,15 +520,16 @@ impl CerberusApp {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.state.key_input)
+                        .id(key_field_id())
                         .password(true)
                         .hint_text("sk-ant-…")
                         .desired_width(320.0),
                 );
                 if ui.add_enabled(!self.state.key_input.is_empty(), egui::Button::new("Speichern")).clicked() {
-                    self.save_key();
+                    self.save_key(ui.ctx());
                 }
                 if ui.add_enabled(self.state.key_stored == Some(true), egui::Button::new("Löschen")).clicked() {
-                    self.delete_key();
+                    self.delete_key(ui.ctx());
                 }
             });
         });
@@ -710,5 +725,42 @@ mod tests {
         save_api_key(&store, "  sk-ant-api03-fake-test-value\n").unwrap();
         assert_eq!(api_key_stored(&store), Some(true));
         assert_eq!(store.0.borrow().as_deref(), Some("sk-ant-api03-fake-test-value"));
+    }
+
+    /// Runs one frame with the key field; the text lives in `text`.
+    fn key_field_frame(ctx: &egui::Context, text: &mut String, events: Vec<egui::Event>, focus: bool) {
+        let input = egui::RawInput { events, ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            let r = ui.add(egui::TextEdit::singleline(text).password(true).id(key_field_id()));
+            if focus {
+                r.request_focus();
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn wiping_the_key_field_removes_its_undo_history() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        key_field_frame(&ctx, &mut text, vec![], true);
+        key_field_frame(&ctx, &mut text, vec![egui::Event::Text("sk-ant-fake-test-value".into())], true);
+        key_field_frame(&ctx, &mut text, vec![], true);
+        assert_eq!(text, "sk-ant-fake-test-value");
+        assert!(
+            egui::TextEdit::load_state(&ctx, key_field_id()).is_some(),
+            "egui should hold widget state (undo history) for the typed text"
+        );
+
+        wipe_key_field(&ctx, &mut text);
+
+        assert!(text.is_empty());
+        assert!(
+            egui::TextEdit::load_state(&ctx, key_field_id()).is_none(),
+            "widget state must be gone so Ctrl+Z cannot restore the key"
+        );
+        // A following frame starts from scratch: still empty.
+        key_field_frame(&ctx, &mut text, vec![], true);
+        assert!(text.is_empty());
     }
 }
