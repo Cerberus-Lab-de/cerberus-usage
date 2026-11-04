@@ -4,10 +4,13 @@
 //! into nano-USD. The key only travels in the `x-api-key` header and never appears in a URL,
 //! an error text or a `Debug` output.
 //!
-//! Granularity: the API buckets are UTC days (`1d`). The "today" and "month" sums add every
-//! bucket that overlaps the local day / local month, so around the day boundary they can be
-//! off by up to the local UTC offset. The data also lags behind real usage (the docs speak of
-//! up to 4 hours, in rare cases 24 hours), so this is the billed figure, not a live counter.
+//! Granularity: the API buckets are UTC days (`1d`) and each bucket is assigned to a day by its
+//! UTC start date. "Today" is the bucket whose UTC date equals the local date, "month" the
+//! buckets whose UTC date lies in the local month. The figure is therefore per UTC-day label,
+//! not a local-time cut: around midnight, usage of the previous local evening can still sit in
+//! the other label (off by up to the local UTC offset). The data also lags behind real usage
+//! (the docs speak of up to 4 hours, in rare cases 24 hours), so this is the billed figure, not
+//! a live counter.
 
 use std::fmt;
 use std::sync::Arc;
@@ -29,13 +32,18 @@ const PAGE_LIMIT: u32 = 1000;
 const MAX_PAGES: usize = 50;
 /// Longest range one request may cover.
 const MAX_SPAN_DAYS: i64 = 31;
-/// Global request timeout.
+/// Timeout of a single request.
 const TIMEOUT: StdDuration = StdDuration::from_secs(30);
+/// Upper bound for one whole `fetch_cost` call (all chunks and pages). Checked between requests.
+const TOTAL_DEADLINE: StdDuration = StdDuration::from_secs(90);
 
 /// How often the worker asks the API.
 pub const DEFAULT_API_INTERVAL: StdDuration = StdDuration::from_secs(300);
 /// Lower bound for the API interval, whatever the configuration says.
 pub const MIN_API_INTERVAL: StdDuration = StdDuration::from_secs(60);
+/// Pause after `ApiError::NotAvailable` (individual account or missing permission): retrying
+/// every 5 minutes is pointless, but a later upgrade or key change should still be noticed.
+pub const NOT_AVAILABLE_INTERVAL: StdDuration = StdDuration::from_secs(3600);
 
 /// 1 cent = 10^7 nano-USD; the API amount has 6 decimals, so one unit of it is 10 nano-USD.
 const NANO_PER_AMOUNT_UNIT: u64 = 10;
@@ -126,8 +134,11 @@ impl Http for UreqHttp {
 /// Why the API call failed. The texts are shown in the UI and never contain the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
-    /// HTTP 401 or 403: key unknown, not an admin key, or without permission.
+    /// HTTP 401: key unknown or invalid.
     Unauthorized,
+    /// HTTP 403 or 404: the endpoint is not offered to this account (individual account, no admin
+    /// key, or missing permission). A state, not a failure worth retrying every few minutes.
+    NotAvailable,
     /// HTTP 429.
     RateLimited,
     /// Transport failure (fixed category text).
@@ -144,6 +155,9 @@ impl fmt::Display for ApiError {
             ApiError::Unauthorized => {
                 f.write_str("Admin-Key wurde abgelehnt. Bitte den Key in den Einstellungen prüfen.")
             }
+            ApiError::NotAvailable => f.write_str(
+                "Kosten-API nicht verfügbar: nur für Organisations-Konten mit Admin-Key (Einzelkonto oder fehlende Berechtigung)",
+            ),
             ApiError::RateLimited => {
                 f.write_str("Anfragelimit der API erreicht. Der nächste Versuch folgt später.")
             }
@@ -261,6 +275,7 @@ fn request_url(start: DateTime<Utc>, end: DateTime<Utc>, width: &str, page: Opti
 
 /// Fetches all rows of `[start, end)`. `start` is clamped to 2026-01-01, ranges over 31 days
 /// are split into several requests, pages are followed via `next_page`.
+/// The whole call is bounded by 90 s; the deadline is checked between requests.
 pub fn fetch_cost(
     http: &dyn Http,
     key: &str,
@@ -268,12 +283,23 @@ pub fn fetch_cost(
     end: DateTime<Utc>,
     width: &str,
 ) -> Result<Vec<CostRow>, ApiError> {
+    fetch_cost_until(http, key, start, end, width, Instant::now() + TOTAL_DEADLINE)
+}
+
+fn fetch_cost_until(
+    http: &dyn Http,
+    key: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    width: &str,
+    deadline: Instant,
+) -> Result<Vec<CostRow>, ApiError> {
     let start = start.max(earliest_start());
     let mut rows = Vec::new();
     let mut from = start;
     while from < end {
         let to = end.min(from + Duration::days(MAX_SPAN_DAYS));
-        fetch_chunk(http, key, from, to, width, &mut rows)?;
+        fetch_chunk(http, key, from, to, width, deadline, &mut rows)?;
         from = to;
     }
     Ok(rows)
@@ -285,6 +311,7 @@ fn fetch_chunk(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     width: &str,
+    deadline: Instant,
     rows: &mut Vec<CostRow>,
 ) -> Result<(), ApiError> {
     let headers = [
@@ -295,18 +322,24 @@ fn fetch_chunk(
     ];
     let mut page: Option<String> = None;
     for _ in 0..MAX_PAGES {
+        if Instant::now() >= deadline {
+            return Err(ApiError::Network("Zeitüberschreitung".to_string()));
+        }
         let url = request_url(start, end, width, page.as_deref());
         let (status, body) = http
             .get(&url, &headers)
             .map_err(|e| ApiError::Network(e.0))?;
         match status {
             200..=299 => {}
-            401 | 403 => return Err(ApiError::Unauthorized),
+            401 => return Err(ApiError::Unauthorized),
+            403 | 404 => return Err(ApiError::NotAvailable),
             429 => return Err(ApiError::RateLimited),
             other => return Err(ApiError::Server(other)),
         }
-        let parsed: PageDto =
-            serde_json::from_str(&body).map_err(|e| ApiError::Parse(e.to_string()))?;
+        // Fixed text with position only: serde's own message can echo parts of the body.
+        let parsed: PageDto = serde_json::from_str(&body).map_err(|e| {
+            ApiError::Parse(format!("unerwartetes Format (Zeile {}, Spalte {})", e.line(), e.column()))
+        })?;
         for row in parsed.data {
             rows.push(CostRow {
                 start: row.starting_at,
@@ -341,56 +374,44 @@ pub struct ApiStatus {
     pub error: Option<ApiError>,
 }
 
-/// UTC bounds of the local day and month containing `now`, plus the UTC-day range to request.
+/// Which UTC-day buckets count as "today" and "month", and which UTC range to request.
 struct Windows {
-    today: (DateTime<Utc>, DateTime<Utc>),
-    month: (DateTime<Utc>, DateTime<Utc>),
+    /// Local date of `now`; the bucket with this UTC date is "today".
+    today: NaiveDate,
+    /// Buckets whose UTC date lies in this local year and month are "month".
+    month: (i32, u32),
+    /// UTC-day aligned request range `[start, end)`.
     fetch: (DateTime<Utc>, DateTime<Utc>),
 }
 
-fn local_start_utc<Tz: TimeZone>(tz: &Tz, day: NaiveDate) -> DateTime<Utc> {
-    let midnight = day.and_time(NaiveTime::MIN);
-    // A midnight that does not exist (DST gap) starts at the first valid instant after it.
-    tz.from_local_datetime(&midnight)
-        .earliest()
-        .or_else(|| tz.from_local_datetime(&(midnight + Duration::hours(1))).earliest())
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or_else(|| midnight.and_utc())
-}
-
-fn utc_day_start(t: DateTime<Utc>) -> DateTime<Utc> {
-    t.date_naive().and_time(NaiveTime::MIN).and_utc()
-}
-
 fn windows<Tz: TimeZone>(now: &DateTime<Tz>) -> Windows {
-    let tz = now.timezone();
     let today = now.date_naive();
-    let tomorrow = today.succ_opt().unwrap_or(today);
+    let utc_today = now.with_timezone(&Utc).date_naive();
     let month_first = today.with_day(1).unwrap_or(today);
     let next_month_first = if today.month() == 12 {
         NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
     } else {
         NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
     }
-    .unwrap_or(tomorrow);
-
-    let month_start = local_start_utc(&tz, month_first);
-    let now_utc = now.with_timezone(&Utc);
+    .unwrap_or(today);
+    // Last bucket that can matter: the later of the local and the UTC date, but nothing past the
+    // local month (those buckets count for neither figure). This also keeps the span <= 31 days.
+    let last_day = today.max(utc_today);
+    let end_day = last_day.succ_opt().unwrap_or(last_day).min(next_month_first);
     Windows {
-        today: (local_start_utc(&tz, today), local_start_utc(&tz, tomorrow)),
-        month: (month_start, local_start_utc(&tz, next_month_first)),
-        // Both ends must be UTC-day aligned; the end covers the UTC day containing `now`.
+        today,
+        month: (today.year(), today.month()),
         fetch: (
-            utc_day_start(month_start),
-            utc_day_start(now_utc) + Duration::days(1),
+            month_first.and_time(NaiveTime::MIN).and_utc(),
+            end_day.and_time(NaiveTime::MIN).and_utc(),
         ),
     }
 }
 
-/// Sum of all rows whose bucket overlaps `[from, to)`.
-fn sum_overlapping(rows: &[CostRow], (from, to): (DateTime<Utc>, DateTime<Utc>)) -> u64 {
+/// Sum of the rows for which `keep(UTC start date)` holds.
+fn sum_where(rows: &[CostRow], keep: impl Fn(NaiveDate) -> bool) -> u64 {
     rows.iter()
-        .filter(|r| r.start < to && r.end > from)
+        .filter(|r| keep(r.start.date_naive()))
         .fold(0u64, |acc, r| acc.saturating_add(r.amount_nano))
 }
 
@@ -401,7 +422,9 @@ fn fetch_totals<Tz: TimeZone>(
 ) -> Result<(u64, u64), ApiError> {
     let w = windows(now);
     let rows = fetch_cost(http, key, w.fetch.0, w.fetch.1, "1d")?;
-    Ok((sum_overlapping(&rows, w.today), sum_overlapping(&rows, w.month)))
+    let today = sum_where(&rows, |d| d == w.today);
+    let month = sum_where(&rows, |d| (d.year(), d.month()) == w.month);
+    Ok((today, month))
 }
 
 /// Decides when to ask the API and keeps the last known figures.
@@ -439,9 +462,14 @@ impl ApiPoller {
     }
 
     /// True when no HTTP call was made yet or the interval has passed since the last one.
+    /// After `ApiError::NotAvailable` the wait is [`NOT_AVAILABLE_INTERVAL`] instead.
     pub fn due(&self, now: Instant) -> bool {
+        let wait = match self.status.as_ref().map(|s| &s.error) {
+            Some(Some(ApiError::NotAvailable)) => self.interval.max(NOT_AVAILABLE_INTERVAL),
+            _ => self.interval,
+        };
         self.last_attempt
-            .is_none_or(|t| now.saturating_duration_since(t) >= self.interval)
+            .is_none_or(|t| now.saturating_duration_since(t) >= wait)
     }
 
     /// Polls the API if a key exists. Returns true when `current()` changed.
@@ -709,9 +737,22 @@ mod tests {
     }
 
     #[test]
-    fn maps_401_and_403_to_unauthorized() {
+    fn maps_401_to_unauthorized() {
         assert_eq!(fetch_status(401).unwrap_err(), ApiError::Unauthorized);
-        assert_eq!(fetch_status(403).unwrap_err(), ApiError::Unauthorized);
+    }
+
+    #[test]
+    fn maps_403_and_404_to_not_available() {
+        for status in [403, 404] {
+            let err = fetch_status(status).unwrap_err();
+            assert_eq!(err, ApiError::NotAvailable);
+            let text = err.to_string();
+            assert_eq!(
+                text,
+                "Kosten-API nicht verfügbar: nur für Organisations-Konten mit Admin-Key (Einzelkonto oder fehlende Berechtigung)"
+            );
+            assert!(!text.contains("Serverfehler") && !text.contains("HTTP 404"));
+        }
     }
 
     #[test]
@@ -735,12 +776,20 @@ mod tests {
 
     #[test]
     fn errors_never_contain_key() {
+        // A server that echoes the key back in a malformed body must not leak it via Parse.
+        let echo = format!(r#"{{"data":"{KEY}"}}"#);
+        let echo_row = format!(
+            r#"{{"data":[{{"starting_at":"{KEY}","ending_at":"x","cost":{{"amount":"1"}}}}]}}"#
+        );
         let responses: Vec<Result<(u16, String), NetError>> = vec![
             Ok((401, "{}".into())),
             Ok((403, "{}".into())),
+            Ok((404, "{}".into())),
             Ok((429, "{}".into())),
             Ok((500, "{}".into())),
             Ok((200, "not json".into())),
+            Ok((200, echo)),
+            Ok((200, echo_row)),
             Ok((200, r#"{"data":[{"starting_at":"2026-10-03T00:00:00Z","ending_at":"2026-10-04T00:00:00Z","cost":{"amount":"-1"}}]}"#.into())),
             Err(NetError("Server nicht erreichbar".into())),
         ];
@@ -755,9 +804,28 @@ mod tests {
         for (url, _) in http.requests.lock().unwrap().iter() {
             assert!(!url.contains("NICHTECHT"));
         }
-        // The real transport maps errors to fixed category texts only.
-        let ureq_text = net_error(ureq::Error::HostNotFound).to_string();
-        assert!(!ureq_text.contains("api.anthropic.com"));
+    }
+
+    #[test]
+    fn status_debug_never_contains_key_after_success_and_errors() {
+        let echo = format!(r#"{{"data":"{KEY}"}}"#);
+        let (mut p, _http) = poller(
+            Some(KEY),
+            vec![
+                ok(&totals_body()),
+                Ok((401, "{}".into())),
+                Ok((404, "{}".into())),
+                Ok((200, echo)),
+                Err(NetError("Server nicht erreichbar".into())),
+            ],
+        );
+        let t0 = Instant::now();
+        for i in 0..5u32 {
+            p.refresh(t0 + DEFAULT_API_INTERVAL * i, cet("2026-10-15T12:00:00Z"));
+            let status = p.current().expect("status after a poll with key");
+            let shown = format!("{status:?} | {p_error}", p_error = status.error.as_ref().map(|e| e.to_string()).unwrap_or_default());
+            assert!(!shown.contains("NICHTECHT") && !shown.contains("1234"), "poll {i} leaked: {shown}");
+        }
     }
 
     // -- totals and polling ------------------------------------------------------------------
@@ -766,16 +834,17 @@ mod tests {
         utc(s).with_timezone(&FixedOffset::east_opt(3600).unwrap())
     }
 
-    /// Fixture around 2026-10-15 12:00Z in UTC+1.
-    /// Today = 14th 23:00Z..15th 23:00Z, month = Sep 30 23:00Z..Oct 31 23:00Z.
+    /// Fixture for 2026-10-15 12:00Z in UTC+1 (local date Oct 15). Buckets count by UTC start date.
     fn totals_body() -> String {
         page(
             &[
+                // Today: UTC date == local date.
                 row_json("2026-10-15T00:00:00Z", "2026-10-16T00:00:00Z", "m", "100.000000"),
-                // Overlaps today's window by one hour: counted (UTC-day granularity).
+                // Overlaps the local day by one hour, but its UTC date is the 14th: month only.
                 row_json("2026-10-14T00:00:00Z", "2026-10-15T00:00:00Z", "m", "50.000000"),
                 row_json("2026-10-10T00:00:00Z", "2026-10-11T00:00:00Z", "m", "200.000000"),
-                // Ends before the month window starts: not counted.
+                // Overlaps the local month by one hour, but its UTC date is in September: not counted.
+                row_json("2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z", "m", "77.000000"),
                 row_json("2026-09-29T00:00:00Z", "2026-09-30T00:00:00Z", "m", "999.000000"),
             ],
             None,
@@ -790,19 +859,19 @@ mod tests {
     }
 
     #[test]
-    fn totals_sum_overlapping_buckets_for_local_day_and_month() {
+    fn totals_assign_each_utc_day_bucket_by_its_date() {
         let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body())]);
         assert!(p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z")));
 
         let s = p.current().unwrap();
-        assert_eq!(s.today_nano, 1_500_000_000); // $1.50
-        assert_eq!(s.month_nano, 3_500_000_000); // $3.50
+        assert_eq!(s.today_nano, 1_000_000_000); // one UTC day = $1.00, not $1.50
+        assert_eq!(s.month_nano, 3_500_000_000); // 100 + 50 + 200 cents
         assert_eq!(s.error, None);
 
-        // One request covers the month so far, aligned to UTC days.
+        // One request covers the local month so far, aligned to UTC days.
         let requests = http.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].0.contains("starting_at=2026-09-30T00%3A00%3A00Z"), "{}", requests[0].0);
+        assert!(requests[0].0.contains("starting_at=2026-10-01T00%3A00%3A00Z"), "{}", requests[0].0);
         assert!(requests[0].0.contains("ending_at=2026-10-16T00%3A00%3A00Z"), "{}", requests[0].0);
     }
 
@@ -886,17 +955,119 @@ mod tests {
         assert!(fast.due(t0 + StdDuration::from_secs(60)));
     }
 
+    fn at(s: &str, hours: i32) -> DateTime<FixedOffset> {
+        utc(s).with_timezone(&FixedOffset::east_opt(hours * 3600).unwrap())
+    }
+
     #[test]
     fn windows_handle_year_end_and_local_offsets() {
-        let now = utc("2026-12-31T23:30:00Z")
-            .with_timezone(&FixedOffset::east_opt(2 * 3600).unwrap()); // already Jan 1 locally
-        let w = windows(&now);
-        assert_eq!(w.today.0, utc("2026-12-31T22:00:00Z"));
-        assert_eq!(w.today.1, utc("2027-01-01T22:00:00Z"));
-        assert_eq!(w.month.0, utc("2026-12-31T22:00:00Z"));
-        assert_eq!(w.month.1, utc("2027-01-31T22:00:00Z"));
-        assert_eq!(w.fetch.0, utc("2026-12-31T00:00:00Z"));
-        assert_eq!(w.fetch.1, utc("2027-01-01T00:00:00Z"));
+        // UTC+2, already Jan 1 locally while UTC is still Dec 31.
+        let w = windows(&at("2026-12-31T23:30:00Z", 2));
+        assert_eq!(w.today, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
+        assert_eq!(w.month, (2027, 1));
+        assert_eq!(w.fetch, (utc("2027-01-01T00:00:00Z"), utc("2027-01-02T00:00:00Z")));
+
+        // UTC-5: local Oct 14 21:00 while UTC is already Oct 15; both buckets must be fetched.
+        let w = windows(&at("2026-10-15T02:00:00Z", -5));
+        assert_eq!(w.today, NaiveDate::from_ymd_opt(2026, 10, 14).unwrap());
+        assert_eq!(w.month, (2026, 10));
+        assert_eq!(w.fetch, (utc("2026-10-01T00:00:00Z"), utc("2026-10-16T00:00:00Z")));
+
+        // Last local day of the month with UTC already in the next month: range stops at the
+        // month end (31 days), the next month's bucket counts for neither figure.
+        let w = windows(&at("2026-11-01T02:00:00Z", -5));
+        assert_eq!(w.today, NaiveDate::from_ymd_opt(2026, 10, 31).unwrap());
+        assert_eq!(w.fetch, (utc("2026-10-01T00:00:00Z"), utc("2026-11-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn local_date_decides_today_even_across_utc_midnight() {
+        // Local Jan 1 (UTC+2), UTC still Dec 31: the Jan 1 bucket is today and month,
+        // the Dec 31 bucket belongs to the old month and is not counted.
+        let body = page(
+            &[
+                row_json("2027-01-01T00:00:00Z", "2027-01-02T00:00:00Z", "m", "100.000000"),
+                row_json("2026-12-31T00:00:00Z", "2027-01-01T00:00:00Z", "m", "300.000000"),
+            ],
+            None,
+        );
+        let (mut p, _http) = poller(Some(KEY), vec![ok(&body)]);
+        p.refresh(Instant::now(), at("2026-12-31T23:30:00Z", 2));
+        let s = p.current().unwrap();
+        assert_eq!((s.today_nano, s.month_nano), (1_000_000_000, 1_000_000_000));
+    }
+
+    #[test]
+    fn not_available_backs_off_for_60_minutes_then_recovers() {
+        let (mut p, http) = poller(Some(KEY), vec![Ok((404, "{}".into())), ok(EMPTY), ok(EMPTY)]);
+        let t0 = Instant::now();
+        let wall = cet("2026-10-15T12:00:00Z");
+        p.refresh(t0, wall);
+        assert_eq!(p.current().unwrap().error, Some(ApiError::NotAvailable));
+
+        assert!(!p.due(t0 + StdDuration::from_secs(300)), "normal interval must not apply");
+        assert!(!p.due(t0 + NOT_AVAILABLE_INTERVAL - StdDuration::from_secs(1)));
+        assert!(p.due(t0 + NOT_AVAILABLE_INTERVAL));
+
+        // Once the endpoint works again, the 5-minute cadence is back.
+        let t1 = t0 + NOT_AVAILABLE_INTERVAL;
+        p.refresh(t1, wall);
+        assert_eq!(p.current().unwrap().error, None);
+        assert!(!p.due(t1 + StdDuration::from_secs(299)));
+        assert!(p.due(t1 + DEFAULT_API_INTERVAL));
+        assert_eq!(http.request_count(), 2);
+    }
+
+    /// Delegates to `FakeHttp` after sleeping, to exercise the overall deadline.
+    struct SlowHttp {
+        inner: FakeHttp,
+        delay: StdDuration,
+    }
+
+    impl Http for SlowHttp {
+        fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), NetError> {
+            std::thread::sleep(self.delay);
+            self.inner.get(url, headers)
+        }
+    }
+
+    #[test]
+    fn overall_deadline_stops_paging() {
+        let more = page(&[], Some("page_next"));
+        let http = SlowHttp {
+            inner: FakeHttp::new(vec![ok(&more), ok(&more), ok(&more)]),
+            delay: StdDuration::from_millis(60),
+        };
+        let deadline = Instant::now() + StdDuration::from_millis(100);
+        let err = fetch_cost_until(
+            &http,
+            KEY,
+            utc("2026-10-03T00:00:00Z"),
+            utc("2026-10-04T00:00:00Z"),
+            "1d",
+            deadline,
+        )
+        .unwrap_err();
+        assert_eq!(err, ApiError::Network("Zeitüberschreitung".to_string()));
+        let made = http.inner.request_count();
+        assert!((1..3).contains(&made), "expected paging to stop early, made {made} requests");
+    }
+
+    #[test]
+    fn deadline_also_stops_before_the_next_chunk() {
+        // Deadline already over: nothing is requested at all.
+        let http = FakeHttp::new(vec![ok(EMPTY)]);
+        let err = fetch_cost_until(
+            &http,
+            KEY,
+            utc("2026-10-01T00:00:00Z"),
+            utc("2026-11-10T00:00:00Z"),
+            "1d",
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ApiError::Network("Zeitüberschreitung".to_string()));
+        assert_eq!(http.request_count(), 0);
     }
 
     /// Needs a stored admin key and network. Run manually (the maintainer saves the key via the app):

@@ -166,9 +166,14 @@ fn tick(
     if !deliver(tx, notify, snapshot.clone()) {
         return false;
     }
-    if api.due(Instant::now()) && api.refresh(Instant::now(), Local::now()) {
-        snapshot.api = api.current().cloned();
-        return deliver(tx, notify, snapshot);
+    if api.due(Instant::now()) {
+        // Same protection as the scan: a panic in the poll path must not end the worker.
+        let changed = catch_unwind(AssertUnwindSafe(|| api.refresh(Instant::now(), Local::now())))
+            .unwrap_or(false);
+        if changed {
+            snapshot.api = api.current().cloned();
+            return deliver(tx, notify, snapshot);
+        }
     }
     true
 }
@@ -177,6 +182,7 @@ fn tick(
 mod tests {
     use super::*;
     use crate::analytics::testing::{FakeHttp, FakeStore, ok};
+    use crate::analytics::{Http, NetError};
     use chrono::Utc;
     use serde_json::json;
     use std::fs;
@@ -402,5 +408,57 @@ mod tests {
         assert_eq!((api.today_nano, api.month_nano, api.error), (0, 0, None));
         assert!(second.report.is_some());
         assert_eq!(http.request_count(), 1);
+    }
+
+    #[test]
+    fn snapshot_debug_never_contains_admin_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "sk-ant-admin01-NICHTECHT-1234";
+        // First poll fails (401), so the snapshot carries an error status; the key is set throughout.
+        let (cfg, _http) = config_with_api(dir.path(), Some(key), vec![Ok((401, "{}".to_string()))]);
+        let rx = spawn_worker(cfg, noop());
+        let (_, first) = until_report(&rx);
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        assert_eq!(second.api.as_ref().and_then(|a| a.error.clone()), Some(crate::analytics::ApiError::Unauthorized));
+        for snap in [&first, &second] {
+            let shown = format!("{snap:?}");
+            assert!(!shown.contains("NICHTECHT") && !shown.contains("1234"), "snapshot leaked key");
+        }
+    }
+
+    /// An `Http` that always panics, to prove the worker survives a crash in the poll path.
+    struct PanicHttp;
+
+    impl Http for PanicHttp {
+        fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<(u16, String), NetError> {
+            panic!("simulated crash in the API path");
+        }
+    }
+
+    #[test]
+    fn panic_in_api_poll_does_not_kill_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path(), Duration::from_millis(50));
+        cfg.secrets = Arc::new(FakeStore::new(Some("sk-ant-admin01-NICHTECHT-1234")));
+        cfg.http = Arc::new(PanicHttp);
+        write_log(&cfg.logs_root, "p/a.jsonl", &["m1"]);
+        let log = cfg.logs_root.join("p/a.jsonl");
+        let rx = spawn_worker(cfg, noop());
+
+        let (_, first) = until_report(&rx);
+        assert_eq!(first.report.unwrap().last_5h.requests, 1);
+
+        // The poll panicked after the first report; later ticks must still scan and deliver.
+        let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all((usage_line("m2") + "\n").as_bytes()).unwrap();
+        drop(f);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let snap = rx.recv_timeout(WAIT).expect("worker stopped delivering after the panic");
+            if snap.report.is_some_and(|r| r.last_5h.requests == 2) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "appended line never showed up");
+        }
     }
 }
