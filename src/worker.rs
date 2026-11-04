@@ -243,6 +243,11 @@ mod tests {
         assert_eq!((last.scanned_files, last.total_files), (3, 3));
         assert!(last.scan_error.is_none());
         assert_eq!(last.report.unwrap().last_5h.requests, 3);
+        // notify() runs after send(), so poll instead of reading right after recv.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while notified.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(notified.load(Ordering::SeqCst) >= 2);
     }
 
