@@ -2,3 +2,4 @@
 
 pub mod log_scan;
 pub mod pricing;
+pub mod report;
