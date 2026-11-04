@@ -5,3 +5,4 @@ pub mod pricing;
 pub mod report;
 pub mod launcher;
 pub mod secrets;
+pub mod worker;
