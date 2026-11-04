@@ -1,0 +1,23 @@
+[package]
+name = "cerberus-usage"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "cerberus_usage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cerberus-usage"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37"
+tray-icon = "0.26"
+keyring = "4"
+ureq = { version = "3", features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
