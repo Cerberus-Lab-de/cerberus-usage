@@ -10,8 +10,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use zeroize::Zeroizing;
+
 use cerberus_usage::release_sign::{
-    generate_keypair, private_key_hex, public_key_hex, sign_manifest, signing_key_from_hex,
+    generate_keypair, private_key_hex, public_key_hex, sign_checked, signing_key_from_hex,
 };
 
 const SERVICE: &str = "cerberus-usage-release";
@@ -64,7 +66,7 @@ fn keygen(flags: &[String]) -> Result<(), String> {
         }
     }
     let entry = entry()?;
-    match entry.get_password() {
+    match entry.get_password().map(Zeroizing::new) {
         Ok(_) if !force => {
             return Err("es existiert bereits ein Signaturschlüssel. Mit --force überschreiben \
                         (bereits ausgelieferte Apps können neue Releases dann nicht mehr verifizieren)."
@@ -75,7 +77,7 @@ fn keygen(flags: &[String]) -> Result<(), String> {
     }
     let key = generate_keypair()?;
     entry
-        .set_password(&private_key_hex(&key))
+        .set_password(private_key_hex(&key).as_str())
         .map_err(|_| "Schlüssel konnte nicht gespeichert werden".to_string())?;
     println!("Öffentlicher Schlüssel (hex): {}", public_key_hex(&key));
     println!(
@@ -83,7 +85,7 @@ fn keygen(flags: &[String]) -> Result<(), String> {
          Geht er verloren, kann keine Update-Signatur mehr erzeugt werden."
     );
     if print_private {
-        println!("Privater Schlüssel (hex, einmalig): {}", private_key_hex(&key));
+        println!("Privater Schlüssel (hex, einmalig): {}", private_key_hex(&key).as_str());
     }
     Ok(())
 }
@@ -100,9 +102,16 @@ fn sign(args: &[String]) -> Result<(), String> {
         .and_then(|n| n.to_str())
         .ok_or("ungültiger Installer-Pfad")?
         .to_string();
+    // Fail before touching the installer or the credential store.
+    if !cerberus_usage::update::file_name_ok(&file_name) {
+        return Err(format!("ungültiger Installer-Dateiname: {file_name}"));
+    }
+    if !version.pre.is_empty() {
+        return Err("Vorabversionen dürfen nicht signiert werden".to_string());
+    }
     let bytes = std::fs::read(&installer)
         .map_err(|_| "Installer konnte nicht gelesen werden".to_string())?;
-    let key = match entry()?.get_password() {
+    let key = match entry()?.get_password().map(Zeroizing::new) {
         Ok(hex) => signing_key_from_hex(&hex)?,
         Err(keyring::Error::NoEntry) => {
             return Err(
@@ -112,7 +121,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         }
         Err(_) => return Err("Credential-Store konnte nicht gelesen werden".to_string()),
     };
-    let manifest = sign_manifest(&key, &version, &bytes, &file_name);
+    let manifest = sign_checked(&key, &version, &bytes, &file_name)?;
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|_| "Manifest nicht serialisierbar".to_string())?;
     let mut out = installer.as_os_str().to_owned();
