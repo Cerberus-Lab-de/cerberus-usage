@@ -43,6 +43,30 @@ function Find-Tool([string]$name, [string[]]$candidates) {
     return $null
 }
 
+# Latest release version, or $null when there is none (HTTP 404). Any other failure (auth,
+# network, rate limit) throws. Native stderr is redirected to a file with the error preference
+# relaxed, because Windows PowerShell 5.1 turns merged stderr into a terminating error.
+function Get-LatestReleaseVersion([string]$ghExe, [string]$repo) {
+    $errFile = [System.IO.Path]::GetTempFileName()
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $ghExe api "repos/$repo/releases/latest" --jq .tag_name 2>$errFile
+        $code = $LASTEXITCODE
+        $err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+    } finally {
+        $ErrorActionPreference = $previous
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($code -eq 0) {
+        $tag = ("$out").Trim() -replace '^v', ''
+        if ($tag -notmatch '^\d+\.\d+\.\d+$') { throw "Unerwarteter Release-Tag '$tag'." }
+        return [version]$tag
+    }
+    if ("$err" -match 'HTTP 404') { return $null }
+    throw "Release-Abfrage fehlgeschlagen: $("$err".Trim())"
+}
+
 $cargo = Find-Tool 'cargo' @("$env:USERPROFILE\.cargo\bin\cargo.exe")
 if (-not $cargo) { throw 'cargo nicht gefunden.' }
 $iscc = Find-Tool 'ISCC' @(
@@ -72,25 +96,21 @@ if (-not $gh) {
     if ($DryRun) { Write-Warning 'gh nicht gefunden: Versionsvergleich mit dem letzten Release übersprungen (Probelauf).' }
     else { throw 'gh (GitHub CLI) nicht gefunden.' }
 } else {
-    $out = & $gh.Source release view --repo $Repo --json tagName --jq .tagName 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $latest = ($out | Out-String).Trim() -replace '^v', ''
-        if ($latest -notmatch '^\d+\.\d+\.\d+$') { throw "Unerwarteter Release-Tag '$latest'." }
-        if ($newVersion -le [version]$latest) {
+    $latest = Get-LatestReleaseVersion $gh.Source $Repo
+    if ($null -eq $latest) {
+        Write-Host "Noch kein Release vorhanden: $version wäre das erste."
+    } else {
+        if ($newVersion -le $latest) {
             throw "Version $version ist nicht neuer als das letzte Release ($latest). Version in Cargo.toml erhöhen."
         }
         Write-Host "Letztes Release: $latest, neu: $version"
-    } elseif (($out | Out-String) -match 'release not found|Could not resolve to a Repository|HTTP 404|not found') {
-        Write-Host "Noch kein Release vorhanden: $version wäre das erste."
-    } else {
-        throw "Release-Abfrage fehlgeschlagen: $(($out | Out-String).Trim())"
     }
 }
 
 # --- 3. Release notes --------------------------------------------------------------------------
 Step 'Änderungsnotizen lesen'
 $changelog = Get-Content -LiteralPath (Join-Path $root 'CHANGELOG.md') -Raw -Encoding UTF8
-$pattern = '(?ms)^##\s+\[?' + [regex]::Escape($version) + '\]?[^\r\n]*\r?\n(?<body>.*?)(?=^##\s|\z)'
+$pattern = '(?ms)^##\s+\[?' + [regex]::Escape($version) + '(?![\d.])\]?[^\r\n]*\r?\n(?<body>.*?)(?=^##\s|\z)'
 $nm = [regex]::Match($changelog, $pattern)
 if (-not $nm.Success -or [string]::IsNullOrWhiteSpace($nm.Groups['body'].Value)) {
     throw "In CHANGELOG.md fehlt ein Abschnitt für Version $version."
@@ -107,13 +127,19 @@ if (-not (Test-Path -LiteralPath $exe)) { throw "Build-Ergebnis fehlt: $exe" }
 
 # --- 5. Installer --------------------------------------------------------------------------------
 Step 'Installer bauen'
+# Inno Setup reads a BOM-less script as ANSI and garbles umlauts in dialogs.
+$issPath = Join-Path $root 'installer\cerberus-usage.iss'
+$head3 = [System.IO.File]::ReadAllBytes($issPath)[0..2]
+if ($head3[0] -ne 0xEF -or $head3[1] -ne 0xBB -or $head3[2] -ne 0xBF) {
+    throw 'installer\cerberus-usage.iss ist nicht als UTF-8 mit BOM gespeichert (Umlaute würden falsch angezeigt).'
+}
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 $installer = Join-Path $dist "CerberusUsage-Setup-$version.exe"
 $manifest = "$installer.manifest.json"
 if (Test-Path -LiteralPath $installer) { Remove-Item -LiteralPath $installer -Force }
 if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force }
-Invoke-Native $iscc @("/DAppVersion=$version", (Join-Path $root 'installer\cerberus-usage.iss'))
+Invoke-Native $iscc @("/DAppVersion=$version", $issPath)
 if (-not (Test-Path -LiteralPath $installer)) { throw "Installer fehlt: $installer" }
 
 # --- 6. Sign ----------------------------------------------------------------------------------------

@@ -1298,7 +1298,7 @@ mod tests {
         assert_eq!(http.request_count(), 0);
     }
 
-    /// Needs a stored admin key and network. Run manually (the maintainer saves the key via the app):
+    /// Needs a stored admin key and network. Run manually (save the key via the app first):
     /// `cargo test live_cost_today -- --ignored --nocapture`. Prints amounts only.
     #[test]
     #[ignore]

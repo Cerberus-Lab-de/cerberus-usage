@@ -1,4 +1,4 @@
-; Inno Setup script for Cerberus Usage.
+﻿; Inno Setup script for Cerberus Usage.
 ; Build:  ISCC.exe /DAppVersion=1.0.0 installer\cerberus-usage.iss   (release.ps1 does this)
 ; Output: dist\CerberusUsage-Setup-<version>.exe
 ; Optional: /DExeDir=<folder with cerberus-usage.exe>, default ..\target\release.
@@ -88,7 +88,7 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
-// Ends cerberus-usage.exe (this exact image name only): polite first, force after 5 s.
+// Ends cerberus-usage.exe (this exact image name only): polite first, force after 2 s.
 procedure CloseApp;
 var
   ResultCode, I: Integer;

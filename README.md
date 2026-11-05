@@ -83,7 +83,7 @@ cargo test
 cargo build --release
 ```
 
-Die App liegt danach unter `target\release\cerberus-usage.exe`.
+Die App liegt danach unter `target\release\cerberus-usage.exe`. Läuft gerade eine Kopie von dort, sperrt sie die Datei und der Build schlägt fehl: erst beenden.
 
 ## Release-Prozess
 
