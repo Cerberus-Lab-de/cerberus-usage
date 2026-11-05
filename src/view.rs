@@ -51,6 +51,19 @@ pub fn mode_card(m: ModeDisplay) -> ModeCard {
     }
 }
 
+/// The mode card, but never green while a routing variable may redirect or re-bill requests: then
+/// the Max claim ("keine API-Kosten") could be wrong and the card says so.
+pub fn mode_card_with_routing(m: ModeDisplay, routing_active: bool) -> ModeCard {
+    if routing_active && m == ModeDisplay::Max {
+        return ModeCard {
+            tone: Tone::AmberOutline,
+            title: "Max",
+            hint: "Umleitung aktiv, Kosten möglich. Siehe Hinweis oben.",
+        };
+    }
+    mode_card(m)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailKind {
     Today,
@@ -176,6 +189,78 @@ pub fn work_area_height(monitor_height: Option<f32>) -> Option<f32> {
 /// The window has a size other than the one the app asked for last: the user resized it.
 pub fn differs_from_request(actual: (f32, f32), requested: (f32, f32)) -> bool {
     (actual.0 - requested.0).abs() > RESIZE_TOLERANCE || (actual.1 - requested.1).abs() > RESIZE_TOLERANCE
+}
+
+/// Inner height the window may grow to: monitor height minus taskbar, minus the title bar and borders
+/// (`chrome`), and, when the window top is known, minus the part of the screen above the window.
+/// `None` (monitor unknown): the app does not grow.
+pub fn grow_cap(monitor_height: Option<f32>, chrome: f32, window_top: Option<f32>) -> Option<f32> {
+    let usable = work_area_height(monitor_height)?;
+    let mut cap = usable - chrome.max(0.0);
+    if let Some(top) = window_top.filter(|t| *t >= 0.0 && *t < usable) {
+        cap = cap.min(usable - top - chrome.max(0.0));
+    }
+    Some(cap.max(0.0))
+}
+
+/// What the window should do this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowAction {
+    None,
+    /// Measure the settled content and grow if it does not fit.
+    Grow,
+    /// Give back the height the app added.
+    Shrink,
+}
+
+/// Decides when to measure. A content change is requested while the frame is already laid out, so the
+/// measurement waits one frame (`armed`) and, for opening, until the animation has finished.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GrowState {
+    want_grow: bool,
+    armed: bool,
+    want_shrink: bool,
+}
+
+impl GrowState {
+    /// Content got taller (opened, switched, rows expanded).
+    pub fn content_grew(&mut self) {
+        self.want_grow = true;
+        self.armed = false;
+        self.want_shrink = false;
+    }
+
+    /// The detail is closing.
+    pub fn content_closing(&mut self) {
+        self.want_shrink = true;
+        self.want_grow = false;
+        self.armed = false;
+    }
+
+    /// Call once at the end of every frame with the detail openness (0..=1).
+    pub fn on_frame(&mut self, openness: f32) -> GrowAction {
+        if self.want_grow {
+            if !self.armed {
+                self.armed = true;
+                return GrowAction::None;
+            }
+            if openness >= 1.0 {
+                self.want_grow = false;
+                self.armed = false;
+                return GrowAction::Grow;
+            }
+        }
+        if self.want_shrink && openness <= 0.0 {
+            self.want_shrink = false;
+            return GrowAction::Shrink;
+        }
+        GrowAction::None
+    }
+
+    /// A grow or shrink is waiting for a later frame.
+    pub fn pending(&self) -> bool {
+        self.want_grow || self.want_shrink
+    }
 }
 
 /// `grow_for_content` with the work area possibly unknown and a result never below the current height.
@@ -352,5 +437,86 @@ mod tests {
         assert_eq!(shrink_to(480.0, 200.0, false), None);
         assert_eq!(shrink_to(800.0, 160.0, true), None);
         assert_eq!(shrink_to(800.0, 0.0, false), None);
+    }
+
+    #[test]
+    fn max_is_green_only_without_routing() {
+        assert_eq!(mode_card_with_routing(ModeDisplay::Max, false).tone, Tone::Green);
+        let routed = mode_card_with_routing(ModeDisplay::Max, true);
+        assert_ne!(routed.tone, Tone::Green);
+        assert_eq!(routed.tone, Tone::AmberOutline);
+        assert_eq!(routed.hint, "Umleitung aktiv, Kosten möglich. Siehe Hinweis oben.");
+        for m in [ModeDisplay::ApiKey, ModeDisplay::Unknown, ModeDisplay::Closed] {
+            assert_eq!(mode_card_with_routing(m, true), mode_card(m));
+            assert_eq!(mode_card_with_routing(m, false), mode_card(m));
+        }
+    }
+
+    #[test]
+    fn cost_hints_carry_an_uncertainty_qualifier() {
+        assert!(mode_card(ModeDisplay::Max).hint.contains("sofern"));
+        assert!(mode_card(ModeDisplay::ApiKey).hint.contains("nach Verbrauch"));
+        assert!(mode_card(ModeDisplay::Unknown).hint.contains("möglich"));
+        assert!(mode_card_with_routing(ModeDisplay::Max, true).hint.contains("möglich"));
+    }
+
+    #[test]
+    fn grow_cap_accounts_for_title_bar_and_window_position() {
+        assert_eq!(grow_cap(None, 30.0, Some(0.0)), None);
+        assert_eq!(grow_cap(Some(1080.0), 0.0, None), Some(1032.0));
+        assert_eq!(grow_cap(Some(1080.0), 31.0, None), Some(1001.0));
+        // Window starts 200 px down: only the rest of the screen is left.
+        assert_eq!(grow_cap(Some(1080.0), 31.0, Some(200.0)), Some(801.0));
+        // Nonsensical top: plain cap.
+        assert_eq!(grow_cap(Some(1080.0), 31.0, Some(-5000.0)), Some(1001.0));
+        assert_eq!(grow_cap(Some(1080.0), 31.0, Some(5000.0)), Some(1001.0));
+    }
+
+    fn frames(g: &mut GrowState, openness: &[f32]) -> Vec<GrowAction> {
+        openness.iter().map(|o| g.on_frame(*o)).collect()
+    }
+
+    #[test]
+    fn grow_waits_a_frame_and_for_the_open_animation() {
+        use GrowAction::*;
+        let mut g = GrowState::default();
+        g.content_grew(); // clicked while closed
+        assert_eq!(frames(&mut g, &[0.0, 0.4, 1.0]), [None, None, Grow]);
+        assert_eq!(g.on_frame(1.0), None, "only once");
+        assert!(!g.pending());
+    }
+
+    #[test]
+    fn switching_the_detail_measures_the_frame_after_the_change() {
+        use GrowAction::*;
+        let mut g = GrowState::default();
+        g.content_grew(); // switched Guthaben -> Heute, still fully open
+        assert_eq!(g.on_frame(1.0), None, "same frame: old content");
+        assert_eq!(g.on_frame(1.0), Grow);
+    }
+
+    #[test]
+    fn expanding_rows_measures_the_frame_after_the_change() {
+        use GrowAction::*;
+        let mut g = GrowState::default();
+        assert_eq!(g.on_frame(1.0), None);
+        g.content_grew();
+        assert_eq!(frames(&mut g, &[1.0, 1.0, 1.0]), [None, Grow, None]);
+    }
+
+    #[test]
+    fn closing_shrinks_only_when_fully_closed_and_cancels_a_grow() {
+        use GrowAction::*;
+        let mut g = GrowState::default();
+        g.content_closing();
+        assert_eq!(frames(&mut g, &[0.7, 0.2, 0.0, 0.0]), [None, None, Shrink, None]);
+        let mut g = GrowState::default();
+        g.content_grew();
+        g.content_closing();
+        assert_eq!(frames(&mut g, &[0.5, 0.0]), [None, Shrink]);
+        let mut g = GrowState::default();
+        g.content_closing();
+        g.content_grew();
+        assert_eq!(frames(&mut g, &[0.0, 0.5, 1.0]), [None, None, Grow], "reopen cancels the shrink");
     }
 }

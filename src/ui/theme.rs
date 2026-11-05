@@ -23,6 +23,9 @@ pub mod palette {
     pub const NEUTRAL: Color32 = Color32::from_rgb(0x6F, 0x86, 0xA3);
 }
 
+/// Selected-text background: a darker cyan so `TEXT` on it keeps 4.5:1 (CYAN_DARK gives about 3.3).
+pub const SELECTION_BG: Color32 = Color32::from_rgb(0x0B, 0x6F, 0x82);
+
 /// Name of the extra text style used for large figures.
 pub const BIG: &str = "big";
 
@@ -102,7 +105,7 @@ fn visuals() -> egui::Visuals {
     v.menu_corner_radius = CornerRadius::same(10);
     v.weak_text_color = Some(MUTED);
     v.hyperlink_color = CYAN;
-    v.selection.bg_fill = CYAN_DARK;
+    v.selection.bg_fill = SELECTION_BG;
     v.selection.stroke = Stroke::new(1.0, TEXT);
 
     let w = &mut v.widgets;
@@ -146,6 +149,8 @@ mod tests {
         }
         let button = contrast_ratio(BG, CYAN);
         assert!(button >= 4.5, "BG on CYAN = {button}");
+        let selection = contrast_ratio(TEXT, SELECTION_BG);
+        assert!(selection >= 4.5, "TEXT on selection = {selection}");
         let amber = contrast_ratio(AMBER, PANEL);
         assert!(amber >= 3.0, "AMBER on PANEL = {amber}");
     }

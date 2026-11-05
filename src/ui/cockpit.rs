@@ -6,6 +6,7 @@ use eframe::egui::{
 
 use super::details::figure_value;
 use super::theme::{BIG, palette::*};
+use crate::analytics::ApiError;
 use crate::cards::{ApiCard, BalanceCard};
 use crate::format::{COST_NOTE, format_count, progress_text, unpriced_text};
 use crate::launcher::Mode;
@@ -123,13 +124,13 @@ pub fn figures(report: &Report, balance: &BalanceCard, balance_issue: bool) -> V
             lines: vec![("Noch kein Startwert".to_string(), false)],
         },
         BalanceCard::Estimate { value, deducted, .. } => {
-            let mut lines = vec![(
-                (if *deducted { "geschätzt" } else { "geschätzt, ohne Kostenabzug" }).to_string(),
-                !*deducted,
-            )];
-            if balance_issue {
-                lines.push(("Hinweis, Klick für Details".to_string(), true));
-            }
+            // One short line; the opened area has the full explanation.
+            let line = match (*deducted, balance_issue) {
+                (false, _) => ("geschätzt · ohne Kostenabzug", true),
+                (true, true) => ("geschätzt · Hinweis", true),
+                (true, false) => ("geschätzt", false),
+            };
+            let lines = vec![(line.0.to_string(), line.1)];
             Figure { kind: DetailKind::Balance, label: "GUTHABEN", value: value.clone(), value_warn: false, lines }
         }
     };
@@ -174,34 +175,62 @@ fn columns_for(width: f32) -> usize {
     if width >= WIDE { 4 } else { 2 }
 }
 
-/// A rounded, clickable card. Hover: cyan stroke and pointer; open: dark cyan stroke and a soft glow.
+fn kind_name(kind: DetailKind) -> &'static str {
+    match kind {
+        DetailKind::Today => "Heute",
+        DetailKind::Month => "Monat",
+        DetailKind::Balance => "Guthaben",
+        DetailKind::Max => "Max",
+    }
+}
+
+/// Screen-reader label of a figure card.
+pub fn card_accessible_label(kind: DetailKind, open: bool) -> String {
+    format!("{}, Details {}", kind_name(kind), if open { "schließen" } else { "öffnen" })
+}
+
+/// A rounded, clickable card of exactly `width`. Label on top, big number below, short muted lines
+/// that wrap inside the card. Hover or keyboard focus: cyan ring and pointer; open: dark cyan stroke and glow.
 fn figure_card(ui: &mut egui::Ui, width: f32, figure: &Figure, open: bool) -> egui::Response {
-    let stroke = Stroke::new(1.0, LINE);
+    let margin = 12.0;
+    // A frame adds its margin and a 1 px stroke on every side.
+    let inner_width = (width - 2.0 * margin - 2.0).max(40.0);
     let mut frame = egui::Frame::new()
         .fill(PANEL)
-        .stroke(stroke)
+        .stroke(Stroke::new(1.0, LINE))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
-        .inner_margin(Margin::same(12));
+        .inner_margin(Margin::same(margin as i8));
     if open {
         frame = frame
             .stroke(Stroke::new(1.0, CYAN_DARK))
             .shadow(Shadow { offset: [0, 0], blur: 12, spread: 0, color: CYAN.gamma_multiply(0.15) });
     }
-    let inner = frame.show(ui, |ui| {
-        ui.set_width(width - 26.0);
-        ui.set_min_height(92.0);
-        ui.style_mut().interaction.selectable_labels = false;
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(RichText::new(format!("{}{}", figure.label, if open { " ▴" } else { "" })).small().color(MUTED));
-        ui.label(big(&figure.value).color(if figure.value_warn { AMBER } else { TEXT }));
-        for (text, warn) in &figure.lines {
-            ui.label(RichText::new(text).small().color(if *warn { AMBER } else { MUTED }));
-        }
-    });
+    let inner = ui
+        .allocate_ui_with_layout(vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(inner_width);
+                ui.set_max_width(inner_width);
+                ui.set_min_height(86.0);
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add(egui::Label::new(
+                    RichText::new(format!("{}{}", figure.label, if open { " ▴" } else { "" })).small().color(MUTED),
+                ));
+                ui.add(egui::Label::new(big(&figure.value).color(if figure.value_warn { AMBER } else { TEXT })));
+                for (text, warn) in &figure.lines {
+                    ui.add(egui::Label::new(RichText::new(text).small().color(if *warn { AMBER } else { MUTED })).wrap());
+                }
+            })
+        })
+        .inner;
+    let rect = inner.response.rect;
     let id = egui::Id::unique(("figure", figure.label));
-    let response = ui.interact(inner.response.rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-    if response.hovered() {
-        ui.painter().rect_stroke(inner.response.rect, CornerRadius::same(CARD_RADIUS), Stroke::new(1.0, CYAN), StrokeKind::Inside);
+    let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, card_accessible_label(figure.kind, open))
+    });
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_stroke(rect, CornerRadius::same(CARD_RADIUS), Stroke::new(1.5, CYAN), StrokeKind::Inside);
     }
     response
 }
@@ -210,10 +239,10 @@ fn figure_card(ui: &mut egui::Ui, width: f32, figure: &Figure, open: bool) -> eg
 pub fn figure_cards(ui: &mut egui::Ui, figures: &[Figure], open: Option<DetailKind>) -> Option<DetailKind> {
     let spacing = ui.spacing().item_spacing.x;
     let columns = columns_for(ui.available_width());
-    let width = (ui.available_width() - spacing * (columns as f32 - 1.0)) / columns as f32;
+    let width = ((ui.available_width() - spacing * (columns as f32 - 1.0)) / columns as f32).floor();
     let mut clicked = None;
     for row in figures.chunks(columns) {
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             for figure in row {
                 if figure_card(ui, width, figure, open == Some(figure.kind)).clicked() {
                     clicked = Some(figure.kind);
@@ -231,17 +260,26 @@ pub fn scan_progress(ui: &mut egui::Ui, scanned: usize, total: usize) {
     ui.add(egui::ProgressBar::new(fraction).desired_height(8.0).fill(CYAN_DARK).animate(false));
 }
 
+/// "Not available" (a personal account has no Cost API) is an expected state, not a fault: dim, not amber.
+pub fn api_error_is_dim(text: &str) -> bool {
+    text == ApiError::NotAvailable.to_string()
+}
+
+fn wrapped(ui: &mut egui::Ui, text: RichText) {
+    ui.add(egui::Label::new(text).wrap());
+}
+
 /// The API cost line or card under the figures. No key, nothing yet and errors are one dim line.
 pub fn api_line(ui: &mut egui::Ui, view: &ApiCard) {
     match view {
-        ApiCard::NoKey => {
-            ui.label(RichText::new("Laut Anthropic: Kein Admin-Key gespeichert. Kosten-API nur mit Organisations-Konto.").color(MUTED));
-        }
-        ApiCard::Pending => {
-            ui.label(RichText::new("Laut Anthropic: Warte auf die erste Abfrage …").color(MUTED));
-        }
+        ApiCard::NoKey => wrapped(
+            ui,
+            RichText::new("Laut Anthropic: Kein Admin-Key gespeichert. Kosten-API nur mit Organisations-Konto.").color(MUTED),
+        ),
+        ApiCard::Pending => wrapped(ui, RichText::new("Laut Anthropic: Warte auf die erste Abfrage …").color(MUTED)),
         ApiCard::Error(text) => {
-            ui.label(RichText::new(format!("Laut Anthropic: {text}")).color(AMBER));
+            let color = if api_error_is_dim(text) { MUTED } else { AMBER };
+            wrapped(ui, RichText::new(format!("Laut Anthropic: {text}")).color(color));
         }
         ApiCard::Data { today, month, updated, error } => {
             egui::Frame::new()
@@ -252,17 +290,19 @@ pub fn api_line(ui: &mut egui::Ui, view: &ApiCard) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("API-KOSTEN LAUT ANTHROPIC").small().color(MUTED));
-                    ui.label(RichText::new(format!("Heute {today}")).size(16.0).strong());
-                    ui.label(format!("Dieser Monat {month}"));
-                    ui.label(RichText::new(format!("Stand: {updated}")).small().color(MUTED));
-                    ui.label(
+                    wrapped(ui, RichText::new("API-KOSTEN LAUT ANTHROPIC").small().color(MUTED));
+                    wrapped(ui, RichText::new(format!("Heute {today}")).size(16.0).strong());
+                    wrapped(ui, RichText::new(format!("Dieser Monat {month}")));
+                    wrapped(ui, RichText::new(format!("Stand: {updated}")).small().color(MUTED));
+                    wrapped(
+                        ui,
                         RichText::new("Die Daten können mehrere Stunden hinterherhinken (laut Anthropic etwa 4 Std., bis zu 24 Std.).")
                             .small()
                             .color(MUTED),
                     );
                     if let Some(text) = error {
-                        ui.label(RichText::new(text).color(AMBER));
+                        let color = if api_error_is_dim(text) { MUTED } else { AMBER };
+                        wrapped(ui, RichText::new(text).color(color));
                     }
                 });
         }
@@ -313,8 +353,10 @@ mod tests {
         assert_eq!(none[2].value, "–");
         assert!(none[2].lines[0].0.contains("Noch kein Startwert"));
         let no_deduction = figures(&report(), &estimate(false), true);
-        assert!(no_deduction[2].lines.iter().any(|(t, w)| *w && t.contains("ohne Kostenabzug")));
-        assert!(no_deduction[2].lines.iter().any(|(t, _)| t.contains("Hinweis")));
+        assert_eq!(no_deduction[2].lines, [("geschätzt · ohne Kostenabzug".to_string(), true)]);
+        let hint = figures(&report(), &estimate(true), true);
+        assert_eq!(hint[2].lines, [("geschätzt · Hinweis".to_string(), true)]);
+        assert_eq!(figures(&report(), &estimate(true), false)[2].lines, [("geschätzt".to_string(), false)]);
     }
 
     #[test]
@@ -351,5 +393,33 @@ mod tests {
             assert!(contrast_ratio(MUTED, fill) >= 4.5, "{tone:?} hint");
         }
         assert!(contrast_ratio(AMBER, PANEL2) >= 4.5, "API-Key button text");
+    }
+
+    #[test]
+    fn not_available_is_a_dim_line_other_errors_stay_amber() {
+        assert!(api_error_is_dim(&ApiError::NotAvailable.to_string()));
+        for e in [ApiError::Unauthorized, ApiError::RateLimited, ApiError::Server(500)] {
+            assert!(!api_error_is_dim(&e.to_string()), "{e:?}");
+        }
+        // The card carries exactly that text for a Cost API that was never available.
+        let status = crate::analytics::ApiStatus {
+            today_nano: 0,
+            month_nano: 0,
+            has_data: false,
+            updated: chrono::Local::now(),
+            since_nano: None,
+            error: Some(ApiError::NotAvailable),
+            since_error: None,
+        };
+        match crate::cards::api_card(Some(true), Some(&status)) {
+            ApiCard::Error(text) => assert!(api_error_is_dim(&text)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn card_labels_are_german_and_follow_the_state() {
+        assert_eq!(card_accessible_label(DetailKind::Today, false), "Heute, Details öffnen");
+        assert_eq!(card_accessible_label(DetailKind::Balance, true), "Guthaben, Details schließen");
     }
 }

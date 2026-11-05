@@ -107,7 +107,7 @@ pub struct DetailData<'a> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DetailOutput {
     pub open_drawer: bool,
-    /// Tab or row count changed: the content height changed, the window may need to grow again.
+    /// The content got taller (tab switch, more rows): the window may need to grow again.
     pub layout_changed: bool,
 }
 
@@ -170,7 +170,7 @@ fn segmented(ui: &mut egui::Ui, current: &mut DetailTab, tabs: &[DetailTab]) -> 
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
-                for &tab in tabs {
+                for &tab in tabs.iter().rev() {
                     let on = *current == tab;
                     let text = RichText::new(tab_label(tab)).color(if on { TEXT } else { MUTED });
                     let button = egui::Button::new(text)
@@ -187,7 +187,8 @@ fn segmented(ui: &mut egui::Ui, current: &mut DetailTab, tabs: &[DetailTab]) -> 
     changed
 }
 
-/// Name and cost on one line, a thin bar below. Returns `true` when "weitere anzeigen" was clicked.
+/// Name and cost on one line, a thin bar below. Returns `true` when "weitere anzeigen" or
+/// "Weniger anzeigen" was clicked.
 fn bar_rows(ui: &mut egui::Ui, rows: &[(Cow<str>, &Bucket)], empty_text: &str, expanded: bool) -> bool {
     if rows.is_empty() {
         ui.label(RichText::new(empty_text).color(MUTED));
@@ -214,11 +215,10 @@ fn bar_rows(ui: &mut egui::Ui, rows: &[(Cow<str>, &Bucket)], empty_text: &str, e
         painter.rect_filled(egui::Rect::from_min_size(track.min, vec2(fill_w, 5.0)), CornerRadius::same(3), CYAN_DARK);
         response.on_hover_text(format!("{name}\n{} Anfragen · {}", format_count(b.requests), token_summary(b)));
     }
-    let mut toggled = false;
-    if hidden > 0 && ui.link(format!("+ {hidden} weitere anzeigen")).clicked() {
-        toggled = true;
+    if hidden > 0 {
+        return ui.link(format!("+ {hidden} weitere anzeigen")).clicked();
     }
-    toggled
+    expanded && rows.len() > MAX_ROWS && ui.link("Weniger anzeigen").clicked()
 }
 
 fn explanation(ui: &mut egui::Ui, text: &str) {
@@ -256,8 +256,9 @@ fn history(ui: &mut egui::Ui, kind: DetailKind, data: &DetailData, view: &mut De
     let (title, empty, rows) = rows_for(kind, view.tab, data.report);
     ui.label(RichText::new(title).strong());
     if bar_rows(ui, &rows, empty, view.rows_expanded) {
-        view.rows_expanded = true;
-        out.layout_changed = true;
+        view.rows_expanded = !view.rows_expanded;
+        // Only taller content may need the window to grow.
+        out.layout_changed = view.rows_expanded;
     }
     ui.label(RichText::new(format!("Kosten sind {COST_NOTE}")).small().color(MUTED));
 }
@@ -387,8 +388,8 @@ mod tests {
         assert_eq!(token_summary(&b), "1.000 Ein · 2.500 Cache · 7 Aus");
     }
 
-    /// Draws every detail, the figure cards and the banners through a few frames, so a layout panic or an
-    /// id clash shows up in the tests (no assertions on pixels).
+    /// Draws every detail, the figure cards and the banners through a few frames, so a layout panic shows
+    /// up in the tests (no assertions on pixels, and egui does not panic on an id clash).
     #[test]
     fn every_detail_and_the_cockpit_pieces_draw_without_panicking() {
         use crate::report::Pause;

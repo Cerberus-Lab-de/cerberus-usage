@@ -11,7 +11,7 @@ use eframe::egui::{self, IconData, ViewportCommand};
 use crate::balance::Alert;
 use crate::pricing::format_usd;
 use crate::ui::ModeDisplay;
-use crate::view::mode_card;
+use crate::view::mode_card_with_routing;
 use crate::worker::Snapshot;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -191,8 +191,11 @@ pub fn icon_with_badge(rgba: &[u8], width: u32, height: u32, state: IconState) -
 
 /// Tooltip text: mode, today's estimated cost, a hint when warnings are active. Windows cuts tooltips
 /// at 127 characters. Built from the snapshot only, which never holds a key.
-pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay) -> String {
-    let mut text = format!("Cerberus Usage · {}", mode_card(mode).title);
+pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay, routing_active: bool) -> String {
+    let mut text = format!("Cerberus Usage · {}", mode_card_with_routing(mode, routing_active).title);
+    if routing_active && mode == ModeDisplay::Max {
+        text.push_str(" (Umleitung aktiv)");
+    }
     if let Some(report) = &snapshot.report {
         text.push_str(&format!(" · heute {} (geschätzt)", format_usd(report.today.cost_nano)));
     }
@@ -303,18 +306,25 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_flags_a_routed_max() {
+        let tip = tooltip(&snapshot(0), ModeDisplay::Max, true);
+        assert!(tip.contains("Umleitung aktiv"), "{tip}");
+        assert!(!tooltip(&snapshot(0), ModeDisplay::ApiKey, true).contains("Umleitung"));
+    }
+
+    #[test]
     fn tray_tooltip_shows_mode_and_today_cost() {
-        let tip = tooltip(&snapshot(1_230_000_000), ModeDisplay::Max);
+        let tip = tooltip(&snapshot(1_230_000_000), ModeDisplay::Max, false);
         assert!(tip.contains("Max") && tip.contains("$1.23"), "{tip}");
         assert!(tip.len() < 128, "Windows truncates tooltips at 127 characters: {tip}");
         // Without a report yet there is still a valid tooltip.
         let mut s = snapshot(0);
         s.report = None;
-        assert!(tooltip(&s, ModeDisplay::Closed).contains("Cerberus Usage"));
+        assert!(tooltip(&s, ModeDisplay::Closed, false).contains("Cerberus Usage"));
         // Alerts are mentioned; no key material can be in a snapshot tooltip.
         let mut s = snapshot(0);
         s.alerts = vec![Alert::LowBalance];
-        assert!(tooltip(&s, ModeDisplay::ApiKey).contains("Warnung"));
+        assert!(tooltip(&s, ModeDisplay::ApiKey, false).contains("Warnung"));
     }
 
     #[test]

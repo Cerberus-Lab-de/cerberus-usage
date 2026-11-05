@@ -30,12 +30,12 @@ use crate::settings::{Settings, TopUp};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
-    DetailKind, EscTarget, differs_from_request, esc_target, growth_for, mode_card, shrink_to, toggle_detail,
-    work_area_height,
+    DetailKind, EscTarget, GrowAction, GrowState, differs_from_request, esc_target, grow_cap, growth_for,
+    mode_card_with_routing, shrink_to, toggle_detail,
 };
 use banners::{BannerInput, banner_items, banner_strip};
 use details::{DetailData, DetailView, animated_area, effective_tab};
-use theme::palette::{AMBER, BG, PANEL};
+use theme::palette::{AMBER, BG, MUTED, PANEL};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 
 /// How often the background thread asks whether Obsidian runs (each check spawns `tasklist`).
@@ -405,17 +405,19 @@ pub struct CerberusApp {
     detail_openness: f32,
     /// The settings drawer (drawn in a later task; for now only the flag).
     drawer_open: bool,
+    /// Until the drawer exists: open the temporary settings header and scroll to it.
+    settings_focus: bool,
     /// Height the app added to the window for an open detail.
     grown_by: f32,
     /// The window size differs from what the app last asked for: the user resized it.
     user_resized: bool,
     /// Inner size the app last asked for (or saw first).
     last_requested: Option<egui::Vec2>,
+    /// The window size before the last request, to tell "not arrived yet" from "arrived differently".
+    size_before_request: Option<egui::Vec2>,
     requested_at: Option<Instant>,
-    /// Grow the window once the detail is fully open.
-    pending_grow: bool,
-    /// Give the added height back once the detail is fully closed.
-    pending_shrink: bool,
+    /// When to grow or give back height.
+    grow: GrowState,
 }
 
 /// A request younger than this may not have reached the window yet.
@@ -486,12 +488,13 @@ impl CerberusApp {
             detail_view: DetailView::default(),
             detail_openness: 0.0,
             drawer_open: false,
+            settings_focus: false,
             grown_by: 0.0,
             user_resized: false,
             last_requested: None,
+            size_before_request: None,
             requested_at: None,
-            pending_grow: false,
-            pending_shrink: false,
+            grow: GrowState::default(),
         }
     }
 
@@ -523,7 +526,7 @@ impl CerberusApp {
         let now = Instant::now();
         self.state.apply_running(self.obsidian_running.load(Ordering::Relaxed), now);
         if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
-            tray.update(tooltip(snapshot, self.state.mode), icon_state(&snapshot.alerts));
+            tray.update(tooltip(snapshot, self.state.mode, !self.routing_names.is_empty()), icon_state(&snapshot.alerts));
         }
 
         if let Some(rx) = &self.launch_rx {
@@ -709,6 +712,7 @@ impl eframe::App for CerberusApp {
         egui::Panel::top("top-bar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| cockpit::top_bar(ui, &self.logo, &mut self.drawer_open));
+        self.stand_in_for_drawer();
         if !items.is_empty() {
             egui::Panel::top("banner-strip")
                 .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
@@ -762,22 +766,28 @@ impl CerberusApp {
         match new {
             Some(kind) => {
                 self.detail_view.tab = effective_tab(kind, self.detail_view.tab);
-                self.pending_grow = true;
-                self.pending_shrink = false;
+                self.grow.content_grew();
             }
-            None => {
-                self.pending_shrink = true;
-                self.pending_grow = false;
-            }
+            None => self.grow.content_closing(),
         }
     }
 
-    /// Esc closes the topmost layer: confirm dialog, drawer, detail.
+    /// Until the drawer exists (task 5) the gear and the balance link open the temporary settings header
+    /// and scroll to it. The request is consumed here, so `drawer_open` never stays set without a drawer.
+    fn stand_in_for_drawer(&mut self) {
+        if self.drawer_open {
+            self.drawer_open = false;
+            self.settings_focus = true;
+        }
+    }
+
+    /// Esc closes the topmost layer: confirm dialog, drawer, detail. A focused text field keeps its Esc.
     fn handle_escape(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) || ctx.egui_wants_keyboard_input() {
             return;
         }
-        match esc_target(self.state.confirm.is_some(), self.drawer_open, self.detail.is_some()) {
+        // No drawer is drawn yet, so it is never the target.
+        match esc_target(self.state.confirm.is_some(), false, self.detail.is_some()) {
             EscTarget::Confirm => self.state.confirm = None,
             EscTarget::Drawer => self.drawer_open = false,
             EscTarget::Detail => self.set_detail(None),
@@ -785,9 +795,12 @@ impl CerberusApp {
         }
     }
 
-    /// A window size other than the one the app asked for last means the user resized it. The first
-    /// size seen counts as asked for; a fresh request gets a moment to arrive.
+    /// Compares the window with what the app asked for. A size that differs long after a request is a
+    /// user resize: the app re-baselines on it (nothing to give back, grows are relative to the user's
+    /// size from then on). A size that arrives differently right after a request is an OS clamp or DPI
+    /// rounding: adopted without counting as a user resize.
     fn track_window_size(&mut self, ctx: &egui::Context) {
+        self.user_resized = false;
         let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
         let actual = rect.size();
         let Some(requested) = self.last_requested else {
@@ -795,45 +808,77 @@ impl CerberusApp {
             return;
         };
         if !differs_from_request((actual.x, actual.y), (requested.x, requested.y)) {
-            self.user_resized = false;
-        } else if self.requested_at.is_none_or(|at| at.elapsed() >= RESIZE_SETTLE) {
-            self.user_resized = true;
+            return;
         }
+        let young = self.requested_at.is_some_and(|at| at.elapsed() < RESIZE_SETTLE);
+        if young {
+            let waiting = self
+                .size_before_request
+                .is_some_and(|before| !differs_from_request((actual.x, actual.y), (before.x, before.y)));
+            if !waiting {
+                // Arrived, but smaller or larger than asked: the OS clamped it.
+                let lost = (requested.y - actual.y).max(0.0);
+                self.grown_by = (self.grown_by - lost).max(0.0);
+                self.last_requested = Some(actual);
+            }
+            return;
+        }
+        self.user_resized = true;
+        self.last_requested = Some(actual);
+        self.grown_by = 0.0;
     }
 
-    fn request_height(&mut self, ctx: &egui::Context, width: f32, height: f32) {
-        let size = egui::vec2(width, height);
+    fn request_height(&mut self, ctx: &egui::Context, current: egui::Vec2, height: f32) {
+        let size = egui::vec2(current.x, height);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        self.size_before_request = Some(current);
         self.last_requested = Some(size);
         self.requested_at = Some(Instant::now());
     }
 
-    /// After a detail has fully opened the window grows to fit it (never past the work area, never when
-    /// the user resized); after it has fully closed the window gives back what it added.
+    /// After the content settled (a frame after a change, the animation finished) the window grows to fit
+    /// it, never past the work area and never when the user is resizing; after the detail has fully
+    /// closed the window gives back what it added.
     fn fit_window(&mut self, ctx: &egui::Context, content_height: f32, scroll_height: f32) {
-        let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
-        let (width, current) = (rect.width(), rect.height());
-        if self.pending_grow && self.detail_openness >= 1.0 {
-            self.pending_grow = false;
-            let needed = current - scroll_height + content_height;
-            let work_area = work_area_height(ctx.input(|i| i.viewport().monitor_size).map(|s| s.y));
-            if let Some(growth) = growth_for(current, needed, work_area, self.user_resized) {
-                self.grown_by += growth.added;
-                self.request_height(ctx, width, growth.target_height);
-            }
+        let action = self.grow.on_frame(self.detail_openness);
+        let still = self.detail_openness >= 1.0 || self.detail_openness <= 0.0;
+        if self.grow.pending() && still {
+            // Not animating, so egui would not draw the frame that does the measuring.
+            ctx.request_repaint();
         }
-        if self.pending_shrink && self.detail_openness <= 0.0 {
-            self.pending_shrink = false;
-            if let Some(height) = shrink_to(current, self.grown_by, self.user_resized) {
-                self.request_height(ctx, width, height);
+        let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
+        let (size, current) = (rect.size(), rect.height());
+        match action {
+            GrowAction::None => {}
+            GrowAction::Grow => {
+                let needed = current - scroll_height + content_height;
+                let (monitor, top, chrome) = ctx.input(|i| {
+                    let v = i.viewport();
+                    let chrome = v.outer_rect.map(|o| (o.height() - current).max(0.0));
+                    (v.monitor_size.map(|m| m.y), v.outer_rect.map(|o| o.min.y), chrome)
+                });
+                let cap = grow_cap(monitor, chrome.unwrap_or(0.0), top);
+                if let Some(growth) = growth_for(current, needed, cap, self.user_resized) {
+                    self.grown_by += growth.added;
+                    self.request_height(ctx, size, growth.target_height);
+                }
             }
-            self.grown_by = 0.0;
+            GrowAction::Shrink => {
+                if let Some(height) = shrink_to(current, self.grown_by, self.user_resized) {
+                    self.request_height(ctx, size, height);
+                }
+                self.grown_by = 0.0;
+            }
         }
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 10.0;
-        if let Some(mode) = cockpit::mode_card_ui(ui, mode_card(self.state.mode), self.state.launching) {
+        if let Some(mode) = cockpit::mode_card_ui(
+            ui,
+            mode_card_with_routing(self.state.mode, !self.routing_names.is_empty()),
+            self.state.launching,
+        ) {
             self.start_launch(ctx, mode, false);
         }
 
@@ -877,20 +922,25 @@ impl CerberusApp {
         }
         if let Some(out) = area_out {
             self.drawer_open |= out.open_drawer;
-            self.pending_grow |= out.layout_changed && self.detail.is_some();
+            if out.layout_changed && self.detail.is_some() {
+                self.grow.content_grew();
+            }
         }
 
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         cockpit::api_line(ui, &api_card(self.state.admin_key_stored, api));
         if let Some(snapshot) = self.state.snapshot.as_ref().filter(|s| s.report.is_some()) {
-            ui.label(
-                RichText::new(format!(
-                    "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
-                    format_time(snapshot.updated),
-                    self.prices_as_of
-                ))
-                .small()
-                .color(theme::palette::MUTED),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
+                        format_time(snapshot.updated),
+                        self.prices_as_of
+                    ))
+                    .small()
+                    .color(MUTED),
+                )
+                .wrap(),
             );
         }
         // The update hint (task 8) goes here.
@@ -942,7 +992,7 @@ impl CerberusApp {
                     .id(id)
                     .password(true)
                     .hint_text(hint)
-                    .desired_width(320.0),
+                    .desired_width((ui.available_width() - 190.0).clamp(100.0, 320.0)),
             );
             let empty = input.is_empty();
             save = ui.add_enabled(!empty, egui::Button::new("Speichern")).clicked();
@@ -957,7 +1007,12 @@ impl CerberusApp {
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Einstellungen (vorübergehend)").default_open(false).show(ui, |ui| {
+        let focus = std::mem::take(&mut self.settings_focus);
+        let mut header = egui::CollapsingHeader::new("Einstellungen (vorübergehend)").default_open(false);
+        if focus {
+            header = header.open(Some(true));
+        }
+        let shown = header.show(ui, |ui| {
             ui.label("API-Key (nur für „Mit API-Key starten“, liegt im Windows-Anmeldeinformationsspeicher)");
             self.draw_key_row(ui, Slot::ApiKey, "sk-ant-…");
             ui.label(
@@ -979,6 +1034,9 @@ impl CerberusApp {
 
             self.draw_balance_settings(ui);
         });
+        if focus {
+            shown.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
     }
 
     fn draw_balance_settings(&mut self, ui: &mut egui::Ui) {
@@ -998,7 +1056,7 @@ impl CerberusApp {
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         let mut action: Option<SettingsAction> = None;
         ui.add_enabled_ui(can_save, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Startwert aus der Console (USD):");
                 ui.add(egui::TextEdit::singleline(&mut self.state.baseline_input).hint_text("65,03").desired_width(90.0));
                 if ui.button("Als Startwert speichern").clicked() {
@@ -1006,7 +1064,7 @@ impl CerberusApp {
                 }
             });
             ui.label(RichText::new("Der Startwert gilt ab jetzt; Aufladungen und Kosten davor zählen nicht.").weak().small());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Aufladung (USD):");
                 ui.add(egui::TextEdit::singleline(&mut self.state.topup_input).hint_text("10").desired_width(90.0));
                 if ui.button("Aufladung hinzufügen").clicked() {
@@ -1025,7 +1083,7 @@ impl CerberusApp {
                     }
                 });
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Monatsbudget (USD, optional):");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.state.budget_input).hint_text("20").desired_width(90.0));
                 self.state.budget_edited |= r.changed();
