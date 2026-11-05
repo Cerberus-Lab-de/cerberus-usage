@@ -75,6 +75,21 @@ impl std::error::Error for NetError {}
 /// Non-2xx statuses are returned as `Ok((status, body))`, not as errors.
 pub trait Http {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), NetError>;
+
+    /// GET returning raw bytes, at most `max_bytes` (an oversized body is an error). The default
+    /// goes through [`Http::get`]; transports that can stream override it.
+    fn get_bytes(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max_bytes: usize,
+    ) -> Result<(u16, Vec<u8>), NetError> {
+        let (status, body) = self.get(url, headers)?;
+        if body.len() > max_bytes {
+            return Err(NetError("Antwort zu groß".to_string()));
+        }
+        Ok((status, body.into_bytes()))
+    }
 }
 
 /// `ureq` with rustls: HTTPS only, no redirects (the key must not follow a redirect), 30 s timeout.
@@ -101,7 +116,7 @@ impl Default for UreqHttp {
     }
 }
 
-fn net_error(e: ureq::Error) -> NetError {
+pub(crate) fn net_error(e: ureq::Error) -> NetError {
     NetError(
         match e {
             ureq::Error::Timeout(_) => "Zeitüberschreitung",
