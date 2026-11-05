@@ -1,5 +1,9 @@
 //! The single egui window: mode display, launcher buttons, usage cards and tables, key settings.
 
+mod banners;
+mod chart;
+mod cockpit;
+mod details;
 pub mod theme;
 
 use std::path::{Path, PathBuf};
@@ -9,16 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
 use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::cards::{
-    ApiCard, BalanceCard, alert_banner_text, api_card, balance_card, inert_limits_hint, update_settings,
-    with_baseline, with_limits, with_topup, without_topup,
+    BalanceCard, api_card, balance_card, inert_limits_hint, update_settings, with_baseline, with_limits,
+    with_topup, without_topup,
 };
-use crate::format::{
-    COST_NOTE, format_count, mode_hint, outcome_message, pause_text, progress_text, routing_warning, unpriced_text,
-};
+use crate::format::{COST_NOTE, outcome_message, pause_text, unpriced_text};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
 use crate::paths::{Env, real_env, resolve_logs_root};
 use crate::paths_ui::{PathsAction, PathsPanel};
@@ -27,6 +29,13 @@ use crate::report::Bucket;
 use crate::settings::{Settings, TopUp};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
+use crate::view::{
+    DetailKind, EscTarget, differs_from_request, esc_target, growth_for, mode_card, shrink_to, toggle_detail,
+    work_area_height,
+};
+use banners::{BannerInput, banner_items, banner_strip};
+use details::{DetailData, DetailView, animated_area, effective_tab};
+use theme::palette::{AMBER, BG, PANEL};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 
 /// How often the background thread asks whether Obsidian runs (each check spawns `tasklist`).
@@ -385,7 +394,32 @@ pub struct CerberusApp {
     tray: Option<Tray>,
     /// Names (never values) of routing variables that are set in this process's environment.
     routing_names: Vec<&'static str>,
+    /// Top-bar logo, decoded once at startup.
+    logo: egui::TextureHandle,
+    /// The open figure-card detail; only one at a time.
+    detail: Option<DetailKind>,
+    /// The detail that is drawn: `detail`, or the one that is still folding up.
+    detail_shown: Option<DetailKind>,
+    detail_view: DetailView,
+    /// Openness (0..=1) of the detail area this frame.
+    detail_openness: f32,
+    /// The settings drawer (drawn in a later task; for now only the flag).
+    drawer_open: bool,
+    /// Height the app added to the window for an open detail.
+    grown_by: f32,
+    /// The window size differs from what the app last asked for: the user resized it.
+    user_resized: bool,
+    /// Inner size the app last asked for (or saw first).
+    last_requested: Option<egui::Vec2>,
+    requested_at: Option<Instant>,
+    /// Grow the window once the detail is fully open.
+    pending_grow: bool,
+    /// Give the added height back once the detail is fully closed.
+    pending_shrink: bool,
 }
+
+/// A request younger than this may not have reached the window yet.
+const RESIZE_SETTLE: Duration = Duration::from_millis(500);
 
 impl CerberusApp {
     fn new(cc: &eframe::CreationContext<'_>, icon: &egui::IconData) -> Self {
@@ -429,6 +463,11 @@ impl CerberusApp {
         state.settings_path = crate::settings::default_path().ok();
         state.reload_settings();
         let paths = PathsPanel::new(&state.settings);
+        let logo = cc.egui_ctx.load_texture(
+            "logo",
+            egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba),
+            egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)),
+        );
 
         Self {
             state,
@@ -441,6 +480,18 @@ impl CerberusApp {
             prices_as_of,
             tray,
             routing_names: routing_env_names(&|n| real_env(n).map(|v| v.to_string_lossy().into_owned())),
+            logo,
+            detail: None,
+            detail_shown: None,
+            detail_view: DetailView::default(),
+            detail_openness: 0.0,
+            drawer_open: false,
+            grown_by: 0.0,
+            user_resized: false,
+            last_requested: None,
+            requested_at: None,
+            pending_grow: false,
+            pending_shrink: false,
         }
     }
 
@@ -627,6 +678,7 @@ impl CerberusApp {
     }
 }
 
+
 impl eframe::App for CerberusApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
@@ -650,141 +702,199 @@ impl eframe::App for CerberusApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.track_window_size(&ctx);
+        self.handle_escape(&ctx);
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.draw(ui, &ctx);
-            });
-        });
+        let items = self.banners();
+        egui::Panel::top("top-bar")
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
+            .show(ui, |ui| cockpit::top_bar(ui, &self.logo, &mut self.drawer_open));
+        if !items.is_empty() {
+            egui::Panel::top("banner-strip")
+                .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
+                .show_separator_line(false)
+                .show(ui, |ui| banner_strip(ui, &items));
+        }
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(12))).show(
+            ui,
+            |ui| {
+                let out = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.draw(ui, &ctx);
+                });
+                self.fit_window(&ctx, out.content_size.y, out.inner_rect.height());
+            },
+        );
         self.draw_confirm(&ctx);
     }
 }
 
 // ---- drawing -------------------------------------------------------------------------------------
 
-pub(crate) fn mode_style(mode: ModeDisplay) -> (&'static str, &'static str, Color32) {
-    match mode {
-        ModeDisplay::Max => (
-            "Max (Abo)",
-            mode_hint(Mode::Max),
-            Color32::from_rgb(46, 160, 90),
-        ),
-        ModeDisplay::ApiKey => (
-            "API-Key (kostet Geld)",
-            mode_hint(Mode::ApiKey),
-            Color32::from_rgb(230, 150, 30),
-        ),
-        ModeDisplay::Unknown => (
-            "Modus unbekannt",
-            "Obsidian läuft, wurde aber nicht über diese App gestartet.",
-            Color32::from_rgb(140, 140, 150),
-        ),
-        ModeDisplay::Closed => (
-            "Obsidian ist geschlossen",
-            "Starte Obsidian über einen der Buttons.",
-            Color32::from_rgb(100, 130, 170),
-        ),
-    }
-}
-
-/// Short mode name for the tray tooltip.
-pub fn mode_title(mode: ModeDisplay) -> &'static str {
-    mode_style(mode).0
-}
-
-fn banner(ui: &mut egui::Ui, fill: Color32, text: &str) {
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(6)
-        .inner_margin(10)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(text).strong().color(Color32::WHITE));
-        });
-}
-
 impl CerberusApp {
-    fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (title, hint, color) = mode_style(self.state.mode);
-        ui.add_space(4.0);
-        ui.label(RichText::new(title).size(30.0).strong().color(color));
-        ui.label(RichText::new(hint).weak());
-        ui.add_space(8.0);
-
-        if self.control.quit_waiting() {
-            banner(ui, Color32::from_rgb(50, 100, 160), "Der Start läuft noch. Die App beendet sich danach.");
-            ui.add_space(8.0);
-        }
-        if let Some(text) = routing_warning(&self.routing_names) {
-            banner(ui, Color32::from_rgb(190, 90, 30), &text);
-            ui.add_space(8.0);
-        }
-        if self.state.worker_gone {
-            banner(
-                ui,
-                Color32::from_rgb(170, 60, 50),
-                "Der Hintergrunddienst ist ausgefallen. Die Zahlen werden nicht mehr aktualisiert. Bitte die App neu starten.",
-            );
-            ui.add_space(8.0);
-        }
-        let report = self.state.snapshot.as_ref().and_then(|s| s.report.as_ref());
-        if let Some(pause) = report.and_then(|r| r.pause.as_ref()) {
-            let text = pause_text(pause.until.with_timezone(&Local), Local::now(), &pause.limit_type);
-            banner(ui, Color32::from_rgb(170, 60, 50), &text);
-            ui.add_space(8.0);
-        }
-        if let Some(err) = self.state.snapshot.as_ref().and_then(|s| s.scan_error.as_ref()) {
-            banner(ui, Color32::from_rgb(170, 60, 50), &format!("Fehler beim Lesen der Protokolle: {err}"));
-            ui.add_space(8.0);
-        }
-        if let Some(err) = self.state.snapshot.as_ref().and_then(|s| s.settings_error.as_ref()) {
-            let place = self.state.settings_path.as_ref().map(|p| format!(". Datei: {}", p.display())).unwrap_or_default();
-            banner(ui, Color32::from_rgb(170, 60, 50), &format!("{}{place}", err.trim_end_matches('.')));
-            ui.add_space(8.0);
-        }
-        for alert in self.state.snapshot.iter().flat_map(|s| s.alerts.iter()) {
-            if let Some(text) = alert_banner_text(alert) {
-                banner(ui, Color32::from_rgb(190, 90, 30), text);
-                ui.add_space(8.0);
-            }
-        }
-        if let Some(notice) = &self.state.notice {
-            let fill = match notice.kind {
-                NoticeKind::Info => Color32::from_rgb(50, 100, 160),
-                NoticeKind::Error => Color32::from_rgb(170, 60, 50),
-            };
-            banner(ui, fill, &notice.text);
-            ui.add_space(8.0);
-        }
-
-        self.draw_launcher(ui, ctx);
-        ui.add_space(12.0);
-        self.draw_anthropic(ui);
-        ui.add_space(12.0);
-        self.draw_usage(ui);
-        ui.add_space(12.0);
-        self.draw_settings(ui);
+    /// Every v1 banner, in severity colours.
+    fn banners(&self) -> Vec<(crate::view::Tone, String)> {
+        let snapshot = self.state.snapshot.as_ref();
+        let pause_text = snapshot
+            .and_then(|s| s.report.as_ref())
+            .and_then(|r| r.pause.as_ref())
+            .map(|pause| pause_text(pause.until.with_timezone(&Local), Local::now(), &pause.limit_type));
+        let alerts: &[crate::balance::Alert] = snapshot.map_or(&[], |s| s.alerts.as_slice());
+        banner_items(&BannerInput {
+            quit_waiting: self.control.quit_waiting(),
+            routing_names: &self.routing_names,
+            worker_gone: self.state.worker_gone,
+            pause_text,
+            scan_error: snapshot.and_then(|s| s.scan_error.as_deref()),
+            settings_error: snapshot.and_then(|s| s.settings_error.as_deref()),
+            settings_path: self.state.settings_path.as_deref(),
+            alerts,
+            notice: self.state.notice.as_ref(),
+        })
     }
 
-    fn draw_launcher(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let idle = self.state.launching.is_none();
-        let mut start: Option<Mode> = None;
-        ui.horizontal(|ui| {
-            let size = egui::vec2(190.0, 36.0);
-            if ui.add_enabled(idle, egui::Button::new("Mit Max starten").min_size(size)).clicked() {
-                start = Some(Mode::Max);
+    /// Opens, switches or closes the detail area and queues the matching window change.
+    fn set_detail(&mut self, new: Option<DetailKind>) {
+        if new == self.detail {
+            return;
+        }
+        self.detail = new;
+        self.detail_view.rows_expanded = false;
+        match new {
+            Some(kind) => {
+                self.detail_view.tab = effective_tab(kind, self.detail_view.tab);
+                self.pending_grow = true;
+                self.pending_shrink = false;
             }
-            if ui.add_enabled(idle, egui::Button::new("Mit API-Key starten").min_size(size)).clicked() {
-                start = Some(Mode::ApiKey);
+            None => {
+                self.pending_shrink = true;
+                self.pending_grow = false;
             }
-            if let Some((_, confirmed)) = self.state.launching {
-                ui.spinner();
-                ui.label(if confirmed { "Obsidian wird geschlossen …" } else { "Obsidian wird gestartet …" });
+        }
+    }
+
+    /// Esc closes the topmost layer: confirm dialog, drawer, detail.
+    fn handle_escape(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            return;
+        }
+        match esc_target(self.state.confirm.is_some(), self.drawer_open, self.detail.is_some()) {
+            EscTarget::Confirm => self.state.confirm = None,
+            EscTarget::Drawer => self.drawer_open = false,
+            EscTarget::Detail => self.set_detail(None),
+            EscTarget::Nothing => {}
+        }
+    }
+
+    /// A window size other than the one the app asked for last means the user resized it. The first
+    /// size seen counts as asked for; a fresh request gets a moment to arrive.
+    fn track_window_size(&mut self, ctx: &egui::Context) {
+        let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
+        let actual = rect.size();
+        let Some(requested) = self.last_requested else {
+            self.last_requested = Some(actual);
+            return;
+        };
+        if !differs_from_request((actual.x, actual.y), (requested.x, requested.y)) {
+            self.user_resized = false;
+        } else if self.requested_at.is_none_or(|at| at.elapsed() >= RESIZE_SETTLE) {
+            self.user_resized = true;
+        }
+    }
+
+    fn request_height(&mut self, ctx: &egui::Context, width: f32, height: f32) {
+        let size = egui::vec2(width, height);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        self.last_requested = Some(size);
+        self.requested_at = Some(Instant::now());
+    }
+
+    /// After a detail has fully opened the window grows to fit it (never past the work area, never when
+    /// the user resized); after it has fully closed the window gives back what it added.
+    fn fit_window(&mut self, ctx: &egui::Context, content_height: f32, scroll_height: f32) {
+        let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
+        let (width, current) = (rect.width(), rect.height());
+        if self.pending_grow && self.detail_openness >= 1.0 {
+            self.pending_grow = false;
+            let needed = current - scroll_height + content_height;
+            let work_area = work_area_height(ctx.input(|i| i.viewport().monitor_size).map(|s| s.y));
+            if let Some(growth) = growth_for(current, needed, work_area, self.user_resized) {
+                self.grown_by += growth.added;
+                self.request_height(ctx, width, growth.target_height);
             }
-        });
-        if let Some(mode) = start {
+        }
+        if self.pending_shrink && self.detail_openness <= 0.0 {
+            self.pending_shrink = false;
+            if let Some(height) = shrink_to(current, self.grown_by, self.user_resized) {
+                self.request_height(ctx, width, height);
+            }
+            self.grown_by = 0.0;
+        }
+    }
+
+    fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.spacing_mut().item_spacing.y = 10.0;
+        if let Some(mode) = cockpit::mode_card_ui(ui, mode_card(self.state.mode), self.state.launching) {
             self.start_launch(ctx, mode, false);
         }
+
+        let open = self.detail.is_some();
+        let t = ctx.animate_bool_with_time(egui::Id::unique("detail-open"), open, 0.18);
+        self.detail_openness = t;
+        if open {
+            self.detail_shown = self.detail;
+        } else if t <= 0.0 {
+            self.detail_shown = None;
+        }
+
+        let mut clicked = None;
+        let mut area_out = None;
+        match self.state.snapshot.as_ref() {
+            None => {
+                ui.label("Lese Protokolle …");
+            }
+            Some(snapshot) => match &snapshot.report {
+                None => cockpit::scan_progress(ui, snapshot.scanned_files, snapshot.total_files),
+                Some(report) => {
+                    let balance = snapshot.balance.as_ref();
+                    let balance_view = balance_card(balance, &self.state.settings);
+                    let balance_error = balance.filter(|b| b.cost_deducted).and_then(|b| b.error.as_ref());
+                    let issue = balance_error.is_some()
+                        || matches!(&balance_view, BalanceCard::Estimate { note: Some(_), .. });
+                    let figures = cockpit::figures(report, &balance_view, issue);
+                    clicked = cockpit::figure_cards(ui, &figures, self.detail);
+                    if let Some(kind) = self.detail_shown {
+                        let data = DetailData { report, balance: &balance_view, balance_error };
+                        let view = &mut self.detail_view;
+                        area_out = animated_area(ui, egui::Id::unique("detail-area"), t, |ui| {
+                            details::show(ui, kind, &data, view)
+                        });
+                    }
+                }
+            },
+        }
+        if let Some(kind) = clicked {
+            self.set_detail(toggle_detail(self.detail, kind));
+        }
+        if let Some(out) = area_out {
+            self.drawer_open |= out.open_drawer;
+            self.pending_grow |= out.layout_changed && self.detail.is_some();
+        }
+
+        let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
+        cockpit::api_line(ui, &api_card(self.state.admin_key_stored, api));
+        if let Some(snapshot) = self.state.snapshot.as_ref().filter(|s| s.report.is_some()) {
+            ui.label(
+                RichText::new(format!(
+                    "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
+                    format_time(snapshot.updated),
+                    self.prices_as_of
+                ))
+                .small()
+                .color(theme::palette::MUTED),
+            );
+        }
+        // The update hint (task 8) goes here.
+        self.draw_settings(ui);
     }
 
     fn draw_confirm(&mut self, ctx: &egui::Context) {
@@ -812,65 +922,6 @@ impl CerberusApp {
             Some(false) => self.state.confirm = None,
             None => {}
         }
-    }
-
-    fn draw_usage(&self, ui: &mut egui::Ui) {
-        let Some(snapshot) = &self.state.snapshot else {
-            ui.label("Lese Protokolle …");
-            return;
-        };
-        let Some(report) = &snapshot.report else {
-            ui.label(progress_text(snapshot.scanned_files, snapshot.total_files));
-            return;
-        };
-
-        ui.heading("Lokal geschätzt");
-        ui.label(
-            RichText::new("Aus den Claude-Protokollen auf diesem Rechner, nach Listenpreis berechnet. Das ist nicht die Rechnung.")
-                .weak()
-                .small(),
-        );
-        ui.add_space(4.0);
-        ui.horizontal_top(|ui| {
-            let width = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
-            card(ui, width, "Heute", &report.today);
-            card(ui, width, "Dieser Monat", &report.month);
-            card(ui, width, "Letzte 5 Std.", &report.last_5h);
-        });
-        ui.add_space(12.0);
-
-        ui.heading("Diesen Monat nach Projekt");
-        bucket_table(ui, "by_project", "Projekt", &report.by_project);
-        ui.add_space(12.0);
-        ui.heading("Diesen Monat nach Modell");
-        bucket_table(ui, "by_model", "Modell", &report.by_model);
-        ui.add_space(8.0);
-
-        ui.label(
-            RichText::new(format!(
-                "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
-                format_time(snapshot.updated),
-                self.prices_as_of
-            ))
-            .weak()
-            .small(),
-        );
-    }
-
-    fn draw_anthropic(&self, ui: &mut egui::Ui) {
-        ui.heading("Laut Anthropic");
-        ui.label(RichText::new("Von Anthropic gemeldete Werte bzw. daraus geschätzt, getrennt von der lokalen Schätzung.").weak().small());
-        ui.add_space(4.0);
-        let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
-        let balance = self.state.snapshot.as_ref().and_then(|s| s.balance.as_ref());
-        let api_view = api_card(self.state.admin_key_stored, api);
-        let balance_view = balance_card(balance, &self.state.settings);
-        let balance_error = balance.filter(|b| b.cost_deducted).and_then(|b| b.error.as_ref());
-        ui.horizontal_top(|ui| {
-            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-            titled_card(ui, width, "API-Kosten laut Anthropic", |ui| draw_api_card(ui, &api_view));
-            titled_card(ui, width, "Guthaben (geschätzt)", |ui| draw_balance_card(ui, &balance_view, balance_error));
-        });
     }
 
     fn draw_key_row(&mut self, ui: &mut egui::Ui, slot: Slot, hint: &str) {
@@ -906,7 +957,7 @@ impl CerberusApp {
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Einstellungen").default_open(false).show(ui, |ui| {
+        egui::CollapsingHeader::new("Einstellungen (vorübergehend)").default_open(false).show(ui, |ui| {
             ui.label("API-Key (nur für „Mit API-Key starten“, liegt im Windows-Anmeldeinformationsspeicher)");
             self.draw_key_row(ui, Slot::ApiKey, "sk-ant-…");
             ui.label(
@@ -942,7 +993,7 @@ impl CerberusApp {
                 ),
                 None => "Speichern nicht möglich: Die Umgebungsvariable LOCALAPPDATA ist nicht gesetzt, es gibt keinen Ort für die Einstellungen.".to_string(),
             };
-            ui.colored_label(Color32::from_rgb(230, 150, 30), text);
+            ui.colored_label(AMBER, text);
         }
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         let mut action: Option<SettingsAction> = None;
@@ -986,7 +1037,7 @@ impl CerberusApp {
                 }
             });
             if let Some(hint) = inert_limits_hint(api) {
-                ui.colored_label(WARN, hint);
+                ui.colored_label(AMBER, hint);
             }
         });
         if let Some(action) = action {
@@ -997,132 +1048,6 @@ impl CerberusApp {
 
 fn format_time(t: DateTime<Local>) -> String {
     t.format("%d.%m.%Y %H:%M:%S").to_string()
-}
-
-fn token_summary(b: &Bucket) -> String {
-    format!(
-        "{} Ein · {} Cache · {} Aus",
-        format_count(b.input),
-        format_count(b.cache_read.saturating_add(b.cache_write)),
-        format_count(b.output)
-    )
-}
-
-fn card(ui: &mut egui::Ui, width: f32, title: &str, b: &Bucket) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(width - 20.0);
-        // The surrounding row is horizontal; each card stacks its lines vertically.
-        ui.vertical(|ui| {
-            ui.label(RichText::new(title).strong());
-            ui.label(RichText::new(format_usd(b.cost_nano)).size(26.0).strong());
-            ui.label(RichText::new(COST_NOTE).weak().small());
-            if let Some(text) = unpriced_text(b.unpriced_requests) {
-                ui.label(RichText::new(text).small().color(Color32::from_rgb(230, 150, 30)));
-            }
-            ui.add_space(4.0);
-            ui.label(format!("{} Anfragen", format_count(b.requests)));
-            ui.label(RichText::new(token_summary(b)).small());
-        });
-    });
-}
-
-/// A framed card with a title; `body` stacks its lines vertically.
-fn titled_card(ui: &mut egui::Ui, width: f32, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(width - 20.0);
-        ui.vertical(|ui| {
-            ui.label(RichText::new(title).strong());
-            body(ui);
-        });
-    });
-}
-
-const WARN: Color32 = Color32::from_rgb(230, 150, 30);
-
-fn draw_api_card(ui: &mut egui::Ui, view: &ApiCard) {
-    match view {
-        ApiCard::NoKey => {
-            ui.label("Kein Admin-Key gespeichert. Kosten-API nur mit Organisations-Konto.");
-        }
-        ApiCard::Pending => {
-            ui.label("Warte auf die erste Abfrage …");
-        }
-        ApiCard::Error(text) => {
-            ui.colored_label(WARN, text);
-        }
-        ApiCard::Data { today, month, updated, error } => {
-            ui.label(RichText::new(format!("Heute {today}")).size(22.0).strong());
-            ui.label(format!("Dieser Monat {month}"));
-            ui.label(RichText::new(format!("Stand: {updated}")).small());
-            ui.label(
-                RichText::new("Die Daten können mehrere Stunden hinterherhinken (laut Anthropic etwa 4 Std., bis zu 24 Std.).")
-                    .weak()
-                    .small(),
-            );
-            if let Some(text) = error {
-                ui.colored_label(WARN, text);
-            }
-        }
-    }
-}
-
-fn draw_balance_card(ui: &mut egui::Ui, view: &BalanceCard, error: Option<&crate::analytics::ApiError>) {
-    match view {
-        BalanceCard::NoBaseline => {
-            ui.label("Noch kein Startwert. Trage unter Einstellungen den aktuellen Betrag aus der Console ein.");
-        }
-        BalanceCard::Estimate { value, deducted, details, note } => {
-            ui.label(RichText::new(value).size(26.0).strong());
-            ui.label(RichText::new(if *deducted { "geschätzt" } else { "geschätzt, ohne Kostenabzug" }).weak().small());
-            for line in details {
-                ui.label(RichText::new(line).small());
-            }
-            if let Some(note) = note {
-                ui.colored_label(WARN, note);
-            }
-            if let Some(e) = error {
-                ui.colored_label(WARN, crate::cards::api_error_text(e));
-            }
-        }
-    }
-}
-
-/// Right-aligned cell with a fixed width, so every column (and the row striping) has a stable size.
-fn right(ui: &mut egui::Ui, width: f32, text: impl Into<String>) {
-    let size = egui::vec2(width, ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(text.into());
-    });
-}
-
-fn bucket_table(ui: &mut egui::Ui, id: &str, first_col: &str, rows: &[(String, Bucket)]) {
-    if rows.is_empty() {
-        ui.label(RichText::new("Noch keine Anfragen in diesem Monat.").weak());
-        return;
-    }
-    // Horizontal scroll: the cost column is always reachable, even in a narrow window. Long names are
-    // cut (full name as tooltip) so the table stays about as wide as the default window.
-    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
-        egui::Grid::new(id).striped(true).num_columns(5).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.label(RichText::new(first_col).strong());
-            right(ui, 70.0, "Anfragen");
-            right(ui, 120.0, "Ein (inkl. Cache)");
-            right(ui, 80.0, "Aus");
-            right(ui, 250.0, format!("Kosten ({COST_NOTE})"));
-            ui.end_row();
-            for (name, b) in rows {
-                ui.scope(|ui| {
-                    ui.set_max_width(200.0);
-                    ui.add(egui::Label::new(name.as_str()).truncate()).on_hover_text(name.as_str());
-                });
-                right(ui, 70.0, format_count(b.requests));
-                right(ui, 120.0, format_count(b.input.saturating_add(b.cache_read).saturating_add(b.cache_write)));
-                right(ui, 80.0, format_count(b.output));
-                right(ui, 250.0, cost_cell_text(b));
-                ui.end_row();
-            }
-        });
-    });
 }
 
 // ---- startup -------------------------------------------------------------------------------------
@@ -1139,8 +1064,8 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cerberus Usage")
-            .with_inner_size([820.0, 760.0])
-            .with_min_inner_size([620.0, 420.0])
+            .with_inner_size([480.0, 640.0])
+            .with_min_inner_size([420.0, 480.0])
             .with_icon(icon.clone()),
         ..Default::default()
     };

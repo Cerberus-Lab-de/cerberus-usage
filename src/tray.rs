@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use eframe::egui::{self, IconData, ViewportCommand};
 use crate::balance::Alert;
 use crate::pricing::format_usd;
-use crate::ui::{ModeDisplay, mode_title};
+use crate::ui::ModeDisplay;
+use crate::view::mode_card;
 use crate::worker::Snapshot;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -191,7 +192,7 @@ pub fn icon_with_badge(rgba: &[u8], width: u32, height: u32, state: IconState) -
 /// Tooltip text: mode, today's estimated cost, a hint when warnings are active. Windows cuts tooltips
 /// at 127 characters. Built from the snapshot only, which never holds a key.
 pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay) -> String {
-    let mut text = format!("Cerberus Usage · {}", mode_title(mode));
+    let mut text = format!("Cerberus Usage · {}", mode_card(mode).title);
     if let Some(report) = &snapshot.report {
         text.push_str(&format!(" · heute {} (geschätzt)", format_usd(report.today.cost_nano)));
     }

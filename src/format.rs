@@ -47,15 +47,6 @@ where
     format!("Max pausiert bis {when} ({})", limit_type_label(limit_type))
 }
 
-/// The short honest line under the mode title. The app cannot see an `apiKeyHelper` or an `env`
-/// block in Claude's own settings, so neither mode promises more than the child environment.
-pub fn mode_hint(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Max => "Start ohne API-Key. Es gilt dein Max-Abo, sofern in Claude keine andere Anmeldung eingerichtet ist.",
-        Mode::ApiKey => "Start mit deinem API-Key. Abgerechnet wird dieser Key, sofern in Claude keine andere Anmeldung eingerichtet ist.",
-    }
-}
-
 /// Warning for routing variables that were left untouched. Takes names only, never values.
 pub fn routing_warning(names: &[&str]) -> Option<String> {
     if names.is_empty() {
@@ -165,16 +156,6 @@ mod tests {
         let names = crate::launcher::routing_env_names(&env);
         let text = routing_warning(&names).unwrap();
         assert!(!text.contains("secret-gateway") && !text.contains("KEY123"), "{text}");
-    }
-
-    #[test]
-    fn mode_hints_do_not_promise_more_than_the_app_can_know() {
-        for mode in [Mode::Max, Mode::ApiKey] {
-            let hint = mode_hint(mode);
-            assert!(!hint.contains("keine API-Kosten"), "{hint}");
-            assert!(hint.contains("sofern"), "{hint}");
-        }
-        assert!(mode_hint(Mode::Max).starts_with("Start ohne API-Key."));
     }
 
     #[test]

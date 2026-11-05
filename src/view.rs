@@ -161,6 +161,37 @@ pub fn shrink_after_collapse(current: f32, added: f32, user_resized: bool) -> Op
     Some(current - added)
 }
 
+/// Smallest window height the app ever sets (matches `with_min_inner_size`).
+pub const MIN_HEIGHT: f32 = 480.0;
+/// Height reserved for the taskbar when the work area is derived from the monitor size.
+pub const TASKBAR_RESERVE: f32 = 48.0;
+/// How far the actual window size may differ from the requested one before it counts as a user resize.
+pub const RESIZE_TOLERANCE: f32 = 2.0;
+
+/// Usable height: monitor height minus the taskbar. `None` (monitor unknown): the app does not grow.
+pub fn work_area_height(monitor_height: Option<f32>) -> Option<f32> {
+    monitor_height.map(|h| (h - TASKBAR_RESERVE).max(0.0))
+}
+
+/// The window has a size other than the one the app asked for last: the user resized it.
+pub fn differs_from_request(actual: (f32, f32), requested: (f32, f32)) -> bool {
+    (actual.0 - requested.0).abs() > RESIZE_TOLERANCE || (actual.1 - requested.1).abs() > RESIZE_TOLERANCE
+}
+
+/// `grow_for_content` with the work area possibly unknown and a result never below the current height.
+pub fn growth_for(current: f32, needed: f32, work_area: Option<f32>, user_resized: bool) -> Option<Growth> {
+    let work_area = work_area?;
+    let g = grow_for_content(current, needed, work_area, user_resized)?;
+    let target_height = g.target_height.max(current);
+    Some(Growth { target_height, added: target_height - current })
+}
+
+/// `shrink_after_collapse` clamped to the minimum height; `None` when nothing would change.
+pub fn shrink_to(current: f32, added: f32, user_resized: bool) -> Option<f32> {
+    let h = shrink_after_collapse(current, added, user_resized)?.max(MIN_HEIGHT);
+    (h < current).then_some(h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +319,38 @@ mod tests {
         assert_eq!(shrink_after_collapse(800.0, 160.0, false), Some(640.0));
         assert_eq!(shrink_after_collapse(800.0, 0.0, false), None);
         assert_eq!(shrink_after_collapse(800.0, -5.0, false), None);
+    }
+
+    #[test]
+    fn work_area_is_monitor_minus_taskbar_or_unknown() {
+        assert_eq!(work_area_height(Some(1080.0)), Some(1032.0));
+        assert_eq!(work_area_height(None), None);
+        assert_eq!(work_area_height(Some(20.0)), Some(0.0));
+    }
+
+    #[test]
+    fn user_resize_is_detected_with_tolerance() {
+        assert!(!differs_from_request((480.0, 640.0), (480.0, 640.0)));
+        assert!(!differs_from_request((481.5, 638.5), (480.0, 640.0)));
+        assert!(differs_from_request((480.0, 643.0), (480.0, 640.0)));
+        assert!(differs_from_request((500.0, 640.0), (480.0, 640.0)));
+    }
+
+    #[test]
+    fn growth_needs_a_known_work_area_and_never_goes_below_current() {
+        assert!(growth_for(640.0, 900.0, None, false).is_none());
+        let g = growth_for(640.0, 900.0, Some(800.0), false).unwrap();
+        assert_eq!((g.target_height, g.added), (800.0, 160.0));
+        assert!(growth_for(640.0, 900.0, Some(500.0), false).is_none());
+        assert!(growth_for(640.0, 900.0, Some(800.0), true).is_none());
+    }
+
+    #[test]
+    fn shrink_is_clamped_to_the_minimum_height() {
+        assert_eq!(shrink_to(800.0, 160.0, false), Some(640.0));
+        assert_eq!(shrink_to(560.0, 200.0, false), Some(MIN_HEIGHT));
+        assert_eq!(shrink_to(480.0, 200.0, false), None);
+        assert_eq!(shrink_to(800.0, 160.0, true), None);
+        assert_eq!(shrink_to(800.0, 0.0, false), None);
     }
 }

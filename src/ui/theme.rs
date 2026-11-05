@@ -100,7 +100,6 @@ fn visuals() -> egui::Visuals {
     v.window_stroke = Stroke::new(1.0, LINE);
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(10);
-    v.override_text_color = Some(TEXT);
     v.weak_text_color = Some(MUTED);
     v.hyperlink_color = CYAN;
     v.selection.bg_fill = CYAN_DARK;
