@@ -147,6 +147,8 @@ pub enum ApiError {
     Server(u16),
     /// The answer could not be understood.
     Parse(String),
+    /// The balance baseline is older than the API allows (365 days): no request is made.
+    BaselineTooOld,
 }
 
 impl fmt::Display for ApiError {
@@ -164,6 +166,7 @@ impl fmt::Display for ApiError {
             ApiError::Network(m) => write!(f, "Netzwerkfehler: {m}"),
             ApiError::Server(code) => write!(f, "Serverfehler der API (HTTP {code})"),
             ApiError::Parse(m) => write!(f, "Antwort der API nicht lesbar: {m}"),
+            ApiError::BaselineTooOld => f.write_str("Startwert zu alt, bitte neu eintragen"),
         }
     }
 }
@@ -374,7 +377,10 @@ pub struct ApiStatus {
     /// when no baseline is set or no poll including it has succeeded yet.
     pub since_nano: Option<u64>,
     pub updated: DateTime<Local>,
+    /// Error of the today/month request. The figures above stay as they were.
     pub error: Option<ApiError>,
+    /// Error of the "since baseline" request only; it never freezes today and month.
+    pub since_error: Option<ApiError>,
     /// True once a poll has succeeded. False means the figures are placeholders (0) after a first
     /// failed poll and must not be shown as costs.
     pub has_data: bool,
@@ -433,9 +439,27 @@ fn fetch_totals<Tz: TimeZone>(
     Ok((today, month))
 }
 
-/// Total cost in `[from, to)` with hourly buckets. The API rounds `from` down to the full hour,
-/// so the sum may include up to one hour of cost before `from`.
+/// The API only serves `starting_at` within this many days.
+const MAX_LOOKBACK_DAYS: i64 = 365;
+
+/// Rounds down to the full hour, like the API does with both ends of a range.
+fn floor_hour(t: DateTime<Utc>) -> DateTime<Utc> {
+    let ts = t.timestamp();
+    DateTime::from_timestamp(ts - ts.rem_euclid(3600), 0).unwrap_or(t)
+}
+
+/// Total cost in `[from, to)` with hourly buckets. Both ends are rounded down to the full hour
+/// (as the API does), so the sum may include up to one hour of cost before `from`. When both
+/// ends fall into the same hour there is nothing to ask: no request, cost 0. A start older than
+/// 365 days is refused without a request.
 fn fetch_since(http: &dyn Http, key: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<u64, ApiError> {
+    if to.signed_duration_since(from) > Duration::days(MAX_LOOKBACK_DAYS) {
+        return Err(ApiError::BaselineTooOld);
+    }
+    let (from, to) = (floor_hour(from), floor_hour(to));
+    if from >= to {
+        return Ok(0);
+    }
     let rows = fetch_cost(http, key, from, to, "1h")?;
     Ok(sum_where(&rows, |_| true))
 }
@@ -514,25 +538,35 @@ impl ApiPoller {
             }
         };
         self.last_attempt = Some(now);
-        let result = fetch_totals(self.http.as_ref(), &key, &wall).and_then(|(today, month)| {
-            let since = match self.since {
-                Some(from) => Some(fetch_since(self.http.as_ref(), &key, from, wall.with_timezone(&Utc))?),
-                None => None,
-            };
-            Ok((today, month, since))
-        });
+        let totals = fetch_totals(self.http.as_ref(), &key, &wall);
+        // Today and month are settled first. The baseline request comes after and can only set its own
+        // error; it never freezes the totals. Without fresh totals there is no point in asking.
+        let since_result = match (&totals, self.since) {
+            (Ok(_), Some(from)) => Some(fetch_since(self.http.as_ref(), &key, from, wall.with_timezone(&Utc))),
+            _ => None,
+        };
         drop(key);
 
         let updated = wall.with_timezone(&Local);
-        self.status = Some(match (result, before.clone()) {
-            (Ok((today_nano, month_nano, since_nano)), _) => ApiStatus {
-                today_nano,
-                month_nano,
-                since_nano,
-                updated,
-                error: None,
-                has_data: true,
-            },
+        self.status = Some(match (totals, before.clone()) {
+            (Ok((today_nano, month_nano)), previous) => {
+                let (since_nano, since_error) = match since_result {
+                    None => (None, None),
+                    Some(Ok(v)) => (Some(v), None),
+                    Some(Err(ApiError::BaselineTooOld)) => (None, Some(ApiError::BaselineTooOld)),
+                    // Any other failure keeps the last known figure (if any) and reports itself.
+                    Some(Err(e)) => (previous.and_then(|p| p.since_nano), Some(e)),
+                };
+                ApiStatus {
+                    today_nano,
+                    month_nano,
+                    since_nano,
+                    updated,
+                    error: None,
+                    since_error,
+                    has_data: true,
+                }
+            }
             (Err(e), Some(previous)) => ApiStatus { error: Some(e), ..previous },
             (Err(e), None) => ApiStatus {
                 today_nano: 0,
@@ -540,6 +574,7 @@ impl ApiPoller {
                 since_nano: None,
                 updated,
                 error: Some(e),
+                since_error: None,
                 has_data: false,
             },
         });
@@ -1021,7 +1056,7 @@ mod tests {
         let requests = http.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].0.contains("time_bucket_width=1h"), "{}", requests[1].0);
-        assert!(requests[1].0.contains("starting_at=2026-10-12T08%3A30%3A00Z"), "{}", requests[1].0);
+        assert!(requests[1].0.contains("starting_at=2026-10-12T08%3A00%3A00Z"), "{}", requests[1].0);
         assert!(requests[1].0.contains("ending_at=2026-10-15T12%3A00%3A00Z"), "{}", requests[1].0);
     }
 
@@ -1058,12 +1093,79 @@ mod tests {
     }
 
     #[test]
-    fn since_request_failing_keeps_totals_consistent_with_one_error() {
+    fn since_request_failing_keeps_fresh_totals_and_sets_only_its_own_error() {
         let (mut p, _http) = poller(Some(KEY), vec![ok(&totals_body()), Ok((429, "{}".into()))]);
         p.set_since(Some(utc("2026-10-12T08:30:00Z")));
+        assert!(p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z")));
+        let s = p.current().unwrap();
+        // Totals are fresh and error-free; only the balance side carries the failure.
+        assert_eq!((s.today_nano, s.month_nano), (1_000_000_000, 3_500_000_000));
+        assert_eq!((s.since_nano, s.error.clone(), s.since_error.clone()), (None, None, Some(ApiError::RateLimited)));
+        assert!(s.has_data);
+    }
+
+    #[test]
+    fn a_failing_since_request_keeps_the_last_figure_while_totals_move_on() {
+        let (mut p, _http) = poller(
+            Some(KEY),
+            vec![ok(&totals_body()), ok(&since_body()), ok(&totals_body()), Ok((500, "{}".into()))],
+        );
+        p.set_since(Some(utc("2026-10-12T08:30:00Z")));
+        let t0 = Instant::now();
+        p.refresh(t0, cet("2026-10-15T12:00:00Z"));
+        p.refresh(t0 + DEFAULT_API_INTERVAL, cet("2026-10-15T12:05:00Z"));
+        let s = p.current().unwrap();
+        assert_eq!(s.since_nano, Some(425_000_000));
+        assert_eq!((s.error.clone(), s.since_error.clone()), (None, Some(ApiError::Server(500))));
+        assert_eq!(s.updated.with_timezone(&Utc), utc("2026-10-15T12:05:00Z"));
+    }
+
+    #[test]
+    fn baseline_in_the_same_utc_hour_makes_no_request_and_counts_zero() {
+        let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body())]);
+        p.set_since(Some(utc("2026-10-15T12:10:00Z")));
+        p.refresh(Instant::now(), cet("2026-10-15T12:50:00Z"));
+        let s = p.current().unwrap();
+        assert_eq!((s.since_nano, s.since_error.clone()), (Some(0), None), "counted as deducted, cost 0");
+        assert_eq!(http.request_count(), 1, "only the totals request goes out");
+    }
+
+    #[test]
+    fn since_range_is_floored_to_the_hour_on_both_ends() {
+        let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body()), ok(&since_body())]);
+        p.set_since(Some(utc("2026-10-12T08:30:00Z")));
+        p.refresh(Instant::now(), cet("2026-10-15T12:45:10Z"));
+        let requests = http.requests.lock().unwrap();
+        assert!(requests[1].0.contains("starting_at=2026-10-12T08%3A00%3A00Z"), "{}", requests[1].0);
+        assert!(requests[1].0.contains("ending_at=2026-10-15T12%3A00%3A00Z"), "{}", requests[1].0);
+    }
+
+    #[test]
+    fn baseline_older_than_365_days_makes_no_request_and_says_so() {
+        let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body())]);
+        p.set_since(Some(utc("2025-10-14T00:00:00Z")));
         p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z"));
         let s = p.current().unwrap();
-        assert_eq!((s.today_nano, s.since_nano, s.error.clone()), (0, None, Some(ApiError::RateLimited)));
+        assert_eq!((s.since_nano, s.since_error.clone()), (None, Some(ApiError::BaselineTooOld)));
+        assert_eq!(s.error, None);
+        assert_eq!(s.today_nano, 1_000_000_000, "totals stay fresh");
+        assert_eq!(http.request_count(), 1);
+        assert_eq!(ApiError::BaselineTooOld.to_string(), "Startwert zu alt, bitte neu eintragen");
+
+    }
+
+    #[test]
+    fn the_365_day_limit_is_exact() {
+        let end = utc("2027-06-01T12:00:00Z");
+        // No answers are prepared: a request that goes out fails with a network error, a refused one with TooOld.
+        let http = FakeHttp::new(vec![]);
+        let at_limit = fetch_since(&http, KEY, end - Duration::days(365), end);
+        assert!(matches!(at_limit, Err(ApiError::Network(_))), "{at_limit:?}");
+        assert_eq!(http.request_count(), 1);
+        let http = FakeHttp::new(vec![]);
+        let over = fetch_since(&http, KEY, end - Duration::days(365) - Duration::hours(1), end);
+        assert_eq!(over, Err(ApiError::BaselineTooOld));
+        assert_eq!(http.request_count(), 0);
     }
 
     fn at(s: &str, hours: i32) -> DateTime<FixedOffset> {

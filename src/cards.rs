@@ -138,15 +138,31 @@ pub fn balance_card(balance: Option<&BalanceStatus>, settings: &Settings) -> Bal
     }
     let note = (!balance.cost_deducted).then(|| {
         let date = base.map_or_else(|| balance.updated.format("%d.%m.%Y").to_string(), |b| date_text(b.at));
-        format!(
-            "Stand vom {date}, ohne Kostenabzug: Kosten-API nicht verfügbar. Startwert bei Bedarf neu eintragen."
-        )
+        let reason = match &balance.error {
+            None | Some(ApiError::NotAvailable) => "Kosten-API nicht verfügbar".to_string(),
+            Some(ApiError::BaselineTooOld) => return format!("Stand vom {date}, ohne Kostenabzug: {}.", ApiError::BaselineTooOld),
+            Some(_) => "Kosten seit dem Startwert nicht abrufbar".to_string(),
+        };
+        format!("Stand vom {date}, ohne Kostenabzug: {reason}. Startwert bei Bedarf neu eintragen.")
     });
     BalanceCard::Estimate {
         value: format_usd_signed(balance.estimate_nano),
         deducted: balance.cost_deducted,
         details,
         note,
+    }
+}
+
+/// Shown next to the limit fields while no Cost API answers: the budget warning compares the API
+/// month cost with the limit, so without it nothing can ever fire.
+pub const INERT_LIMITS_HINT: &str = "Ohne Kosten-API wird die Budget-Warnung nicht ausgelöst; die Guthaben-Warnung sieht nur Startwert und Aufladungen.";
+
+/// `Some` when the Cost API is absent or not available, i.e. the budget warning is inert.
+pub fn inert_limits_hint(api: Option<&ApiStatus>) -> Option<&'static str> {
+    match api {
+        None => Some(INERT_LIMITS_HINT),
+        Some(a) if a.error == Some(ApiError::NotAvailable) => Some(INERT_LIMITS_HINT),
+        Some(_) => None,
     }
 }
 
@@ -296,6 +312,7 @@ mod tests {
             since_nano: None,
             updated: utc("2026-11-05T11:55:00Z").with_timezone(&Local),
             error,
+            since_error: None,
             has_data,
         }
     }
@@ -366,6 +383,33 @@ mod tests {
         let note = note.expect("note without cost deduction");
         assert!(note.contains("Stand vom 01.11.2026") && note.contains("ohne Kostenabzug"), "{note}");
         assert!(note.contains("Startwert bei Bedarf neu eintragen"));
+    }
+
+    #[test]
+    fn balance_note_names_the_real_reason() {
+        let note_for = |error: Option<ApiError>| {
+            let mut b = bal(75_000_000_000, false);
+            b.error = error;
+            match balance_card(Some(&b), &with_base()) {
+                BalanceCard::Estimate { note, .. } => note.unwrap(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(note_for(Some(ApiError::NotAvailable)).contains("Kosten-API nicht verfügbar"));
+        let old = note_for(Some(ApiError::BaselineTooOld));
+        assert!(old.contains("Startwert zu alt, bitte neu eintragen"), "{old}");
+        assert!(!old.contains("nicht verfügbar"), "{old}");
+        let other = note_for(Some(ApiError::RateLimited));
+        assert!(other.contains("nicht abrufbar") && !other.contains("Kosten-API nicht verfügbar"), "{other}");
+    }
+
+    #[test]
+    fn limit_hint_only_while_the_cost_api_is_absent_or_unavailable() {
+        assert_eq!(inert_limits_hint(None), Some(INERT_LIMITS_HINT));
+        assert_eq!(inert_limits_hint(Some(&status(false, Some(ApiError::NotAvailable)))), Some(INERT_LIMITS_HINT));
+        assert_eq!(inert_limits_hint(Some(&status(true, None))), None);
+        assert_eq!(inert_limits_hint(Some(&status(true, Some(ApiError::RateLimited)))), None);
+        assert!(INERT_LIMITS_HINT.contains("Budget-Warnung") && INERT_LIMITS_HINT.contains("Guthaben-Warnung"));
     }
 
     #[test]

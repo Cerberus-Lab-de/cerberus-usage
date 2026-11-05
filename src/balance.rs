@@ -85,7 +85,8 @@ pub fn status(settings: &Settings, api: Option<&ApiStatus>, now: DateTime<Local>
         cost_deducted: cost.is_some(),
         cost_since_nano: cost,
         updated: api.map_or(now, |a| a.updated),
-        error: api.and_then(|a| a.error.clone()),
+        // The baseline request's own error comes first; it only concerns the balance.
+        error: api.and_then(|a| a.since_error.clone().or_else(|| a.error.clone())),
     })
 }
 
@@ -200,6 +201,7 @@ mod tests {
             since_nano: since,
             updated: utc("2026-11-05T11:55:00Z").with_timezone(&Local),
             error,
+            since_error: None,
             has_data: true,
         }
     }
@@ -246,5 +248,15 @@ mod tests {
         assert!(s.cost_deducted);
         assert_eq!(s.estimate_nano, 48_000_000_000);
         assert_eq!(s.error, Some(ApiError::Server(500)));
+    }
+
+    #[test]
+    fn baseline_request_error_reaches_the_balance_but_totals_error_stays_separate() {
+        let now = utc(NOW).with_timezone(&Local);
+        let mut a = api(None, None);
+        a.since_error = Some(ApiError::BaselineTooOld);
+        let s = status(&with_baseline(), Some(&a), now).unwrap();
+        assert_eq!(s.error, Some(ApiError::BaselineTooOld));
+        assert!(!s.cost_deducted);
     }
 }
