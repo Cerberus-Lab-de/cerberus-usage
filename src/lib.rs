@@ -1,6 +1,8 @@
 //! Cerberus Usage: Obsidian launcher and Claude usage overview (Windows tray app).
 
 pub mod analytics;
+pub mod balance;
+pub mod settings;
 pub mod log_scan;
 pub mod pricing;
 pub mod report;

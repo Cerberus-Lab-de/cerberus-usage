@@ -2,14 +2,16 @@
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 
 use crate::analytics::{ApiPoller, ApiStatus, Http};
+use crate::balance::{Alert, BalanceStatus, alerts, status as balance_status};
+use crate::settings::{Settings, load as load_settings};
 use crate::log_scan::{ScanState, load_state, save_state, scan};
 use crate::pricing::PriceTable;
 use crate::report::{Report, build};
@@ -34,6 +36,9 @@ pub struct WorkerConfig {
     pub http: Arc<dyn Http + Send + Sync>,
     /// Pause between API polls (see `analytics::DEFAULT_API_INTERVAL`; raised to at least one minute).
     pub api_interval: Duration,
+    /// `settings.json` (see `settings::default_path`). `None` when it cannot be determined:
+    /// no balance, no alerts, and `Snapshot::settings_error` says why.
+    pub settings_path: Option<PathBuf>,
 }
 
 /// What the UI gets from the worker. `report` is `None` only while the very
@@ -47,6 +52,12 @@ pub struct Snapshot {
     pub updated: DateTime<Local>,
     /// Real API cost. `None` without an admin key or before the first poll.
     pub api: Option<ApiStatus>,
+    /// Estimated credit balance. `None` without a baseline in the settings.
+    pub balance: Option<BalanceStatus>,
+    /// Active warnings (budget, low balance, Max pause).
+    pub alerts: Vec<Alert>,
+    /// Why `settings.json` could not be used (the last good settings stay in effect).
+    pub settings_error: Option<String>,
 }
 
 impl Snapshot {
@@ -64,7 +75,49 @@ impl Snapshot {
             scan_error,
             updated: Local::now(),
             api: None,
+            balance: None,
+            alerts: Vec::new(),
+            settings_error: None,
         }
+    }
+}
+
+/// Everything that changes between ticks besides the scan state.
+struct Live {
+    api: ApiPoller,
+    settings: Settings,
+    settings_error: Option<String>,
+}
+
+impl Live {
+    /// Re-reads `settings.json` (a small file, so every tick). A broken file keeps the last good
+    /// settings; the problem is reported instead.
+    fn reload_settings(&mut self, path: Option<&Path>) {
+        let Some(path) = path else {
+            self.settings_error = Some("Einstellungen: LOCALAPPDATA ist nicht gesetzt".to_string());
+            return;
+        };
+        let (loaded, error) = load_settings(path);
+        if error.is_none() {
+            self.settings = loaded;
+        }
+        self.settings_error = error;
+        self.api.set_since(self.settings.baseline.as_ref().map(|b| b.at));
+    }
+
+    /// Fills the API, balance and alert fields from the current state.
+    fn fill(&self, snapshot: &mut Snapshot) {
+        snapshot.api = self.api.current().cloned();
+        snapshot.balance = balance_status(&self.settings, snapshot.api.as_ref(), Local::now());
+        let pause = snapshot.report.as_ref().and_then(|r| r.pause.as_ref());
+        snapshot.alerts = alerts(
+            &self.settings,
+            snapshot.api.as_ref().map(|a| a.month_nano),
+            snapshot.balance.as_ref().map(|b| b.estimate_nano),
+            pause,
+            Utc::now(),
+        );
+        snapshot.settings_error = self.settings_error.clone();
     }
 }
 
@@ -89,10 +142,14 @@ fn run(cfg: WorkerConfig, notify: Box<dyn Fn() + Send>, tx: Sender<Snapshot>) {
     let mut state = load_state(&cfg.state_path);
     let prices = PriceTable::load(&cfg.prices_path);
     let mut last_report: Option<Report> = None;
-    let mut api = ApiPoller::new(Arc::clone(&cfg.secrets), Arc::clone(&cfg.http), cfg.api_interval);
+    let mut live = Live {
+        api: ApiPoller::new(Arc::clone(&cfg.secrets), Arc::clone(&cfg.http), cfg.api_interval),
+        settings: Settings::default(),
+        settings_error: None,
+    };
 
     loop {
-        if !tick(&cfg, &mut state, &prices, &mut last_report, &mut api, &tx, notify.as_ref()) {
+        if !tick(&cfg, &mut state, &prices, &mut last_report, &mut live, &tx, notify.as_ref()) {
             return;
         }
         std::thread::sleep(cfg.interval);
@@ -105,7 +162,7 @@ fn tick(
     state: &mut ScanState,
     prices: &PriceTable,
     last_report: &mut Option<Report>,
-    api: &mut ApiPoller,
+    live: &mut Live,
     tx: &Sender<Snapshot>,
     notify: &dyn Fn(),
 ) -> bool {
@@ -162,16 +219,17 @@ fn tick(
     // The report goes out first with the last known API figures; the network call (up to
     // 30 s per request) must not hold it back. A changed API status follows as a second snapshot.
     let mut snapshot = Snapshot::new(Some(report), files, files, error);
-    snapshot.api = api.current().cloned();
+    live.reload_settings(cfg.settings_path.as_deref());
+    live.fill(&mut snapshot);
     if !deliver(tx, notify, snapshot.clone()) {
         return false;
     }
-    if api.due(Instant::now()) {
+    if live.api.due(Instant::now()) {
         // Same protection as the scan: a panic in the poll path must not end the worker.
-        let changed = catch_unwind(AssertUnwindSafe(|| api.refresh(Instant::now(), Local::now())))
+        let changed = catch_unwind(AssertUnwindSafe(|| live.api.refresh(Instant::now(), Local::now())))
             .unwrap_or(false);
         if changed {
-            snapshot.api = api.current().cloned();
+            live.fill(&mut snapshot);
             return deliver(tx, notify, snapshot);
         }
     }
@@ -235,8 +293,19 @@ mod tests {
             secrets: Arc::new(FakeStore::new(None)),
             http: Arc::new(FakeHttp::new(vec![])),
             api_interval: crate::analytics::DEFAULT_API_INTERVAL,
+            settings_path: Some(dir.join("data").join("settings.json")),
         }
     }
+
+    fn write_settings(cfg: &WorkerConfig, json: &str) {
+        let path = cfg.settings_path.as_ref().unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, json).unwrap();
+    }
+
+    const BASELINE_JSON: &str = r#"{"baseline":{"amount_nano":50000000000,"at":"2026-11-01T00:00:00Z"},
+        "topups":[{"amount_nano":10000000000,"at":"2026-11-02T00:00:00Z"}],
+        "monthly_budget_nano":1,"low_balance_nano":100000000000}"#;
 
     /// Config with an admin key and a scripted API; also returns the fake to inspect its requests.
     fn config_with_api(
@@ -420,6 +489,112 @@ mod tests {
         let (_, first) = until_report(&rx);
         let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
         assert_eq!(second.api.as_ref().and_then(|a| a.error.clone()), Some(crate::analytics::ApiError::Unauthorized));
+        for snap in [&first, &second] {
+            let shown = format!("{snap:?}");
+            assert!(!shown.contains("NICHTECHT") && !shown.contains("1234"), "snapshot leaked key");
+        }
+    }
+
+    #[test]
+    fn no_baseline_means_no_balance_and_no_extra_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"data":[],"has_more":false,"next_page":null}"#;
+        let (cfg, http) = config_with_api(dir.path(), Some("sk-ant-admin01-NICHTECHT-1234"), vec![ok(body)]);
+        let rx = spawn_worker(cfg, noop());
+        let (_, first) = until_report(&rx);
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        assert!(first.balance.is_none() && second.balance.is_none());
+        assert!(second.alerts.is_empty() && second.settings_error.is_none());
+        assert_eq!(http.request_count(), 1);
+    }
+
+    #[test]
+    fn baseline_without_admin_key_shows_undeducted_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, http) = config_with_api(dir.path(), None, vec![]);
+        write_settings(&cfg, BASELINE_JSON);
+        let rx = spawn_worker(cfg, noop());
+        let (_, snap) = until_report(&rx);
+        let balance = snap.balance.expect("balance missing");
+        assert_eq!((balance.estimate_nano, balance.cost_deducted), (60_000_000_000, false));
+        // 60 USD is below the 100 USD warning level; the budget alert needs API cost and stays off.
+        assert_eq!(snap.alerts, vec![Alert::LowBalance]);
+        assert_eq!(http.request_count(), 0);
+    }
+
+    #[test]
+    fn baseline_with_admin_key_deducts_cost_since_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let totals = r#"{"data":[],"has_more":false,"next_page":null}"#;
+        let since = r#"{"data":[{"starting_at":"2026-11-01T00:00:00Z","ending_at":"2026-11-01T01:00:00Z","group":{"model":"m"},"cost":{"amount":"20000.000000"}}],"has_more":false,"next_page":null}"#;
+        let (cfg, http) = config_with_api(dir.path(), Some("sk-ant-admin01-NICHTECHT-1234"), vec![ok(totals), ok(since)]);
+        write_settings(&cfg, BASELINE_JSON);
+        let rx = spawn_worker(cfg, noop());
+        let (_, first) = until_report(&rx);
+        assert!(!first.balance.unwrap().cost_deducted);
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        // 20000 cents = 200 USD.
+        let balance = second.balance.expect("balance missing");
+        assert_eq!(balance.cost_since_nano, Some(200_000_000_000));
+        assert_eq!(balance.estimate_nano, 60_000_000_000 - 200_000_000_000);
+        assert!(balance.cost_deducted);
+        assert_eq!(http.request_count(), 2);
+    }
+
+    #[test]
+    fn broken_settings_are_reported_and_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _http) = config_with_api(dir.path(), None, vec![]);
+        write_settings(&cfg, "{ nope");
+        let path = cfg.settings_path.clone().unwrap();
+        let rx = spawn_worker(cfg, noop());
+        let (_, snap) = until_report(&rx);
+        assert!(snap.settings_error.is_some() && snap.balance.is_none());
+        assert_eq!(fs::read_to_string(path).unwrap(), "{ nope");
+    }
+
+    #[test]
+    fn missing_settings_path_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path(), Duration::from_secs(60));
+        cfg.settings_path = None;
+        let rx = spawn_worker(cfg, noop());
+        let (_, snap) = until_report(&rx);
+        assert!(snap.settings_error.is_some() && snap.balance.is_none());
+    }
+
+    #[test]
+    fn settings_edits_are_picked_up_on_the_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, _http) = config_with_api(dir.path(), None, vec![]);
+        cfg.interval = Duration::from_millis(50);
+        let rx = spawn_worker(cfg.clone(), noop());
+        let (_, first) = until_report(&rx);
+        assert!(first.balance.is_none());
+        write_settings(&cfg, BASELINE_JSON);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let snap = rx.recv_timeout(WAIT).expect("no snapshot in time");
+            if snap.balance.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "settings change never showed up");
+        }
+    }
+
+    #[test]
+    fn snapshot_debug_never_contains_key_with_balance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _http) = config_with_api(
+            dir.path(),
+            Some("sk-ant-admin01-NICHTECHT-1234"),
+            vec![Ok((401, "{}".to_string()))],
+        );
+        write_settings(&cfg, BASELINE_JSON);
+        let rx = spawn_worker(cfg, noop());
+        let (_, first) = until_report(&rx);
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        assert!(second.balance.is_some());
         for snap in [&first, &second] {
             let shown = format!("{snap:?}");
             assert!(!shown.contains("NICHTECHT") && !shown.contains("1234"), "snapshot leaked key");

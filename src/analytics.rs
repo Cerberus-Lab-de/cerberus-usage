@@ -370,6 +370,9 @@ fn fetch_chunk(
 pub struct ApiStatus {
     pub today_nano: u64,
     pub month_nano: u64,
+    /// Cost since the balance baseline (hourly buckets, see `ApiPoller::set_since`). `None`
+    /// when no baseline is set or no poll including it has succeeded yet.
+    pub since_nano: Option<u64>,
     pub updated: DateTime<Local>,
     pub error: Option<ApiError>,
 }
@@ -427,6 +430,13 @@ fn fetch_totals<Tz: TimeZone>(
     Ok((today, month))
 }
 
+/// Total cost in `[from, to)` with hourly buckets. The API rounds `from` down to the full hour,
+/// so the sum may include up to one hour of cost before `from`.
+fn fetch_since(http: &dyn Http, key: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<u64, ApiError> {
+    let rows = fetch_cost(http, key, from, to, "1h")?;
+    Ok(sum_where(&rows, |_| true))
+}
+
 /// Decides when to ask the API and keeps the last known figures.
 ///
 /// Time is passed in, so tests need no sleeping. The admin key is read fresh from the store
@@ -438,6 +448,8 @@ pub struct ApiPoller {
     interval: StdDuration,
     last_attempt: Option<Instant>,
     status: Option<ApiStatus>,
+    /// Start of the extra "cost since" request (the balance baseline), if any.
+    since: Option<DateTime<Utc>>,
 }
 
 impl ApiPoller {
@@ -453,6 +465,21 @@ impl ApiPoller {
             interval: interval.max(MIN_API_INTERVAL),
             last_attempt: None,
             status: None,
+            since: None,
+        }
+    }
+
+    /// Sets the start of the "cost since" figure (`ApiStatus::since_nano`), requested with hourly
+    /// buckets in the same poll. A changed start drops the old figure and makes the poller due
+    /// right away; an unchanged one does nothing.
+    pub fn set_since(&mut self, since: Option<DateTime<Utc>>) {
+        if since == self.since {
+            return;
+        }
+        self.since = since;
+        self.last_attempt = None;
+        if let Some(status) = self.status.as_mut() {
+            status.since_nano = None;
         }
     }
 
@@ -484,19 +511,32 @@ impl ApiPoller {
             }
         };
         self.last_attempt = Some(now);
-        let result = fetch_totals(self.http.as_ref(), &key, &wall);
+        let result = fetch_totals(self.http.as_ref(), &key, &wall).and_then(|(today, month)| {
+            let since = match self.since {
+                Some(from) => Some(fetch_since(self.http.as_ref(), &key, from, wall.with_timezone(&Utc))?),
+                None => None,
+            };
+            Ok((today, month, since))
+        });
         drop(key);
 
         let updated = wall.with_timezone(&Local);
         self.status = Some(match (result, before.clone()) {
-            (Ok((today_nano, month_nano)), _) => ApiStatus {
+            (Ok((today_nano, month_nano, since_nano)), _) => ApiStatus {
                 today_nano,
                 month_nano,
+                since_nano,
                 updated,
                 error: None,
             },
             (Err(e), Some(previous)) => ApiStatus { error: Some(e), ..previous },
-            (Err(e), None) => ApiStatus { today_nano: 0, month_nano: 0, updated, error: Some(e) },
+            (Err(e), None) => ApiStatus {
+                today_nano: 0,
+                month_nano: 0,
+                since_nano: None,
+                updated,
+                error: Some(e),
+            },
         });
         self.status != before
     }
@@ -953,6 +993,72 @@ mod tests {
         fast.refresh(t0, cet("2026-10-15T12:00:00Z"));
         assert!(!fast.due(t0 + StdDuration::from_secs(59)));
         assert!(fast.due(t0 + StdDuration::from_secs(60)));
+    }
+
+    fn since_body() -> String {
+        page(
+            &[
+                row_json("2026-10-12T08:00:00Z", "2026-10-12T09:00:00Z", "m", "30.000000"),
+                row_json("2026-10-12T09:00:00Z", "2026-10-12T10:00:00Z", "m", "12.500000"),
+            ],
+            None,
+        )
+    }
+
+    #[test]
+    fn since_figure_uses_hourly_buckets_from_the_given_start() {
+        let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body()), ok(&since_body())]);
+        p.set_since(Some(utc("2026-10-12T08:30:00Z")));
+        assert!(p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z")));
+
+        // 42.5 cents = 425_000_000 nano-USD.
+        assert_eq!(p.current().unwrap().since_nano, Some(425_000_000));
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.contains("time_bucket_width=1h"), "{}", requests[1].0);
+        assert!(requests[1].0.contains("starting_at=2026-10-12T08%3A30%3A00Z"), "{}", requests[1].0);
+        assert!(requests[1].0.contains("ending_at=2026-10-15T12%3A00%3A00Z"), "{}", requests[1].0);
+    }
+
+    #[test]
+    fn without_since_there_is_one_request_and_no_figure() {
+        let (mut p, http) = poller(Some(KEY), vec![ok(&totals_body())]);
+        p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z"));
+        assert_eq!(p.current().unwrap().since_nano, None);
+        assert_eq!(http.request_count(), 1);
+    }
+
+    #[test]
+    fn since_figure_survives_a_later_error_and_is_dropped_when_the_start_changes() {
+        let (mut p, _http) = poller(
+            Some(KEY),
+            vec![ok(&totals_body()), ok(&since_body()), Ok((500, "{}".into()))],
+        );
+        let start = utc("2026-10-12T08:30:00Z");
+        p.set_since(Some(start));
+        let t0 = Instant::now();
+        p.refresh(t0, cet("2026-10-15T12:00:00Z"));
+        assert!(!p.due(t0));
+
+        p.refresh(t0 + DEFAULT_API_INTERVAL, cet("2026-10-15T12:05:00Z"));
+        let s = p.current().unwrap();
+        assert_eq!((s.since_nano, s.error.clone()), (Some(425_000_000), Some(ApiError::Server(500))));
+
+        // Same start: nothing happens. New start: figure dropped, poll due immediately.
+        p.set_since(Some(start));
+        assert_eq!(p.current().unwrap().since_nano, Some(425_000_000));
+        p.set_since(Some(utc("2026-10-13T00:00:00Z")));
+        assert_eq!(p.current().unwrap().since_nano, None);
+        assert!(p.due(t0 + DEFAULT_API_INTERVAL));
+    }
+
+    #[test]
+    fn since_request_failing_keeps_totals_consistent_with_one_error() {
+        let (mut p, _http) = poller(Some(KEY), vec![ok(&totals_body()), Ok((429, "{}".into()))]);
+        p.set_since(Some(utc("2026-10-12T08:30:00Z")));
+        p.refresh(Instant::now(), cet("2026-10-15T12:00:00Z"));
+        let s = p.current().unwrap();
+        assert_eq!((s.today_nano, s.since_nano, s.error.clone()), (0, None, Some(ApiError::RateLimited)));
     }
 
     fn at(s: &str, hours: i32) -> DateTime<FixedOffset> {

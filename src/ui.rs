@@ -250,6 +250,7 @@ impl CerberusApp {
                 secrets: Arc::new(KeyringStore::new()),
                 http: Arc::new(UreqHttp::new()),
                 api_interval: DEFAULT_API_INTERVAL,
+                settings_path: crate::settings::default_path().ok(),
             },
             Box::new(move || notify_ctx.request_repaint()),
         );
