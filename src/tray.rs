@@ -18,10 +18,48 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 const ID_OPEN: &str = "open";
 const ID_QUIT: &str = "quit";
 
+/// What a close request of the window leads to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Let the window close (the app ends).
+    Exit,
+    /// Cancel the close and hide the window to the tray.
+    Hide,
+    /// Cancel the close; quit as soon as the running launch has delivered its result.
+    WaitForLaunch,
+}
+
+/// The X button only hides, unless the user chose "Beenden" or there is no tray icon to bring the
+/// window back. A launch in flight is never cut off: quitting then waits for its result.
+pub fn close_action(quit_requested: bool, tray_available: bool, launch_busy: bool) -> CloseAction {
+    if quit_requested {
+        CloseAction::Exit
+    } else if !tray_available {
+        if launch_busy { CloseAction::WaitForLaunch } else { CloseAction::Exit }
+    } else {
+        CloseAction::Hide
+    }
+}
+
+/// What a left click on the tray icon does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayClick {
+    Show,
+    Hide,
+}
+
+/// A minimized window counts as visible for Windows, but a click must bring it back, not hide it.
+pub fn tray_click(visible: bool, minimized: bool) -> TrayClick {
+    if visible && !minimized { TrayClick::Hide } else { TrayClick::Show }
+}
+
 /// State shared between the tray handlers (main thread, window procedure) and the app.
 pub struct WindowControl {
     visible: AtomicBool,
+    minimized: AtomicBool,
     quit_requested: AtomicBool,
+    quit_pending: AtomicBool,
+    launch_busy: AtomicBool,
     tray_available: AtomicBool,
 }
 
@@ -29,7 +67,10 @@ impl WindowControl {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             visible: AtomicBool::new(true),
+            minimized: AtomicBool::new(false),
             quit_requested: AtomicBool::new(false),
+            quit_pending: AtomicBool::new(false),
+            launch_busy: AtomicBool::new(false),
             tray_available: AtomicBool::new(false),
         })
     }
@@ -38,10 +79,50 @@ impl WindowControl {
         self.visible.load(Ordering::Relaxed)
     }
 
-    /// The window's X button only hides, unless the user chose "Beenden" or there is no tray icon
-    /// to bring the window back.
-    pub fn close_means_exit(&self) -> bool {
-        self.quit_requested.load(Ordering::Relaxed) || !self.tray_available.load(Ordering::Relaxed)
+    pub fn set_minimized(&self, minimized: bool) {
+        self.minimized.store(minimized, Ordering::Relaxed);
+    }
+
+    pub fn is_minimized(&self) -> bool {
+        self.minimized.load(Ordering::Relaxed)
+    }
+
+    /// Decision for a close request seen in `logic`.
+    pub fn close_action(&self) -> CloseAction {
+        close_action(
+            self.quit_requested.load(Ordering::Relaxed),
+            self.tray_available.load(Ordering::Relaxed),
+            self.launch_busy.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The app tells whether a launch is in flight. When it ends, a waiting quit goes through.
+    pub fn set_launch_busy(&self, ctx: &egui::Context, busy: bool) {
+        self.launch_busy.store(busy, Ordering::Relaxed);
+        if !busy {
+            self.finish_quit_if_idle(ctx);
+        }
+    }
+
+    /// "Beenden" was chosen but a launch is still running.
+    pub fn quit_waiting(&self) -> bool {
+        self.quit_pending.load(Ordering::Relaxed) && self.launch_busy.load(Ordering::Relaxed)
+    }
+
+    /// A close request arrived while a launch runs (no tray): quit once it is done.
+    pub fn quit_when_idle(&self, ctx: &egui::Context) {
+        self.quit_pending.store(true, Ordering::Relaxed);
+        self.finish_quit_if_idle(ctx);
+    }
+
+    fn finish_quit_if_idle(&self, ctx: &egui::Context) {
+        if self.quit_pending.load(Ordering::Relaxed) && !self.launch_busy.load(Ordering::Relaxed) {
+            self.quit_requested.store(true, Ordering::Relaxed);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     pub fn show(&self, ctx: &egui::Context) {
@@ -58,10 +139,9 @@ impl WindowControl {
         ctx.request_repaint();
     }
 
+    /// "Beenden": closes at once, or as soon as a running launch has finished.
     pub fn quit(&self, ctx: &egui::Context) {
-        self.quit_requested.store(true, Ordering::Relaxed);
-        ctx.send_viewport_cmd(ViewportCommand::Close);
-        ctx.request_repaint();
+        self.quit_when_idle(ctx);
     }
 }
 
@@ -155,10 +235,9 @@ impl Tray {
                 ..
             } = event
             {
-                if ctl.is_visible() {
-                    ctl.hide(&c);
-                } else {
-                    ctl.show(&c);
+                match tray_click(ctl.is_visible(), ctl.is_minimized()) {
+                    TrayClick::Hide => ctl.hide(&c),
+                    TrayClick::Show => ctl.show(&c),
                 }
             }
         }));
@@ -218,6 +297,7 @@ mod tests {
             balance: None,
             alerts: Vec::new(),
             settings_error: None,
+            state_note: None,
         }
     }
 
@@ -234,6 +314,43 @@ mod tests {
         let mut s = snapshot(0);
         s.alerts = vec![Alert::LowBalance];
         assert!(tooltip(&s, ModeDisplay::ApiKey).contains("Warnung"));
+    }
+
+    #[test]
+    fn close_request_decisions() {
+        // With a tray: X hides, "Beenden" exits.
+        assert_eq!(close_action(false, true, false), CloseAction::Hide);
+        assert_eq!(close_action(false, true, true), CloseAction::Hide);
+        assert_eq!(close_action(true, true, false), CloseAction::Exit);
+        // Without a tray the X button ends the app, but not in the middle of a launch.
+        assert_eq!(close_action(false, false, false), CloseAction::Exit);
+        assert_eq!(close_action(false, false, true), CloseAction::WaitForLaunch);
+    }
+
+    #[test]
+    fn tray_click_restores_a_minimized_window() {
+        assert_eq!(tray_click(true, false), TrayClick::Hide);
+        assert_eq!(tray_click(true, true), TrayClick::Show);
+        assert_eq!(tray_click(false, false), TrayClick::Show);
+        assert_eq!(tray_click(false, true), TrayClick::Show);
+    }
+
+    #[test]
+    fn quit_during_a_launch_waits_for_its_result() {
+        let ctx = egui::Context::default();
+        let control = WindowControl::new();
+        control.set_launch_busy(&ctx, true);
+        control.quit(&ctx);
+        assert!(control.quit_waiting());
+        assert_ne!(control.close_action(), CloseAction::Exit, "no close while the launch runs");
+        control.set_launch_busy(&ctx, false);
+        assert!(!control.quit_waiting());
+        assert_eq!(control.close_action(), CloseAction::Exit, "quit goes through once the launch is done");
+
+        // Without a launch "Beenden" is immediate.
+        let control = WindowControl::new();
+        control.quit(&ctx);
+        assert_eq!(control.close_action(), CloseAction::Exit);
     }
 
     #[test]

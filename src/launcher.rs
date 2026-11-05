@@ -27,6 +27,9 @@ pub enum LaunchOutcome {
     NeedsConfirmation,
     /// Obsidian did not exit within the wait time; nothing was started.
     CloseTimedOut,
+    /// The process check itself failed (tool blocked, error exit). Nothing was closed or started,
+    /// because "unknown" must never be treated as "not running".
+    ProcessCheckFailed,
     MissingKey,
     /// The process could not be started.
     ObsidianNotFound,
@@ -37,8 +40,9 @@ pub enum LaunchOutcome {
 
 /// OS access, abstracted so the launch logic is testable without touching real processes.
 pub trait System {
-    /// Whether a process with this image name (e.g. `Obsidian.exe`) runs.
-    fn obsidian_running(&self, image: &str) -> bool;
+    /// Whether a process with this image name (e.g. `Obsidian.exe`) runs. `Err` means the check
+    /// itself failed; callers must fail closed.
+    fn obsidian_running(&self, image: &str) -> io::Result<bool>;
     /// Polite close request (no force).
     fn request_close(&self, image: &str);
     /// Start `exe` without waiting. `Some` sets `ANTHROPIC_API_KEY` for the child, `None` removes it.
@@ -75,7 +79,11 @@ pub fn launch(
         },
     };
 
-    if sys.obsidian_running(&image) {
+    let running = match sys.obsidian_running(&image) {
+        Ok(r) => r,
+        Err(_) => return LaunchOutcome::ProcessCheckFailed,
+    };
+    if running {
         if !confirmed_close {
             return LaunchOutcome::NeedsConfirmation;
         }
@@ -83,7 +91,8 @@ pub fn launch(
         let mut closed = false;
         for _ in 0..CLOSE_POLLS {
             sys.sleep(CLOSE_POLL_INTERVAL);
-            if !sys.obsidian_running(&image) {
+            // An unknown answer counts as "still running", so it ends in the timeout, not in a start.
+            if matches!(sys.obsidian_running(&image), Ok(false)) {
                 closed = true;
                 break;
             }
@@ -97,6 +106,62 @@ pub fn launch(
         Ok(()) => LaunchOutcome::Started,
         Err(_) => LaunchOutcome::ObsidianNotFound,
     }
+}
+
+/// One change to the child's environment.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EnvOp {
+    Set(&'static str, String),
+    Remove(&'static str),
+}
+
+// Manual Debug: the value of `Set` is the API key and must never show up in any output.
+impl std::fmt::Debug for EnvOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnvOp::Set(name, _) => write!(f, "Set({name}, <redacted>)"),
+            EnvOp::Remove(name) => write!(f, "Remove({name})"),
+        }
+    }
+}
+
+/// The environment changes for the Obsidian child. Both modes remove `ANTHROPIC_AUTH_TOKEN`,
+/// which would otherwise beat every other credential; Max also removes `ANTHROPIC_API_KEY`.
+pub fn child_env_ops(mode: Mode, key: Option<&str>) -> Vec<EnvOp> {
+    let mut ops = Vec::new();
+    match (mode, key) {
+        (Mode::ApiKey, Some(k)) => ops.push(EnvOp::Set("ANTHROPIC_API_KEY", k.to_string())),
+        _ => ops.push(EnvOp::Remove("ANTHROPIC_API_KEY")),
+    }
+    ops.push(EnvOp::Remove("ANTHROPIC_AUTH_TOKEN"));
+    ops
+}
+
+/// Variables that reroute traffic or billing. They are left untouched (a deliberate setup),
+/// but the window names them.
+pub const ROUTING_ENV_VARS: [&str; 4] = [
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
+
+/// Names (never values) of the routing variables that are set to a non-empty value.
+pub fn routing_env_names(env: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    ROUTING_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|n| env(n).is_some_and(|v| !v.trim().is_empty()))
+        .collect()
+}
+
+/// Maps a finished `tasklist` run to an answer. Exit 0 with the "no tasks" INFORMATION text
+/// is "not running"; any non-zero status is a failed check.
+fn tasklist_answer(success: bool, stdout: &str, image: &str) -> io::Result<bool> {
+    if !success {
+        return Err(io::Error::other("tasklist failed"));
+    }
+    Ok(lists_image(stdout, image))
 }
 
 /// Real implementation using fixed-path Windows tools (Git Bash on PATH would shadow e.g. `find`).
@@ -143,19 +208,18 @@ fn lists_image(tasklist_stdout: &str, image: &str) -> bool {
 
 #[cfg(windows)]
 impl System for WindowsSystem {
-    fn obsidian_running(&self, image: &str) -> bool {
+    fn obsidian_running(&self, image: &str) -> io::Result<bool> {
         use std::os::windows::process::CommandExt;
         if !is_safe_image(image) {
-            return false;
+            return Err(io::Error::other("unsafe image name"));
         }
-        Command::new(Self::system32_tool("tasklist.exe"))
+        let out = Command::new(Self::system32_tool("tasklist.exe"))
             .args(["/fi", &format!("imagename eq {image}"), "/fo", "csv", "/nh"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .output()
-            .map(|o| lists_image(&String::from_utf8_lossy(&o.stdout), image))
-            .unwrap_or(false)
+            .output()?;
+        tasklist_answer(out.status.success(), &String::from_utf8_lossy(&out.stdout), image)
     }
 
     fn request_close(&self, image: &str) {
@@ -177,12 +241,15 @@ impl System for WindowsSystem {
         use std::os::windows::process::CommandExt;
         let mut cmd = Command::new(exe);
         // Set/removed on the child only; this process's environment stays untouched.
-        match api_key {
-            Some(k) => {
-                cmd.env("ANTHROPIC_API_KEY", k);
-            }
-            None => {
-                cmd.env_remove("ANTHROPIC_API_KEY");
+        let mode = if api_key.is_some() { Mode::ApiKey } else { Mode::Max };
+        for op in child_env_ops(mode, api_key) {
+            match op {
+                EnvOp::Set(name, value) => {
+                    cmd.env(name, value);
+                }
+                EnvOp::Remove(name) => {
+                    cmd.env_remove(name);
+                }
             }
         }
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
@@ -219,6 +286,9 @@ mod tests {
     /// Records calls. `running_polls` = how many `obsidian_running` calls still report true
     /// (u32::MAX = never exits).
     struct FakeSystem {
+        /// When set, `obsidian_running` fails once `fail_after` successful calls are used up.
+        fail_check: Cell<bool>,
+        fail_after: Cell<u32>,
         resolve: Result<PathBuf, PathError>,
         /// Image names passed to `obsidian_running` / `request_close`.
         images: RefCell<Vec<String>>,
@@ -231,6 +301,8 @@ mod tests {
     impl FakeSystem {
         fn new(exists: bool, running_polls: u32) -> Self {
             Self {
+                fail_check: Cell::new(false),
+                fail_after: Cell::new(0),
                 resolve: if exists {
                     Ok(PathBuf::from(r"C:\Obsidian\Obsidian.exe"))
                 } else {
@@ -252,16 +324,23 @@ mod tests {
     }
 
     impl System for FakeSystem {
-        fn obsidian_running(&self, image: &str) -> bool {
+        fn obsidian_running(&self, image: &str) -> io::Result<bool> {
             self.images.borrow_mut().push(image.to_string());
+            if self.fail_check.get() {
+                let left = self.fail_after.get();
+                if left == 0 {
+                    return Err(io::Error::other("blocked"));
+                }
+                self.fail_after.set(left - 1);
+            }
             let n = self.running_polls.get();
             if n == 0 {
-                return false;
+                return Ok(false);
             }
             if n != u32::MAX {
                 self.running_polls.set(n - 1);
             }
-            true
+            Ok(true)
         }
         fn request_close(&self, image: &str) {
             self.images.borrow_mut().push(image.to_string());
@@ -434,8 +513,75 @@ mod tests {
     }
 
     #[test]
-    fn obsidian_exists_is_harmless_on_real_system() {
-        // Only checks a file path; never starts or stops anything.
-        let _ = WindowsSystem { settings_path: None }.resolve_obsidian();
+    fn failed_process_check_closes_and_starts_nothing() {
+        let sys = FakeSystem::new(true, 0);
+        sys.fail_check.set(true);
+        for confirmed in [false, true] {
+            assert_eq!(launch(&sys, Mode::Max, None, confirmed), LaunchOutcome::ProcessCheckFailed);
+            assert_eq!(launch(&sys, Mode::ApiKey, Some(FAKE_KEY), confirmed), LaunchOutcome::ProcessCheckFailed);
+        }
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    #[test]
+    fn check_failing_while_waiting_for_exit_ends_in_timeout_not_start() {
+        // Running at the first check, then every check fails: must never spawn.
+        let sys = FakeSystem::new(true, u32::MAX);
+        sys.fail_check.set(true);
+        sys.fail_after.set(1);
+        assert_eq!(launch(&sys, Mode::Max, None, true), LaunchOutcome::CloseTimedOut);
+        assert_eq!(sys.count("close"), 1);
+        assert_eq!(sys.count("spawn"), 0);
+        assert_eq!(sys.slept.get(), 20);
+    }
+
+    #[test]
+    fn tasklist_status_decides_between_not_running_and_failed() {
+        let info = "INFO: No tasks are running which match the specified criteria.";
+        assert!(!tasklist_answer(true, info, "Obsidian.exe").unwrap());
+        assert!(tasklist_answer(true, "\"Obsidian.exe\",\"1\"", "Obsidian.exe").unwrap());
+        assert!(tasklist_answer(false, "", "Obsidian.exe").is_err());
+        assert!(tasklist_answer(false, "\"Obsidian.exe\",\"1\"", "Obsidian.exe").is_err());
+    }
+
+    #[test]
+    fn max_mode_removes_key_and_token_even_if_key_given() {
+        for key in [None, Some(FAKE_KEY)] {
+            assert_eq!(
+                child_env_ops(Mode::Max, key),
+                vec![EnvOp::Remove("ANTHROPIC_API_KEY"), EnvOp::Remove("ANTHROPIC_AUTH_TOKEN")]
+            );
+        }
+    }
+
+    #[test]
+    fn api_mode_sets_key_and_removes_token() {
+        assert_eq!(
+            child_env_ops(Mode::ApiKey, Some(FAKE_KEY)),
+            vec![
+                EnvOp::Set("ANTHROPIC_API_KEY", FAKE_KEY.to_string()),
+                EnvOp::Remove("ANTHROPIC_AUTH_TOKEN")
+            ]
+        );
+    }
+
+    #[test]
+    fn env_op_debug_never_shows_the_key() {
+        let text = format!("{:?}", child_env_ops(Mode::ApiKey, Some(FAKE_KEY)));
+        assert!(!text.contains(FAKE_KEY) && !text.contains("NICHTECHT"), "{text}");
+    }
+
+    #[test]
+    fn routing_vars_are_reported_by_name_only() {
+        let env = |n: &str| match n {
+            "ANTHROPIC_BASE_URL" => Some("https://proxy.example/SECRET-VALUE".to_string()),
+            "CLAUDE_CODE_USE_VERTEX" => Some("1".to_string()),
+            "CLAUDE_CODE_USE_BEDROCK" => Some("  ".to_string()),
+            _ => None,
+        };
+        let names = routing_env_names(&env);
+        assert_eq!(names, vec!["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_VERTEX"]);
+        assert!(!format!("{names:?}").contains("SECRET-VALUE"));
+        assert!(routing_env_names(&|_| None).is_empty());
     }
 }

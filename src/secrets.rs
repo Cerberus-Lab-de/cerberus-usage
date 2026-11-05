@@ -118,8 +118,9 @@ impl SecretStore for KeyringStore {
 
 /// Format check only (no network). Returned messages are fixed strings, never the value.
 pub fn validate_key(s: Slot, v: &str) -> Result<(), &'static str> {
-    if v.chars().any(char::is_whitespace) {
-        return Err("Der Schlüssel darf keine Leerzeichen enthalten.");
+    // Control characters too: a NUL would make the process start fail after Obsidian was already closed.
+    if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Der Schlüssel darf keine Leer- oder Steuerzeichen enthalten.");
     }
     match s {
         Slot::ApiKey => {
@@ -169,6 +170,18 @@ mod tests {
         assert!(validate_key(Slot::ApiKey, " sk-ant-test-NICHTECHT").is_err());
         assert!(validate_key(Slot::AdminKey, "sk-ant-admin01-NICHT\tECHT").is_err());
         assert!(validate_key(Slot::ApiKey, "sk-ant-test-NICHTECHT\n").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_control_characters() {
+        for bad in [
+            "sk-ant-test-NICHT\0ECHT",
+            "sk-ant-test-NICHT\x1bECHT",
+            "sk-ant-test-NICHT\x7fECHT",
+        ] {
+            assert!(validate_key(Slot::ApiKey, bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(validate_key(Slot::AdminKey, "sk-ant-admin01-NICHT\0ECHT").is_err());
     }
 
     #[test]

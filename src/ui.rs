@@ -1,8 +1,8 @@
 //! The single egui window: mode display, launcher buttons, usage cards and tables, key settings.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,20 +11,20 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::cards::{
-    ApiCard, BalanceCard, alert_banner_text, api_card, balance_card, update_settings, with_baseline, with_limits,
-    with_topup, without_topup,
+    ApiCard, BalanceCard, alert_banner_text, api_card, balance_card, inert_limits_hint, update_settings,
+    with_baseline, with_limits, with_topup, without_topup,
 };
 use crate::format::{
-    COST_NOTE, format_count, outcome_message, pause_text, progress_text, unpriced_text,
+    COST_NOTE, format_count, mode_hint, outcome_message, pause_text, progress_text, routing_warning, unpriced_text,
 };
-use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch};
-use crate::paths::{real_env, resolve_logs_root};
+use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
+use crate::paths::{Env, real_env, resolve_logs_root};
 use crate::paths_ui::{PathsAction, PathsPanel};
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
 use crate::settings::{Settings, TopUp};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
-use crate::tray::{Tray, WindowControl, icon_state, tooltip};
+use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 
 /// How often the background thread asks whether Obsidian runs (each check spawns `tasklist`).
@@ -97,6 +97,10 @@ pub struct AppState {
     /// saved, so a stale field can never overwrite the limit in the file.
     pub budget_edited: bool,
     pub low_balance_edited: bool,
+    /// The background service has ended (its channel is closed): the numbers are no longer updated.
+    pub worker_gone: bool,
+    /// The note about an unreadable saved state is shown once.
+    state_note_shown: bool,
 }
 
 impl AppState {
@@ -122,6 +126,28 @@ impl AppState {
             low_balance_input: String::new(),
             budget_edited: false,
             low_balance_edited: false,
+            worker_gone: false,
+            state_note_shown: false,
+        }
+    }
+
+    /// The launch thread ended without a result (it panicked): the buttons come back, with an error.
+    pub fn apply_launch_lost(&mut self) {
+        self.launching = None;
+        self.notice = Some(Notice {
+            kind: NoticeKind::Error,
+            text: "Der Startvorgang wurde unerwartet beendet. Ob Obsidian läuft, zeigt die Anzeige oben.".to_string(),
+        });
+    }
+
+    /// Shows the one-time note from loading the saved state, unless a notice is already up.
+    pub fn show_state_note_once(&mut self, note: Option<&str>) {
+        if self.state_note_shown {
+            return;
+        }
+        if let Some(text) = note {
+            self.state_note_shown = true;
+            self.notice = Some(Notice { kind: NoticeKind::Info, text: text.to_string() });
         }
     }
 
@@ -238,6 +264,49 @@ fn amount_input(nano: Option<u64>) -> String {
     nano.map(|n| format_usd(n).trim_start_matches('$').to_string()).unwrap_or_default()
 }
 
+/// Status line of a key slot. An unreadable store must not look like "no key".
+pub fn key_status_text(stored: Option<bool>) -> &'static str {
+    match stored {
+        Some(true) => "gespeichert",
+        Some(false) => "nicht gespeichert",
+        None => "Speicher nicht lesbar",
+    }
+}
+
+/// Cost cell of a table row. A row where no request had a price shows only the note, not "$0.00".
+pub fn cost_cell_text(b: &Bucket) -> String {
+    let usd = format_usd(b.cost_nano);
+    match unpriced_text(b.unpriced_requests) {
+        Some(note) if b.cost_nano == 0 && b.unpriced_requests >= b.requests => note,
+        Some(note) => format!("{usd} · {note}"),
+        None => usd,
+    }
+}
+
+/// The log folder for the worker. A settings file that exists but cannot be read is "unknown", never
+/// the automatic folder: scanning the wrong folder would wipe the history of a custom one.
+pub fn logs_target(settings_path: Option<&Path>, env: Env) -> (PathBuf, Option<String>) {
+    let mut configured = None;
+    if let Some(path) = settings_path {
+        let (settings, error) = crate::settings::load(path);
+        if error.is_some() {
+            return (
+                PathBuf::new(),
+                Some(format!(
+                    "Die Einstellungsdatei ist nicht lesbar, deshalb werden die Protokolle nicht gelesen. Bitte die Datei prüfen: {}",
+                    path.display()
+                )),
+            );
+        }
+        configured = settings.logs_root;
+    }
+    // Resolved once: a changed setting applies after a restart. Never a relative path.
+    match resolve_logs_root(configured.as_deref(), env) {
+        Ok(p) => (p, None),
+        Err(e) => (PathBuf::new(), Some(e.to_string())),
+    }
+}
+
 enum SettingsAction {
     Baseline,
     TopUp,
@@ -274,6 +343,14 @@ fn spawn_launch(mode: Mode, confirmed_close: bool, ctx: egui::Context) -> Receiv
     rx
 }
 
+/// The poller's answer after one check: a failed check keeps the previous answer.
+fn poll_answer(check: std::io::Result<bool>, previous: Option<bool>) -> Option<bool> {
+    match check {
+        Ok(running) => Some(running),
+        Err(_) => previous,
+    }
+}
+
 /// Polls `obsidian_running()` in the background; the latest answer is in the returned flag.
 fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(false));
@@ -285,10 +362,13 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
             // The image name follows the Obsidian path from the settings.
             // Unknown image name (unreadable settings): keep the last answer.
             if let Some(image) = sys.current_image_name() {
-                let now_running = sys.obsidian_running(&image);
-                shared.store(now_running, Ordering::Relaxed);
-                if last != Some(now_running) {
-                    last = Some(now_running);
+                // A failed check keeps the last answer instead of showing "geschlossen".
+                let answer = poll_answer(sys.obsidian_running(&image), last);
+                if let Some(now_running) = answer {
+                    shared.store(now_running, Ordering::Relaxed);
+                }
+                if last != answer {
+                    last = answer;
                     ctx.request_repaint();
                 }
             }
@@ -308,6 +388,8 @@ pub struct CerberusApp {
     store: KeyringStore,
     prices_as_of: String,
     tray: Option<Tray>,
+    /// Names (never values) of routing variables that are set in this process's environment.
+    routing_names: Vec<&'static str>,
 }
 
 impl CerberusApp {
@@ -325,12 +407,7 @@ impl CerberusApp {
         let prices_as_of = PriceTable::load(&prices_path).as_of().to_string();
 
         let settings_path = crate::settings::default_path().ok();
-        let configured_logs = settings_path.as_ref().and_then(|p| crate::settings::load(p).0.logs_root);
-        // Resolved once: a changed setting applies after a restart. Never a relative path.
-        let (logs_root, logs_unavailable) = match resolve_logs_root(configured_logs.as_deref(), &real_env) {
-            Ok(p) => (p, None),
-            Err(e) => (PathBuf::new(), Some(e.to_string())),
-        };
+        let (logs_root, logs_unavailable) = logs_target(settings_path.as_deref(), &real_env);
 
         let notify_ctx = ctx.clone();
         let snapshots = spawn_worker(
@@ -367,6 +444,7 @@ impl CerberusApp {
             store,
             prices_as_of,
             tray,
+            routing_names: routing_env_names(&|n| real_env(n).map(|v| v.to_string_lossy().into_owned())),
         }
     }
 
@@ -375,11 +453,22 @@ impl CerberusApp {
     fn poll(&mut self, ctx: &egui::Context) {
         // The channel is unbounded: take everything, keep the newest.
         let mut fresh = false;
-        while let Ok(snapshot) = self.snapshots.try_recv() {
-            self.state.snapshot = Some(snapshot);
-            fresh = true;
+        loop {
+            match self.snapshots.try_recv() {
+                Ok(snapshot) => {
+                    self.state.snapshot = Some(snapshot);
+                    fresh = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.state.worker_gone = true;
+                    break;
+                }
+            }
         }
         if fresh {
+            let note = self.state.snapshot.as_ref().and_then(|s| s.state_note.clone());
+            self.state.show_state_note_once(note.as_deref());
             self.state.reload_settings();
             self.paths.refresh(&self.state.settings);
         }
@@ -391,8 +480,19 @@ impl CerberusApp {
         }
 
         if let Some(rx) = &self.launch_rx {
-            if let Ok(msg) = rx.try_recv() {
+            let received = match rx.try_recv() {
+                Ok(msg) => Some(Some(msg)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(None),
+            };
+            if let Some(msg) = received {
                 self.launch_rx = None;
+                // A waiting "Beenden" goes through now.
+                self.control.set_launch_busy(ctx, false);
+                let Some(msg) = msg else {
+                    self.state.apply_launch_lost();
+                    return;
+                };
                 match msg {
                     LaunchMsg::Done(mode, outcome) => {
                         let started = outcome == LaunchOutcome::Started;
@@ -417,6 +517,7 @@ impl CerberusApp {
         }
         self.state.notice = None;
         self.state.launching = Some((mode, confirmed_close));
+        self.control.set_launch_busy(ctx, true);
         self.launch_rx = Some(spawn_launch(mode, confirmed_close, ctx.clone()));
     }
 
@@ -533,14 +634,26 @@ impl CerberusApp {
 impl eframe::App for CerberusApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        // Close handling lives here, not in `ui`: eframe skips `ui` while the window is minimized or
+        // hidden, and a close request then must still hide the window instead of ending the app.
+        self.control.set_minimized(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+        if ctx.input(|i| i.viewport().close_requested()) {
+            match self.control.close_action() {
+                CloseAction::Exit => {}
+                CloseAction::Hide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.control.hide(ctx);
+                }
+                CloseAction::WaitForLaunch => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.control.quit_when_idle(ctx);
+                }
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if ctx.input(|i| i.viewport().close_requested()) && !self.control.close_means_exit() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.control.hide(&ctx);
-        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -557,12 +670,12 @@ pub(crate) fn mode_style(mode: ModeDisplay) -> (&'static str, &'static str, Colo
     match mode {
         ModeDisplay::Max => (
             "Max (Abo)",
-            "Obsidian läuft über deine Max-Anmeldung. Es entstehen keine API-Kosten.",
+            mode_hint(Mode::Max),
             Color32::from_rgb(46, 160, 90),
         ),
         ModeDisplay::ApiKey => (
             "API-Key (kostet Geld)",
-            "Obsidian läuft mit deinem API-Key. Jede Claudian-Antwort wird abgerechnet.",
+            mode_hint(Mode::ApiKey),
             Color32::from_rgb(230, 150, 30),
         ),
         ModeDisplay::Unknown => (
@@ -602,9 +715,25 @@ impl CerberusApp {
         ui.label(RichText::new(hint).weak());
         ui.add_space(8.0);
 
+        if self.control.quit_waiting() {
+            banner(ui, Color32::from_rgb(50, 100, 160), "Der Start läuft noch. Die App beendet sich danach.");
+            ui.add_space(8.0);
+        }
+        if let Some(text) = routing_warning(&self.routing_names) {
+            banner(ui, Color32::from_rgb(190, 90, 30), &text);
+            ui.add_space(8.0);
+        }
+        if self.state.worker_gone {
+            banner(
+                ui,
+                Color32::from_rgb(170, 60, 50),
+                "Der Hintergrunddienst ist ausgefallen. Die Zahlen werden nicht mehr aktualisiert. Bitte die App neu starten.",
+            );
+            ui.add_space(8.0);
+        }
         let report = self.state.snapshot.as_ref().and_then(|s| s.report.as_ref());
         if let Some(pause) = report.and_then(|r| r.pause.as_ref()) {
-            let text = pause_text(pause.until.with_timezone(&Local), &pause.limit_type);
+            let text = pause_text(pause.until.with_timezone(&Local), Local::now(), &pause.limit_type);
             banner(ui, Color32::from_rgb(170, 60, 50), &text);
             ui.add_space(8.0);
         }
@@ -756,10 +885,7 @@ impl CerberusApp {
             },
             key_field_id(slot),
         );
-        ui.label(match stored {
-            Some(true) => "gespeichert",
-            _ => "nicht gespeichert",
-        });
+        ui.label(key_status_text(stored));
         let mut save = false;
         let mut delete = false;
         ui.horizontal(|ui| {
@@ -822,6 +948,7 @@ impl CerberusApp {
             };
             ui.colored_label(Color32::from_rgb(230, 150, 30), text);
         }
+        let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         let mut action: Option<SettingsAction> = None;
         ui.add_enabled_ui(can_save, |ui| {
             ui.horizontal(|ui| {
@@ -862,6 +989,9 @@ impl CerberusApp {
                     action = Some(SettingsAction::Limits);
                 }
             });
+            if let Some(hint) = inert_limits_hint(api) {
+                ui.colored_label(WARN, hint);
+            }
         });
         if let Some(action) = action {
             self.apply_settings_action(action);
@@ -974,28 +1104,28 @@ fn bucket_table(ui: &mut egui::Ui, id: &str, first_col: &str, rows: &[(String, B
         ui.label(RichText::new("Noch keine Anfragen in diesem Monat.").weak());
         return;
     }
-    egui::Grid::new(id).striped(true).num_columns(5).spacing([16.0, 4.0]).show(ui, |ui| {
-        ui.label(RichText::new(first_col).strong());
-        right(ui, 70.0, "Anfragen");
-        right(ui, 120.0, "Ein (inkl. Cache)");
-        right(ui, 80.0, "Aus");
-        right(ui, 250.0, format!("Kosten ({COST_NOTE})"));
-        ui.end_row();
-        for (name, b) in rows {
-            ui.scope(|ui| {
-                ui.set_max_width(280.0);
-                ui.add(egui::Label::new(name.as_str()).truncate()).on_hover_text(name.as_str());
-            });
-            right(ui, 70.0, format_count(b.requests));
-            right(ui, 120.0, format_count(b.input.saturating_add(b.cache_read).saturating_add(b.cache_write)));
-            right(ui, 80.0, format_count(b.output));
-            let cost = match unpriced_text(b.unpriced_requests) {
-                Some(note) => format!("{} · {note}", format_usd(b.cost_nano)),
-                None => format_usd(b.cost_nano),
-            };
-            right(ui, 250.0, cost);
+    // Horizontal scroll: the cost column is always reachable, even in a narrow window. Long names are
+    // cut (full name as tooltip) so the table stays about as wide as the default window.
+    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new(id).striped(true).num_columns(5).spacing([16.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new(first_col).strong());
+            right(ui, 70.0, "Anfragen");
+            right(ui, 120.0, "Ein (inkl. Cache)");
+            right(ui, 80.0, "Aus");
+            right(ui, 250.0, format!("Kosten ({COST_NOTE})"));
             ui.end_row();
-        }
+            for (name, b) in rows {
+                ui.scope(|ui| {
+                    ui.set_max_width(200.0);
+                    ui.add(egui::Label::new(name.as_str()).truncate()).on_hover_text(name.as_str());
+                });
+                right(ui, 70.0, format_count(b.requests));
+                right(ui, 120.0, format_count(b.input.saturating_add(b.cache_read).saturating_add(b.cache_write)));
+                right(ui, 80.0, format_count(b.output));
+                right(ui, 250.0, cost_cell_text(b));
+                ui.end_row();
+            }
+        });
     });
 }
 
@@ -1082,6 +1212,80 @@ mod tests {
         s.apply_outcome(Mode::ApiKey, LaunchOutcome::MissingKey, now);
         assert_eq!(s.notice.as_ref().unwrap().kind, NoticeKind::Error);
         assert_eq!(s.mode, ModeDisplay::Closed);
+    }
+
+    #[test]
+    fn failed_process_check_keeps_the_last_answer() {
+        assert_eq!(poll_answer(Ok(true), None), Some(true));
+        assert_eq!(poll_answer(Ok(false), Some(true)), Some(false));
+        let err = || Err(std::io::Error::other("blocked"));
+        assert_eq!(poll_answer(err(), Some(true)), Some(true), "no forgetting the mode on one failed check");
+        assert_eq!(poll_answer(err(), Some(false)), Some(false));
+        assert_eq!(poll_answer(err(), None), None);
+    }
+
+    #[test]
+    fn lost_launch_thread_releases_the_buttons_with_an_error() {
+        let mut s = AppState::new();
+        s.launching = Some((Mode::Max, true));
+        s.apply_launch_lost();
+        assert!(s.launching.is_none());
+        let n = s.notice.unwrap();
+        assert_eq!(n.kind, NoticeKind::Error);
+        assert!(n.text.contains("unerwartet"));
+    }
+
+    #[test]
+    fn state_note_is_shown_exactly_once() {
+        let mut s = AppState::new();
+        s.show_state_note_once(None);
+        assert!(s.notice.is_none());
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "alte Datei zur Seite gelegt");
+        s.notice = None;
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert!(s.notice.is_none(), "dismissed notes do not come back with every snapshot");
+    }
+
+    #[test]
+    fn key_status_distinguishes_unreadable_from_missing() {
+        assert_eq!(key_status_text(Some(true)), "gespeichert");
+        assert_eq!(key_status_text(Some(false)), "nicht gespeichert");
+        assert_eq!(key_status_text(None), "Speicher nicht lesbar");
+    }
+
+    #[test]
+    fn fully_unpriced_rows_show_no_dollar_zero() {
+        let row = |cost_nano, requests, unpriced_requests| Bucket { cost_nano, requests, unpriced_requests, ..Bucket::default() };
+        assert_eq!(cost_cell_text(&row(0, 3, 3)), "3 Anfragen nicht bewertet");
+        assert_eq!(cost_cell_text(&row(0, 1, 1)), "1 Anfrage nicht bewertet");
+        assert_eq!(cost_cell_text(&row(1_230_000_000, 5, 2)), "$1.23 · 2 Anfragen nicht bewertet");
+        assert_eq!(cost_cell_text(&row(1_230_000_000, 5, 0)), "$1.23");
+        assert_eq!(cost_cell_text(&row(0, 5, 0)), "$0.00", "all priced but free stays a number");
+    }
+
+    #[test]
+    fn unreadable_settings_never_fall_back_to_the_auto_log_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let env = |n: &str| (n == "USERPROFILE").then(|| std::ffi::OsString::from(r"C:\Users\someone"));
+
+        // A broken file: nothing is scanned, the reason is shown (this protects a custom folder's history).
+        std::fs::write(&path, "{ broken").unwrap();
+        let (root, reason) = logs_target(Some(&path), &env);
+        assert!(root.as_os_str().is_empty());
+        assert!(reason.unwrap().contains("settings.json"));
+
+        // A missing file is the normal first run: automatic folder.
+        std::fs::remove_file(&path).unwrap();
+        let (root, reason) = logs_target(Some(&path), &env);
+        assert!(reason.is_none());
+        assert!(root.ends_with(Path::new(".claude").join("projects")), "{root:?}");
+
+        // A good file with a custom folder uses it.
+        std::fs::write(&path, r#"{"logs_root": "D:\\Claude\\projects"}"#).unwrap();
+        let (root, reason) = logs_target(Some(&path), &env);
+        assert_eq!((root, reason), (PathBuf::from(r"D:\Claude\projects"), None));
     }
 
     struct FakeStore(RefCell<Option<String>>);
