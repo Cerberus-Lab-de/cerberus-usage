@@ -200,6 +200,7 @@ mod tests {
             since_nano: since,
             updated: utc("2026-11-05T11:55:00Z").with_timezone(&Local),
             error,
+            has_data: true,
         }
     }
 

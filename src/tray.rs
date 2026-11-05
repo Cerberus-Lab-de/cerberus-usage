@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, IconData, ViewportCommand};
+use crate::balance::Alert;
+use crate::pricing::format_usd;
+use crate::ui::{ModeDisplay, mode_title};
+use crate::worker::Snapshot;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -61,9 +65,68 @@ impl WindowControl {
     }
 }
 
+/// How the notification-area icon looks: plain, or with a coloured badge for a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconState {
+    Normal,
+    /// Max is paused (orange badge).
+    Warning,
+    /// Budget exceeded or balance low (red badge).
+    Alert,
+}
+
+/// The most severe state among the alerts.
+pub fn icon_state(alerts: &[Alert]) -> IconState {
+    alerts.iter().fold(IconState::Normal, |state, alert| {
+        let this = match alert {
+            Alert::BudgetExceeded | Alert::LowBalance => IconState::Alert,
+            Alert::MaxPaused(_) => IconState::Warning,
+        };
+        if state == IconState::Alert || this == IconState::Alert { IconState::Alert } else { this }
+    })
+}
+
+/// Copy of the RGBA image with a filled circle in the lower right corner; `Normal` returns it unchanged.
+pub fn icon_with_badge(rgba: &[u8], width: u32, height: u32, state: IconState) -> Vec<u8> {
+    let color = match state {
+        IconState::Normal => return rgba.to_vec(),
+        IconState::Warning => [230u8, 150, 30, 255],
+        IconState::Alert => [200u8, 40, 40, 255],
+    };
+    let mut out = rgba.to_vec();
+    let (w, h) = (width as f32, height as f32);
+    let (cx, cy, r) = (w * 0.75, h * 0.75, w.min(h) * 0.2);
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let i = ((y * width + x) * 4) as usize;
+            if dx * dx + dy * dy <= r * r && i + 4 <= out.len() {
+                out[i..i + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    out
+}
+
+/// Tooltip text: mode, today's estimated cost, a hint when warnings are active. Windows cuts tooltips
+/// at 127 characters. Built from the snapshot only, which never holds a key.
+pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay) -> String {
+    let mut text = format!("Cerberus Usage · {}", mode_title(mode));
+    if let Some(report) = &snapshot.report {
+        text.push_str(&format!(" · heute {} (geschätzt)", format_usd(report.today.cost_nano)));
+    }
+    if !snapshot.alerts.is_empty() {
+        text.push_str(" · Warnung");
+    }
+    text
+}
+
 /// Keeps the icon alive; dropping it removes the icon from the notification area.
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    base_rgba: Vec<u8>,
+    size: (u32, u32),
+    shown: Option<(String, IconState)>,
 }
 
 impl Tray {
@@ -108,6 +171,86 @@ impl Tray {
         }));
 
         control.tray_available.store(true, Ordering::Relaxed);
-        Ok(Tray { _icon: tray })
+        Ok(Tray {
+            icon: tray,
+            base_rgba: icon.rgba.clone(),
+            size: (icon.width, icon.height),
+            shown: None,
+        })
+    }
+
+    /// Updates tooltip and icon badge; does nothing when neither changed.
+    pub fn update(&mut self, tooltip: String, state: IconState) {
+        if self.shown.as_ref().is_some_and(|(t, s)| *t == tooltip && *s == state) {
+            return;
+        }
+        let _ = self.icon.set_tooltip(Some(tooltip.as_str()));
+        let rgba = icon_with_badge(&self.base_rgba, self.size.0, self.size.1, state);
+        if let Ok(icon) = Icon::from_rgba(rgba, self.size.0, self.size.1) {
+            let _ = self.icon.set_icon(Some(icon));
+        }
+        self.shown = Some((tooltip, state));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::balance::Alert;
+    use crate::report::{Bucket, Report};
+    use crate::ui::ModeDisplay;
+    use crate::worker::Snapshot;
+    use chrono::{Local, Utc};
+
+    fn snapshot(today_nano: u64) -> Snapshot {
+        let report = Report { today: Bucket { cost_nano: today_nano, ..Bucket::default() }, ..Report::default() };
+        Snapshot {
+            report: Some(report),
+            scanned_files: 1,
+            total_files: 1,
+            scan_error: None,
+            updated: Local::now(),
+            api: None,
+            balance: None,
+            alerts: Vec::new(),
+            settings_error: None,
+        }
+    }
+
+    #[test]
+    fn tray_tooltip_shows_mode_and_today_cost() {
+        let tip = tooltip(&snapshot(1_230_000_000), ModeDisplay::Max);
+        assert!(tip.contains("Max") && tip.contains("$1.23"), "{tip}");
+        assert!(tip.len() < 128, "Windows truncates tooltips at 127 characters: {tip}");
+        // Without a report yet there is still a valid tooltip.
+        let mut s = snapshot(0);
+        s.report = None;
+        assert!(tooltip(&s, ModeDisplay::Closed).contains("Cerberus Usage"));
+        // Alerts are mentioned; no key material can be in a snapshot tooltip.
+        let mut s = snapshot(0);
+        s.alerts = vec![Alert::LowBalance];
+        assert!(tooltip(&s, ModeDisplay::ApiKey).contains("Warnung"));
+    }
+
+    #[test]
+    fn tray_icon_state_prefers_alert() {
+        assert_eq!(icon_state(&[]), IconState::Normal);
+        let paused = Alert::MaxPaused(Utc::now());
+        assert_eq!(icon_state(std::slice::from_ref(&paused)), IconState::Warning);
+        assert_eq!(icon_state(&[paused, Alert::BudgetExceeded]), IconState::Alert);
+        assert_eq!(icon_state(&[Alert::LowBalance]), IconState::Alert);
+    }
+
+    #[test]
+    fn badge_recolours_a_corner_and_keeps_the_rest() {
+        let (w, h) = (32usize, 32usize);
+        let base = vec![10u8; w * h * 4];
+        assert_eq!(icon_with_badge(&base, w as u32, h as u32, IconState::Normal), base);
+        let alert = icon_with_badge(&base, w as u32, h as u32, IconState::Alert);
+        let warn = icon_with_badge(&base, w as u32, h as u32, IconState::Warning);
+        let px = |v: &[u8], x: usize, y: usize| v[(y * w + x) * 4..(y * w + x) * 4 + 4].to_vec();
+        assert_eq!(px(&alert, 26, 26)[3], 255);
+        assert_ne!(px(&alert, 26, 26), px(&warn, 26, 26));
+        assert_eq!(px(&alert, 2, 2), px(&base, 2, 2));
     }
 }

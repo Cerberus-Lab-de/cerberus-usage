@@ -112,7 +112,8 @@ impl Live {
         let pause = snapshot.report.as_ref().and_then(|r| r.pause.as_ref());
         snapshot.alerts = alerts(
             &self.settings,
-            snapshot.api.as_ref().map(|a| a.month_nano),
+            // Only a real figure: after a first failed poll the 0 is a placeholder.
+            snapshot.api.as_ref().filter(|a| a.has_data).map(|a| a.month_nano),
             snapshot.balance.as_ref().map(|b| b.estimate_nano),
             pause,
             Utc::now(),
@@ -520,6 +521,25 @@ mod tests {
         // 60 USD is below the 100 USD warning level; the budget alert needs API cost and stays off.
         assert_eq!(snap.alerts, vec![Alert::LowBalance]);
         assert_eq!(http.request_count(), 0);
+    }
+
+    #[test]
+    fn no_budget_alert_after_a_first_failed_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        // The budget in BASELINE_JSON is 1 nano: a placeholder "0 cost" must not be compared with it
+        // and a real cost of 0 must not be invented either.
+        let (cfg, _http) = config_with_api(
+            dir.path(),
+            Some("sk-ant-admin01-NICHTECHT-1234"),
+            vec![Ok((429, "{}".to_string()))],
+        );
+        write_settings(&cfg, BASELINE_JSON);
+        let rx = spawn_worker(cfg, noop());
+        let (_, _first) = until_report(&rx);
+        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let api = second.api.as_ref().expect("api status missing");
+        assert!(!api.has_data && api.error.is_some());
+        assert!(!second.alerts.contains(&Alert::BudgetExceeded), "alerts: {:?}", second.alerts);
     }
 
     #[test]

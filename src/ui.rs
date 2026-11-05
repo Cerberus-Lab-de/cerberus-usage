@@ -6,18 +6,23 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
+use crate::cards::{
+    ApiCard, BalanceCard, alert_banner_text, api_card, balance_card, update_settings, with_baseline, with_limits,
+    with_topup, without_topup,
+};
 use crate::format::{
     COST_NOTE, format_count, outcome_message, pause_text, progress_text, unpriced_text,
 };
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch};
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
+use crate::settings::Settings;
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
-use crate::tray::{Tray, WindowControl};
+use crate::tray::{Tray, WindowControl, icon_state, tooltip};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 
 /// How often the background thread asks whether Obsidian runs (each check spawns `tasklist`).
@@ -75,6 +80,17 @@ pub struct AppState {
     pub key_input: String,
     /// Whether an API key is stored (`None`: store not readable).
     pub key_stored: Option<bool>,
+    /// Content of the masked admin-key field; same rules as `key_input`.
+    pub admin_key_input: String,
+    pub admin_key_stored: Option<bool>,
+    /// Last settings read from the file (for the cards and the lists in the settings panel).
+    pub settings: Settings,
+    pub settings_path: Option<PathBuf>,
+    /// Text fields of the settings panel (amounts as typed).
+    pub baseline_input: String,
+    pub topup_input: String,
+    pub budget_input: String,
+    pub low_balance_input: String,
 }
 
 impl AppState {
@@ -90,6 +106,25 @@ impl AppState {
             notice: None,
             key_input: String::new(),
             key_stored: None,
+            admin_key_input: String::new(),
+            admin_key_stored: None,
+            settings: Settings::default(),
+            settings_path: None,
+            baseline_input: String::new(),
+            topup_input: String::new(),
+            budget_input: String::new(),
+            low_balance_input: String::new(),
+        }
+    }
+
+    /// Re-reads `settings.json` for display. A broken or missing file keeps the last good copy; the
+    /// problem itself comes from the worker snapshot (`settings_error`).
+    pub fn reload_settings(&mut self) {
+        if let Some(path) = &self.settings_path {
+            let (settings, error) = crate::settings::load(path);
+            if error.is_none() {
+                self.settings = settings;
+            }
         }
     }
 
@@ -144,29 +179,55 @@ impl Default for AppState {
     }
 }
 
-/// Validate and store an API key. Errors are fixed messages, never the value.
-pub fn save_api_key(store: &dyn SecretStore, input: &str) -> Result<(), String> {
+/// Validate and store a key. Errors are fixed messages, never the value.
+pub fn save_key(store: &dyn SecretStore, slot: Slot, input: &str) -> Result<(), String> {
     let value = input.trim();
-    validate_key(Slot::ApiKey, value).map_err(str::to_string)?;
-    store.set(Slot::ApiKey, value).map_err(|e| e.to_string())
+    validate_key(slot, value).map_err(str::to_string)?;
+    store.set(slot, value).map_err(|e| e.to_string())
+}
+
+pub fn save_api_key(store: &dyn SecretStore, input: &str) -> Result<(), String> {
+    save_key(store, Slot::ApiKey, input)
 }
 
 /// Presence check only; the value is dropped immediately.
-fn api_key_stored(store: &dyn SecretStore) -> Option<bool> {
-    store.get(Slot::ApiKey).ok().map(|v| v.is_some())
+fn key_stored(store: &dyn SecretStore, slot: Slot) -> Option<bool> {
+    store.get(slot).ok().map(|v| v.is_some())
 }
 
-/// Fixed id of the key field, so its widget state can be found again.
-fn key_field_id() -> egui::Id {
-    egui::Id::unique("api-key-field")
+/// Fixed id of a key field, so its widget state can be found again.
+fn key_field_id(slot: Slot) -> egui::Id {
+    match slot {
+        Slot::ApiKey => egui::Id::unique("api-key-field"),
+        Slot::AdminKey => egui::Id::unique("admin-key-field"),
+    }
 }
 
-/// Empties the key field *and* drops its egui widget state. egui keeps the undo history of a text edit
+/// Empties a key field *and* drops its egui widget state. egui keeps the undo history of a text edit
 /// (also of password fields) in the context for the process lifetime, so clearing only the string would
 /// let Ctrl+Z bring the key back.
-fn wipe_key_field(ctx: &egui::Context, input: &mut String) {
+fn wipe_key_field(ctx: &egui::Context, id: egui::Id, input: &mut String) {
     input.clear();
-    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(key_field_id()));
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+}
+
+fn key_label(slot: Slot) -> &'static str {
+    match slot {
+        Slot::ApiKey => "API-Key",
+        Slot::AdminKey => "Admin-Key",
+    }
+}
+
+/// An optional limit as it is typed into its field (`65.03`, empty for none).
+fn amount_input(nano: Option<u64>) -> String {
+    nano.map(|n| format_usd(n).trim_start_matches('$').to_string()).unwrap_or_default()
+}
+
+enum SettingsAction {
+    Baseline,
+    TopUp,
+    Remove(usize),
+    Limits,
 }
 
 enum LaunchMsg {
@@ -223,7 +284,7 @@ pub struct CerberusApp {
     control: Arc<WindowControl>,
     store: KeyringStore,
     prices_as_of: String,
-    _tray: Option<Tray>,
+    tray: Option<Tray>,
 }
 
 impl CerberusApp {
@@ -258,7 +319,12 @@ impl CerberusApp {
 
         let store = KeyringStore::new();
         let mut state = AppState::new();
-        state.key_stored = api_key_stored(&store);
+        state.key_stored = key_stored(&store, Slot::ApiKey);
+        state.admin_key_stored = key_stored(&store, Slot::AdminKey);
+        state.settings_path = crate::settings::default_path().ok();
+        state.reload_settings();
+        state.budget_input = amount_input(state.settings.monthly_budget_nano);
+        state.low_balance_input = amount_input(state.settings.low_balance_nano);
 
         Self {
             state,
@@ -268,7 +334,7 @@ impl CerberusApp {
             control,
             store,
             prices_as_of,
-            _tray: tray,
+            tray,
         }
     }
 
@@ -276,11 +342,19 @@ impl CerberusApp {
     /// while the window is hidden.
     fn poll(&mut self, ctx: &egui::Context) {
         // The channel is unbounded: take everything, keep the newest.
+        let mut fresh = false;
         while let Ok(snapshot) = self.snapshots.try_recv() {
             self.state.snapshot = Some(snapshot);
+            fresh = true;
+        }
+        if fresh {
+            self.state.reload_settings();
         }
         let now = Instant::now();
         self.state.apply_running(self.obsidian_running.load(Ordering::Relaxed), now);
+        if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
+            tray.update(tooltip(snapshot, self.state.mode), icon_state(&snapshot.alerts));
+        }
 
         if let Some(rx) = &self.launch_rx {
             if let Ok(msg) = rx.try_recv() {
@@ -311,12 +385,28 @@ impl CerberusApp {
         self.launch_rx = Some(spawn_launch(mode, confirmed_close, ctx.clone()));
     }
 
-    fn save_key(&mut self, ctx: &egui::Context) {
-        match save_api_key(&self.store, &self.state.key_input) {
+    fn input_mut(&mut self, slot: Slot) -> &mut String {
+        match slot {
+            Slot::ApiKey => &mut self.state.key_input,
+            Slot::AdminKey => &mut self.state.admin_key_input,
+        }
+    }
+
+    fn set_stored(&mut self, slot: Slot, stored: bool) {
+        match slot {
+            Slot::ApiKey => self.state.key_stored = Some(stored),
+            Slot::AdminKey => self.state.admin_key_stored = Some(stored),
+        }
+    }
+
+    fn save_key(&mut self, ctx: &egui::Context, slot: Slot) {
+        let input = self.input_mut(slot).clone();
+        match save_key(&self.store, slot, &input) {
             Ok(()) => {
-                wipe_key_field(ctx, &mut self.state.key_input);
-                self.state.key_stored = Some(true);
-                self.state.notice = Some(Notice { kind: NoticeKind::Info, text: "API-Key gespeichert.".into() });
+                wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
+                self.set_stored(slot, true);
+                self.state.notice =
+                    Some(Notice { kind: NoticeKind::Info, text: format!("{} gespeichert.", key_label(slot)) });
             }
             Err(msg) => {
                 self.state.notice = Some(Notice { kind: NoticeKind::Error, text: msg });
@@ -324,17 +414,49 @@ impl CerberusApp {
         }
     }
 
-    fn delete_key(&mut self, ctx: &egui::Context) {
-        wipe_key_field(ctx, &mut self.state.key_input);
-        match self.store.delete(Slot::ApiKey) {
+    fn delete_key(&mut self, ctx: &egui::Context, slot: Slot) {
+        wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
+        match self.store.delete(slot) {
             Ok(()) => {
-                self.state.key_stored = Some(false);
-                self.state.notice = Some(Notice { kind: NoticeKind::Info, text: "API-Key gelöscht.".into() });
+                self.set_stored(slot, false);
+                self.state.notice =
+                    Some(Notice { kind: NoticeKind::Info, text: format!("{} gelöscht.", key_label(slot)) });
             }
             Err(e) => {
                 self.state.notice = Some(Notice { kind: NoticeKind::Error, text: e.to_string() });
             }
         }
+    }
+
+    fn apply_settings_action(&mut self, action: SettingsAction) {
+        let Some(path) = self.state.settings_path.clone() else {
+            self.state.notice =
+                Some(Notice { kind: NoticeKind::Error, text: "Einstellungen sind nicht verfügbar.".into() });
+            return;
+        };
+        let now = Utc::now();
+        let st = &self.state;
+        let result = update_settings(&path, |s| match &action {
+            SettingsAction::Baseline => with_baseline(s, &st.baseline_input, now),
+            SettingsAction::TopUp => with_topup(s, &st.topup_input, now),
+            SettingsAction::Remove(i) => Ok(without_topup(s, *i)),
+            SettingsAction::Limits => with_limits(s, &st.budget_input, &st.low_balance_input),
+        });
+        self.state.notice = Some(match result {
+            Ok(settings) => {
+                self.state.settings = settings;
+                match action {
+                    SettingsAction::Baseline => self.state.baseline_input.clear(),
+                    SettingsAction::TopUp => self.state.topup_input.clear(),
+                    _ => {}
+                }
+                Notice {
+                    kind: NoticeKind::Info,
+                    text: "Gespeichert. Die Karten übernehmen die Änderung beim nächsten Durchlauf (höchstens eine Minute).".into(),
+                }
+            }
+            Err(text) => Notice { kind: NoticeKind::Error, text },
+        });
     }
 }
 
@@ -361,7 +483,7 @@ impl eframe::App for CerberusApp {
 
 // ---- drawing -------------------------------------------------------------------------------------
 
-fn mode_style(mode: ModeDisplay) -> (&'static str, &'static str, Color32) {
+pub(crate) fn mode_style(mode: ModeDisplay) -> (&'static str, &'static str, Color32) {
     match mode {
         ModeDisplay::Max => (
             "Max (Abo)",
@@ -384,6 +506,11 @@ fn mode_style(mode: ModeDisplay) -> (&'static str, &'static str, Color32) {
             Color32::from_rgb(100, 130, 170),
         ),
     }
+}
+
+/// Short mode name for the tray tooltip.
+pub fn mode_title(mode: ModeDisplay) -> &'static str {
+    mode_style(mode).0
 }
 
 fn banner(ui: &mut egui::Ui, fill: Color32, text: &str) {
@@ -415,6 +542,17 @@ impl CerberusApp {
             banner(ui, Color32::from_rgb(170, 60, 50), &format!("Fehler beim Lesen der Protokolle: {err}"));
             ui.add_space(8.0);
         }
+        if let Some(err) = self.state.snapshot.as_ref().and_then(|s| s.settings_error.as_ref()) {
+            let place = self.state.settings_path.as_ref().map(|p| format!(" Datei: {}", p.display())).unwrap_or_default();
+            banner(ui, Color32::from_rgb(170, 60, 50), &format!("{err}.{place}"));
+            ui.add_space(8.0);
+        }
+        for alert in self.state.snapshot.iter().flat_map(|s| s.alerts.iter()) {
+            if let Some(text) = alert_banner_text(alert) {
+                banner(ui, Color32::from_rgb(190, 90, 30), text);
+                ui.add_space(8.0);
+            }
+        }
         if let Some(notice) = &self.state.notice {
             let fill = match notice.kind {
                 NoticeKind::Info => Color32::from_rgb(50, 100, 160),
@@ -425,6 +563,8 @@ impl CerberusApp {
         }
 
         self.draw_launcher(ui, ctx);
+        ui.add_space(12.0);
+        self.draw_anthropic(ui);
         ui.add_space(12.0);
         self.draw_usage(ui);
         ui.add_space(12.0);
@@ -489,6 +629,13 @@ impl CerberusApp {
             return;
         };
 
+        ui.heading("Lokal geschätzt");
+        ui.label(
+            RichText::new("Aus den Claude-Protokollen auf diesem Rechner, nach Listenpreis berechnet. Das ist nicht die Rechnung.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             let width = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
             card(ui, width, "Heute", &report.today);
@@ -515,29 +662,129 @@ impl CerberusApp {
         );
     }
 
+    fn draw_anthropic(&self, ui: &mut egui::Ui) {
+        ui.heading("Laut Anthropic");
+        ui.label(RichText::new("Von Anthropic gemeldete Werte bzw. daraus geschätzt, getrennt von der lokalen Schätzung.").weak().small());
+        ui.add_space(4.0);
+        let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
+        let balance = self.state.snapshot.as_ref().and_then(|s| s.balance.as_ref());
+        let api_view = api_card(self.state.admin_key_stored, api);
+        let balance_view = balance_card(balance, &self.state.settings);
+        let balance_error = balance.filter(|b| b.cost_deducted).and_then(|b| b.error.as_ref());
+        ui.horizontal_top(|ui| {
+            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            titled_card(ui, width, "API-Kosten laut Anthropic", |ui| draw_api_card(ui, &api_view));
+            titled_card(ui, width, "Guthaben (geschätzt)", |ui| draw_balance_card(ui, &balance_view, balance_error));
+        });
+    }
+
+    fn draw_key_row(&mut self, ui: &mut egui::Ui, slot: Slot, hint: &str) {
+        let (stored, id) = (
+            match slot {
+                Slot::ApiKey => self.state.key_stored,
+                Slot::AdminKey => self.state.admin_key_stored,
+            },
+            key_field_id(slot),
+        );
+        ui.label(match stored {
+            Some(true) => "gespeichert",
+            _ => "nicht gespeichert",
+        });
+        let mut save = false;
+        let mut delete = false;
+        ui.horizontal(|ui| {
+            let input = self.input_mut(slot);
+            ui.add(
+                egui::TextEdit::singleline(input)
+                    .id(id)
+                    .password(true)
+                    .hint_text(hint)
+                    .desired_width(320.0),
+            );
+            let empty = input.is_empty();
+            save = ui.add_enabled(!empty, egui::Button::new("Speichern")).clicked();
+            delete = ui.add_enabled(stored == Some(true), egui::Button::new("Löschen")).clicked();
+        });
+        if save {
+            self.save_key(ui.ctx(), slot);
+        }
+        if delete {
+            self.delete_key(ui.ctx(), slot);
+        }
+    }
+
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Einstellungen").default_open(false).show(ui, |ui| {
             ui.label("API-Key (nur für „Mit API-Key starten“, liegt im Windows-Anmeldeinformationsspeicher)");
-            ui.label(match self.state.key_stored {
-                Some(true) => "gespeichert",
-                _ => "nicht gespeichert",
-            });
+            self.draw_key_row(ui, Slot::ApiKey, "sk-ant-…");
+            ui.label(
+                RichText::new("Key muss einem Workspace zugeordnet sein (Geltungsbereich Default), sonst lehnt die API Anfragen ab.")
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(10.0);
+
+            ui.label("Admin-Key (nur für die Kosten-API, braucht ein Organisations-Konto)");
+            self.draw_key_row(ui, Slot::AdminKey, "sk-ant-admin01-…");
+            ui.add_space(10.0);
+
+            self.draw_balance_settings(ui);
+        });
+    }
+
+    fn draw_balance_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Guthaben und Grenzen").strong());
+        let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
+        let can_save = !broken && self.state.settings_path.is_some();
+        if !can_save {
+            let place = self.state.settings_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            ui.colored_label(
+                Color32::from_rgb(230, 150, 30),
+                format!("Speichern ist gesperrt, solange die Einstellungsdatei nicht lesbar ist. Bitte die Datei prüfen oder löschen: {place}"),
+            );
+        }
+        let mut action: Option<SettingsAction> = None;
+        ui.add_enabled_ui(can_save, |ui| {
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.state.key_input)
-                        .id(key_field_id())
-                        .password(true)
-                        .hint_text("sk-ant-…")
-                        .desired_width(320.0),
-                );
-                if ui.add_enabled(!self.state.key_input.is_empty(), egui::Button::new("Speichern")).clicked() {
-                    self.save_key(ui.ctx());
+                ui.label("Startwert aus der Console (USD):");
+                ui.add(egui::TextEdit::singleline(&mut self.state.baseline_input).hint_text("65,03").desired_width(90.0));
+                if ui.button("Als Startwert speichern").clicked() {
+                    action = Some(SettingsAction::Baseline);
                 }
-                if ui.add_enabled(self.state.key_stored == Some(true), egui::Button::new("Löschen")).clicked() {
-                    self.delete_key(ui.ctx());
+            });
+            ui.label(RichText::new("Der Startwert gilt ab jetzt; Aufladungen und Kosten davor zählen nicht.").weak().small());
+            ui.horizontal(|ui| {
+                ui.label("Aufladung (USD):");
+                ui.add(egui::TextEdit::singleline(&mut self.state.topup_input).hint_text("10").desired_width(90.0));
+                if ui.button("Aufladung hinzufügen").clicked() {
+                    action = Some(SettingsAction::TopUp);
+                }
+            });
+            for (i, topup) in self.state.settings.topups.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} · {}",
+                        topup.at.with_timezone(&Local).format("%d.%m.%Y"),
+                        format_usd(topup.amount_nano)
+                    ));
+                    if ui.small_button("Entfernen").clicked() {
+                        action = Some(SettingsAction::Remove(i));
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Monatsbudget (USD, optional):");
+                ui.add(egui::TextEdit::singleline(&mut self.state.budget_input).hint_text("20").desired_width(90.0));
+                ui.label("Warngrenze Guthaben (USD, optional):");
+                ui.add(egui::TextEdit::singleline(&mut self.state.low_balance_input).hint_text("10").desired_width(90.0));
+                if ui.button("Grenzen speichern").clicked() {
+                    action = Some(SettingsAction::Limits);
                 }
             });
         });
+        if let Some(action) = action {
+            self.apply_settings_action(action);
+        }
     }
 }
 
@@ -570,6 +817,67 @@ fn card(ui: &mut egui::Ui, width: f32, title: &str, b: &Bucket) {
             ui.label(RichText::new(token_summary(b)).small());
         });
     });
+}
+
+/// A framed card with a title; `body` stacks its lines vertically.
+fn titled_card(ui: &mut egui::Ui, width: f32, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(width - 20.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).strong());
+            body(ui);
+        });
+    });
+}
+
+const WARN: Color32 = Color32::from_rgb(230, 150, 30);
+
+fn draw_api_card(ui: &mut egui::Ui, view: &ApiCard) {
+    match view {
+        ApiCard::NoKey => {
+            ui.label("Kein Admin-Key gespeichert. Kosten-API nur mit Organisations-Konto.");
+        }
+        ApiCard::Pending => {
+            ui.label("Warte auf die erste Abfrage …");
+        }
+        ApiCard::Error(text) => {
+            ui.colored_label(WARN, text);
+        }
+        ApiCard::Data { today, month, updated, error } => {
+            ui.label(RichText::new(format!("Heute {today}")).size(22.0).strong());
+            ui.label(format!("Dieser Monat {month}"));
+            ui.label(RichText::new(format!("Stand: {updated}")).small());
+            ui.label(
+                RichText::new("Die Daten können mehrere Stunden hinterherhinken (laut Anthropic etwa 4 Std., bis zu 24 Std.).")
+                    .weak()
+                    .small(),
+            );
+            if let Some(text) = error {
+                ui.colored_label(WARN, text);
+            }
+        }
+    }
+}
+
+fn draw_balance_card(ui: &mut egui::Ui, view: &BalanceCard, error: Option<&crate::analytics::ApiError>) {
+    match view {
+        BalanceCard::NoBaseline => {
+            ui.label("Noch kein Startwert. Trage unter Einstellungen den aktuellen Betrag aus der Console ein.");
+        }
+        BalanceCard::Estimate { value, deducted, details, note } => {
+            ui.label(RichText::new(value).size(26.0).strong());
+            ui.label(RichText::new(if *deducted { "geschätzt" } else { "geschätzt, ohne Kostenabzug" }).weak().small());
+            for line in details {
+                ui.label(RichText::new(line).small());
+            }
+            if let Some(note) = note {
+                ui.colored_label(WARN, note);
+            }
+            if let Some(e) = error {
+                ui.colored_label(WARN, crate::cards::api_error_text(e));
+            }
+        }
+    }
 }
 
 /// Right-aligned cell with a fixed width, so every column (and the row striping) has a stable size.
@@ -721,22 +1029,22 @@ mod tests {
         let err = save_api_key(&store, "not-a-key-xyz").unwrap_err();
         assert_eq!(err, "Ein API-Key beginnt mit sk-ant-.");
         assert!(!err.contains("not-a-key-xyz"));
-        assert_eq!(api_key_stored(&store), Some(false));
+        assert_eq!(key_stored(&store, Slot::ApiKey), Some(false));
     }
 
     #[test]
     fn valid_key_is_trimmed_and_stored() {
         let store = FakeStore(RefCell::new(None));
         save_api_key(&store, "  sk-ant-api03-fake-test-value\n").unwrap();
-        assert_eq!(api_key_stored(&store), Some(true));
+        assert_eq!(key_stored(&store, Slot::ApiKey), Some(true));
         assert_eq!(store.0.borrow().as_deref(), Some("sk-ant-api03-fake-test-value"));
     }
 
     /// Runs one frame with the key field; the text lives in `text`.
-    fn key_field_frame(ctx: &egui::Context, text: &mut String, events: Vec<egui::Event>, focus: bool) {
+    fn key_field_frame(ctx: &egui::Context, id: egui::Id, text: &mut String, events: Vec<egui::Event>, focus: bool) {
         let input = egui::RawInput { events, ..Default::default() };
         let mut output = ctx.run_ui(input, |ui| {
-            let r = ui.add(egui::TextEdit::singleline(text).password(true).id(key_field_id()));
+            let r = ui.add(egui::TextEdit::singleline(text).password(true).id(id));
             if focus {
                 r.request_focus();
             }
@@ -746,26 +1054,47 @@ mod tests {
 
     #[test]
     fn wiping_the_key_field_removes_its_undo_history() {
-        let ctx = egui::Context::default();
-        let mut text = String::new();
-        key_field_frame(&ctx, &mut text, vec![], true);
-        key_field_frame(&ctx, &mut text, vec![egui::Event::Text("sk-ant-fake-test-value".into())], true);
-        key_field_frame(&ctx, &mut text, vec![], true);
-        assert_eq!(text, "sk-ant-fake-test-value");
-        assert!(
-            egui::TextEdit::load_state(&ctx, key_field_id()).is_some(),
-            "egui should hold widget state (undo history) for the typed text"
-        );
+        for slot in [Slot::ApiKey, Slot::AdminKey] {
+            let id = key_field_id(slot);
+            let ctx = egui::Context::default();
+            let mut text = String::new();
+            key_field_frame(&ctx, id, &mut text, vec![], true);
+            key_field_frame(&ctx, id, &mut text, vec![egui::Event::Text("sk-ant-fake-test-value".into())], true);
+            key_field_frame(&ctx, id, &mut text, vec![], true);
+            assert_eq!(text, "sk-ant-fake-test-value");
+            assert!(
+                egui::TextEdit::load_state(&ctx, id).is_some(),
+                "egui should hold widget state (undo history) for the typed text"
+            );
 
-        wipe_key_field(&ctx, &mut text);
+            wipe_key_field(&ctx, id, &mut text);
 
-        assert!(text.is_empty());
-        assert!(
-            egui::TextEdit::load_state(&ctx, key_field_id()).is_none(),
-            "widget state must be gone so Ctrl+Z cannot restore the key"
-        );
-        // A following frame starts from scratch: still empty.
-        key_field_frame(&ctx, &mut text, vec![], true);
-        assert!(text.is_empty());
+            assert!(text.is_empty());
+            assert!(
+                egui::TextEdit::load_state(&ctx, id).is_none(),
+                "widget state must be gone so Ctrl+Z cannot restore the key"
+            );
+            // A following frame starts from scratch: still empty.
+            key_field_frame(&ctx, id, &mut text, vec![], true);
+            assert!(text.is_empty());
+        }
+    }
+
+    #[test]
+    fn key_fields_have_distinct_ids_and_admin_keys_are_validated_as_admin_keys() {
+        assert_ne!(key_field_id(Slot::ApiKey), key_field_id(Slot::AdminKey));
+        let store = FakeStore(RefCell::new(None));
+        assert!(save_key(&store, Slot::AdminKey, "sk-ant-api03-fake").is_err());
+        assert_eq!(key_stored(&store, Slot::AdminKey), Some(false));
+        save_key(&store, Slot::AdminKey, "sk-ant-admin01-fake-test-value").unwrap();
+        assert_eq!(key_stored(&store, Slot::AdminKey), Some(true));
+    }
+
+    #[test]
+    fn amount_field_text_round_trips_through_the_parser() {
+        assert_eq!(amount_input(None), "");
+        let typed = amount_input(Some(20_500_000_000));
+        assert_eq!(typed, "20.50");
+        assert_eq!(crate::cards::parse_usd_nano(&typed), Ok(20_500_000_000));
     }
 }

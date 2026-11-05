@@ -375,6 +375,9 @@ pub struct ApiStatus {
     pub since_nano: Option<u64>,
     pub updated: DateTime<Local>,
     pub error: Option<ApiError>,
+    /// True once a poll has succeeded. False means the figures are placeholders (0) after a first
+    /// failed poll and must not be shown as costs.
+    pub has_data: bool,
 }
 
 /// Which UTC-day buckets count as "today" and "month", and which UTC range to request.
@@ -528,6 +531,7 @@ impl ApiPoller {
                 since_nano,
                 updated,
                 error: None,
+                has_data: true,
             },
             (Err(e), Some(previous)) => ApiStatus { error: Some(e), ..previous },
             (Err(e), None) => ApiStatus {
@@ -536,6 +540,7 @@ impl ApiPoller {
                 since_nano: None,
                 updated,
                 error: Some(e),
+                has_data: false,
             },
         });
         self.status != before

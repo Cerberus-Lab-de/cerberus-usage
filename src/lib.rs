@@ -12,4 +12,5 @@ pub mod worker;
 pub mod format;
 pub mod single_instance;
 pub mod tray;
+pub mod cards;
 pub mod ui;
