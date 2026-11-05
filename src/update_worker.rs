@@ -8,6 +8,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ const DISABLED_RECHECK: Duration = Duration::from_secs(60 * 60);
 
 /// Shown when the build carries no update key (until the release process sets one).
 pub const NO_KEY_TEXT: &str = "Update-Schlüssel fehlt in dieser Version.";
+pub const LAUNCH_BUSY_TEXT: &str = "Obsidian wird gerade gestartet. Update abgebrochen, bitte später erneut versuchen.";
 const PANIC_TEXT: &str = "Interner Fehler bei der Update-Prüfung.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub enum UpdateCmd {
     CheckNow,
     /// Download, verify and start the installer for the last known release.
     Install,
+    /// The settings file changed (the toggle): look at it again now, so switching on does not wait.
+    SettingsChanged,
 }
 
 type InstallerRunner = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
@@ -64,11 +68,14 @@ pub struct UpdateConfig {
     pub initial_delay: Duration,
     pub interval: Duration,
     pub run_installer: InstallerRunner,
+    /// Set by the UI while Obsidian is being started: the installer is never started then.
+    pub launch_busy: Arc<AtomicBool>,
 }
 
 pub fn spawn_update_checker(
     http: Arc<dyn Http + Send + Sync>,
     settings_path: Option<PathBuf>,
+    launch_busy: Arc<AtomicBool>,
     notify: impl Fn() + Send + 'static,
 ) -> (Sender<UpdateCmd>, Receiver<UpdateState>) {
     spawn_with(
@@ -81,6 +88,7 @@ pub fn spawn_update_checker(
             initial_delay: START_DELAY,
             interval: CHECK_INTERVAL,
             run_installer: Arc::new(|p| run_installer(p)),
+            launch_busy,
         },
         notify,
     )
@@ -139,6 +147,8 @@ struct Core {
     cfg: UpdateConfig,
     /// The newest release found, kept for the install command.
     release: Option<Release>,
+    /// The installer was started: further installs are ignored.
+    installed: bool,
 }
 
 impl Core {
@@ -162,6 +172,9 @@ impl Core {
     }
 
     fn install(&mut self, out: &mut Out<'_>) {
+        if self.installed {
+            return;
+        }
         let Some(release) = self.release.clone() else {
             out.send(UpdateState::Failed("Kein Update bekannt. Bitte zuerst prüfen.".to_string()));
             return;
@@ -183,8 +196,15 @@ impl Core {
             // Hash the file on disk once more, immediately before it is started.
             Ok((path, sha)) => match recheck_installer(&path, &sha) {
                 Err(e) => UpdateState::Failed(failure_text(&e)),
+                // The window may have started Obsidian meanwhile: never update under a running launch.
+                Ok(()) if self.cfg.launch_busy.load(Ordering::SeqCst) => {
+                    UpdateState::Failed(LAUNCH_BUSY_TEXT.to_string())
+                }
                 Ok(()) => match (self.cfg.run_installer)(&path) {
-                    Ok(()) => UpdateState::Installing,
+                    Ok(()) => {
+                        self.installed = true;
+                        UpdateState::Installing
+                    }
                     Err(_) => UpdateState::Failed("Der Installer konnte nicht gestartet werden.".to_string()),
                 },
             },
@@ -196,7 +216,7 @@ impl Core {
 fn run(cfg: UpdateConfig, cmds: Receiver<UpdateCmd>, tx: Sender<UpdateState>, notify: &dyn Fn()) {
     let (initial, interval) = (cfg.initial_delay, cfg.interval);
     let settings_path = cfg.settings_path.clone();
-    let mut core = Core { cfg, release: None };
+    let mut core = Core { cfg, release: None, installed: false };
     let mut out = Out { tx: &tx, notify, last: None, gone: false };
     let mut due = Instant::now() + initial;
     loop {
@@ -207,12 +227,22 @@ fn run(cfg: UpdateConfig, cmds: Receiver<UpdateCmd>, tx: Sender<UpdateState>, no
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        // An explicit action always gets an answer, even one equal to the last (a repeated failure).
+        if matches!(cmd, Some(UpdateCmd::CheckNow | UpdateCmd::Install)) {
+            out.last = None;
+        }
         let step = catch_unwind(AssertUnwindSafe(|| match cmd {
             Some(UpdateCmd::CheckNow) => {
                 core.check(&mut out, true);
                 due = Instant::now() + interval;
             }
             Some(UpdateCmd::Install) => core.install(&mut out),
+            Some(UpdateCmd::SettingsChanged) => {
+                if automatic_checks_enabled(settings_path.as_deref()) {
+                    core.check(&mut out, false);
+                    due = Instant::now() + interval;
+                }
+            }
             None if automatic_checks_enabled(settings_path.as_deref()) => {
                 core.check(&mut out, false);
                 due = Instant::now() + interval;
@@ -308,6 +338,7 @@ mod tests {
         cmd: Sender<UpdateCmd>,
         rx: Receiver<UpdateState>,
         started: Arc<Mutex<Vec<PathBuf>>>,
+        busy: Arc<AtomicBool>,
         dir: tempfile::TempDir,
     }
 
@@ -321,6 +352,7 @@ mod tests {
         http.put(crate::update::LATEST_URL, 404, b"{}");
         let started: Arc<Mutex<Vec<PathBuf>>> = Default::default();
         let log = Arc::clone(&started);
+        let busy = Arc::new(AtomicBool::new(false));
         let cfg = UpdateConfig {
             http: http.clone(),
             settings_path: Some(settings),
@@ -333,9 +365,10 @@ mod tests {
                 log.lock().unwrap().push(p.to_path_buf());
                 Ok(())
             }),
+            launch_busy: Arc::clone(&busy),
         };
         let (cmd, rx) = spawn_with(cfg, || {});
-        Rig { http, cmd, rx, started, dir }
+        Rig { http, cmd, rx, started, busy, dir }
     }
 
     fn next(rx: &Receiver<UpdateState>) -> UpdateState {
@@ -459,6 +492,66 @@ mod tests {
         assert_eq!(r.http.calls(), before);
         assert!(r.started.lock().unwrap().is_empty());
         assert!(!r.dir.path().join("dl").exists());
+    }
+
+    #[test]
+    fn a_repeated_failure_is_reported_again() {
+        let r = available_rig(None, 1);
+        for _ in 0..2 {
+            r.cmd.send(UpdateCmd::Install).unwrap();
+            assert_eq!(next(&r.rx), UpdateState::Failed(NO_KEY_TEXT.to_string()));
+        }
+        // Same for "no release known" and a repeated failed check.
+        let r = rig(Some(r#"{"check_updates": false}"#), 100_000, 100_000, Some(1));
+        for _ in 0..2 {
+            r.cmd.send(UpdateCmd::Install).unwrap();
+            assert!(matches!(next(&r.rx), UpdateState::Failed(_)));
+        }
+        r.http.fail.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            r.cmd.send(UpdateCmd::CheckNow).unwrap();
+            assert_eq!(next(&r.rx), UpdateState::Checking);
+            assert!(matches!(next(&r.rx), UpdateState::Failed(_)));
+        }
+    }
+
+    #[test]
+    fn only_one_install_runs() {
+        let r = available_rig(Some(1), 1);
+        r.cmd.send(UpdateCmd::Install).unwrap();
+        r.cmd.send(UpdateCmd::Install).unwrap();
+        assert_eq!(next(&r.rx), UpdateState::Downloading);
+        assert_eq!(next(&r.rx), UpdateState::Installing);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(drain(&r.rx).is_empty());
+        assert_eq!(r.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_launch_that_started_meanwhile_stops_the_installer() {
+        let r = available_rig(Some(1), 1);
+        r.busy.store(true, Ordering::SeqCst);
+        r.cmd.send(UpdateCmd::Install).unwrap();
+        assert_eq!(next(&r.rx), UpdateState::Downloading);
+        assert_eq!(next(&r.rx), UpdateState::Failed(LAUNCH_BUSY_TEXT.to_string()));
+        assert!(r.started.lock().unwrap().is_empty());
+        // Once the launch is over a retry goes through.
+        r.busy.store(false, Ordering::SeqCst);
+        r.cmd.send(UpdateCmd::Install).unwrap();
+        assert_eq!(next(&r.rx), UpdateState::Downloading);
+        assert_eq!(next(&r.rx), UpdateState::Installing);
+    }
+
+    #[test]
+    fn switching_the_toggle_on_checks_soon_and_off_stays_quiet() {
+        let r = rig(Some(r#"{"check_updates": false}"#), 100_000, 100_000, None);
+        r.cmd.send(UpdateCmd::SettingsChanged).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(r.http.calls(), 0);
+        std::fs::write(r.dir.path().join("settings.json"), r#"{"check_updates": true}"#).unwrap();
+        r.cmd.send(UpdateCmd::SettingsChanged).unwrap();
+        assert!(matches!(next(&r.rx), UpdateState::UpToDate { .. }));
+        assert_eq!(r.http.calls(), 1);
     }
 
     #[test]

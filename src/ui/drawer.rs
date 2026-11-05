@@ -216,6 +216,7 @@ impl CerberusApp {
             Ok(settings) => {
                 self.state.settings = settings;
                 self.notes.remove(&NoteKey::Updates);
+                self.update.settings_changed();
             }
             Err(text) => self.set_note(NoteKey::Updates, NoticeKind::Error, text),
         }
@@ -393,7 +394,7 @@ impl CerberusApp {
         section_title(ui, "Über");
         let launch_running = self.launch_running();
         let check_updates = self.state.settings.check_updates;
-        if let Some(on) = self.update.draw_about(ui, check_updates, can_save, launch_running) {
+        if let Some(on) = self.update.draw_about(ui, check_updates, can_save, !broken, launch_running) {
             self.apply_check_updates(on);
         }
         field_note(ui, self.note(NoteKey::Updates));

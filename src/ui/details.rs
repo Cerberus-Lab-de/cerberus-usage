@@ -426,7 +426,7 @@ mod tests {
                             crate::ui::cockpit::top_bar(ui, &logo, &mut drawer);
                             crate::ui::banners::banner_strip(ui, &[(crate::view::Tone::Amber, "x".into())]);
                             let card = crate::view::mode_card(crate::view::ModeDisplay::Max);
-                            crate::ui::cockpit::mode_card_ui(ui, card, Some((crate::launcher::Mode::Max, false)));
+                            crate::ui::cockpit::mode_card_ui(ui, card, Some((crate::launcher::Mode::Max, false)), None);
                             let figs = crate::ui::cockpit::figures(&report, &balance, true);
                             crate::ui::cockpit::figure_cards(ui, &figs, Some(kind));
                             animated_area(ui, egui::Id::unique("t-area"), openness, |ui| show(ui, kind, &data, &mut view));

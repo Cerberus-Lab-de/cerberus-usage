@@ -217,7 +217,8 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALLER_PREFIX: &str = "CerberusUsage-Setup-";
 
 /// HTTP client for updates: HTTPS only, up to 5 redirects, 60 s overall, bounded bodies.
-/// It never sends credentials: callers pass only the headers they name.
+/// It never sends credentials: `get_bytes` forwards exactly the headers it is given and adds none
+/// itself (no cookies, no auth, no default headers configured on the agent).
 pub struct UpdateHttp {
     agent: ureq::Agent,
 }
@@ -687,11 +688,12 @@ mod tests {
     struct Fake {
         responses: HashMap<String, (u16, Vec<u8>)>,
         calls: std::cell::RefCell<Vec<String>>,
+        headers: std::cell::RefCell<Vec<Vec<(String, String)>>>,
     }
 
     impl Fake {
         fn new() -> Self {
-            Self { responses: HashMap::new(), calls: Default::default() }
+            Self { responses: HashMap::new(), calls: Default::default(), headers: Default::default() }
         }
         fn with(mut self, url: &str, status: u16, body: &[u8]) -> Self {
             self.responses.insert(url.to_string(), (status, body.to_vec()));
@@ -711,6 +713,9 @@ mod tests {
             max: usize,
         ) -> Result<(u16, Vec<u8>), NetError> {
             self.calls.borrow_mut().push(url.to_string());
+            self.headers
+                .borrow_mut()
+                .push(_h.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect());
             match self.responses.get(url) {
                 Some((s, b)) if b.len() <= max => Ok((*s, b.clone())),
                 Some(_) => Err(NetError("Antwort zu groß".into())),
@@ -789,32 +794,20 @@ mod tests {
 
     #[test]
     fn requests_carry_only_user_agent_and_accept() {
-        struct Spy(std::cell::RefCell<Vec<Vec<(String, String)>>>);
-        impl Http for Spy {
-            fn get(&self, _u: &str, _h: &[(&str, &str)]) -> Result<(u16, String), NetError> {
-                unreachable!()
-            }
-            fn get_bytes(&self, _u: &str, h: &[(&str, &str)], _m: usize) -> Result<(u16, Vec<u8>), NetError> {
-                self.0.borrow_mut().push(h.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect());
-                Ok((404, Vec::new()))
-            }
-        }
-        let spy = Spy(Default::default());
-        let _ = latest_release(&spy, &v("1.0.0"));
-        let r = dl("1.0.1", None, INSTALLER).release;
+        // All three requests of an update (release lookup, manifest, installer) with real answers.
+        let d = dl("1.0.1", None, INSTALLER);
+        let latest = release_json("v1.0.1", false, false, &good_assets("1.0.1"));
+        let http = d.http.with(LATEST_URL, 200, &latest);
         let tmp = tempfile::tempdir().unwrap();
-        let _ = download_verified(&spy, &r, &v("1.0.0"), Some(pk(&key(1))), tmp.path());
-        let calls = spy.0.borrow();
-        assert_eq!(calls.len(), 2);
-        let ua = format!("cerberus-usage/{CURRENT_VERSION}");
-        assert_eq!(
-            calls[0],
-            vec![
-                ("User-Agent".to_string(), ua.clone()),
-                ("Accept".to_string(), "application/vnd.github+json".to_string())
-            ]
-        );
-        assert_eq!(calls[1], vec![("User-Agent".to_string(), ua)]);
+        assert!(latest_release(&http, &v("1.0.0")).unwrap().is_some());
+        download_verified(&http, &d.release, &v("1.0.0"), Some(pk(&key(1))), tmp.path()).unwrap();
+        let sent = http.headers.borrow();
+        assert_eq!(sent.len(), 3, "lookup, manifest, installer");
+        let ua = ("User-Agent".to_string(), format!("cerberus-usage/{CURRENT_VERSION}"));
+        let accept = ("Accept".to_string(), "application/vnd.github+json".to_string());
+        assert_eq!(sent[0], vec![ua.clone(), accept]);
+        assert_eq!(sent[1], vec![ua.clone()]);
+        assert_eq!(sent[2], vec![ua]);
     }
 
     #[test]

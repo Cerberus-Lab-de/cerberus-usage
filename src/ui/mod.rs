@@ -464,9 +464,11 @@ impl CerberusApp {
             Box::new(move || notify_ctx.request_repaint()),
         );
         let update_ctx = ctx.clone();
+        let launch_flag = Arc::new(AtomicBool::new(false));
         let (update_tx, update_rx) = spawn_update_checker(
             Arc::new(UpdateHttp::new()),
             crate::settings::default_path().ok(),
+            Arc::clone(&launch_flag),
             move || update_ctx.request_repaint(),
         );
         let obsidian_running = spawn_mode_poller(ctx);
@@ -510,7 +512,7 @@ impl CerberusApp {
             size_before_request: None,
             requested_at: None,
             grow: GrowState::default(),
-            update: updates::UpdateUi::new(update_tx, update_rx),
+            update: updates::UpdateUi::new(update_tx, update_rx, launch_flag),
         }
     }
 
@@ -549,6 +551,7 @@ impl CerberusApp {
             tray.update(tooltip(snapshot, self.state.mode, !self.routing_names.is_empty()), icon_state(&snapshot.alerts));
         }
 
+        self.update.set_launch_running(self.launch_running());
         if let Some(rx) = &self.launch_rx {
             let received = match rx.try_recv() {
                 Ok(msg) => Some(Some(msg)),
@@ -594,6 +597,7 @@ impl CerberusApp {
         self.state.launching = Some((mode, confirmed_close));
         self.control.set_launch_busy(ctx, true);
         self.launch_rx = Some(spawn_launch(mode, confirmed_close, ctx.clone()));
+        self.update.set_launch_running(true);
     }
 
     fn input_mut(&mut self, slot: Slot) -> &mut String {
@@ -804,6 +808,7 @@ impl CerberusApp {
             ui,
             mode_card_with_routing(self.state.mode, !self.routing_names.is_empty()),
             self.state.launching,
+            self.update.start_block_reason(),
         ) {
             self.start_launch(ctx, mode, false);
         }

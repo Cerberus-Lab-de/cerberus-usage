@@ -50,7 +50,13 @@ fn mode_colors(tone: Tone) -> (Color32, Stroke, Color32) {
 
 /// The big mode card with both start buttons. Returns the mode whose button was clicked.
 /// While a launch runs both buttons are off and a spinner shows what happens.
-pub fn mode_card_ui(ui: &mut egui::Ui, card: ModeCard, launching: Option<(Mode, bool)>) -> Option<Mode> {
+/// `blocked`: why neither button may be used now (an update is running).
+pub fn mode_card_ui(
+    ui: &mut egui::Ui,
+    card: ModeCard,
+    launching: Option<(Mode, bool)>,
+    blocked: Option<&str>,
+) -> Option<Mode> {
     let (fill, stroke, title_color) = mode_colors(card.tone);
     let mut start = None;
     egui::Frame::new()
@@ -64,21 +70,31 @@ pub fn mode_card_ui(ui: &mut egui::Ui, card: ModeCard, launching: Option<(Mode, 
             ui.label(big(card.title).color(title_color));
             ui.label(RichText::new(card.hint).color(MUTED));
             ui.add_space(4.0);
-            let idle = launching.is_none();
+            let idle = launching.is_none() && blocked.is_none();
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             ui.horizontal(|ui| {
                 let max = egui::Button::new(RichText::new("Mit Max starten").strong().color(TEXT))
                     .fill(PANEL2)
                     .stroke(Stroke::new(1.0, LINE))
                     .min_size(vec2(width, 36.0));
-                if ui.add_enabled(idle, max).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                let max = ui.add_enabled(idle, max);
+                let max = match blocked {
+                    Some(text) => max.on_disabled_hover_text(text),
+                    None => max,
+                };
+                if max.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     start = Some(Mode::Max);
                 }
                 let api = egui::Button::new(RichText::new("Mit API-Key starten").strong().color(AMBER))
                     .fill(PANEL2)
                     .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.5)))
                     .min_size(vec2(width, 36.0));
-                if ui.add_enabled(idle, api).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                let api = ui.add_enabled(idle, api);
+                let api = match blocked {
+                    Some(text) => api.on_disabled_hover_text(text),
+                    None => api,
+                };
+                if api.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     start = Some(Mode::ApiKey);
                 }
             });

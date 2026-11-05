@@ -2,6 +2,8 @@
 //! drawer and the confirm dialog. The checker thread (`update_worker`) does the work; this only keeps
 //! the last state it sent and draws it. No IO per frame.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use chrono::{DateTime, Local};
@@ -14,7 +16,8 @@ use crate::update_worker::{UpdateCmd, UpdateState};
 /// The repository, as shown and opened from the drawer.
 pub const REPO_URL: &str = "https://github.com/Cerberus-Lab-de/cerberus-usage";
 
-pub const NOT_NOW_TEXT: &str = "Cerberus Usage wird beendet und aktualisiert.";
+pub const CONFIRM_TEXT: &str = "Cerberus Usage wird beendet und aktualisiert.";
+pub const RUNNING_TEXT: &str = "Das Update läuft bereits.";
 pub const BLOCKED_TEXT: &str = "Nicht möglich, solange Obsidian gestartet wird.";
 
 /// Only pages of our own repository are ever opened in the browser.
@@ -63,11 +66,17 @@ pub struct UpdateUi {
     /// The user clicked "Jetzt prüfen" or installed: the next failure is shown in full.
     explicit_pending: bool,
     explicit_error: Option<String>,
+    /// The explicit action was an install (its error is also shown in the cockpit).
+    error_from_install: bool,
+    /// An install was confirmed and is not answered yet: one click cannot queue two.
+    install_pending: bool,
     confirm_open: bool,
+    /// Mirrors "a launch is running" for the checker thread.
+    launch_flag: Arc<AtomicBool>,
 }
 
 impl UpdateUi {
-    pub fn new(tx: Sender<UpdateCmd>, rx: Receiver<UpdateState>) -> Self {
+    pub fn new(tx: Sender<UpdateCmd>, rx: Receiver<UpdateState>, launch_flag: Arc<AtomicBool>) -> Self {
         Self {
             tx,
             rx,
@@ -77,7 +86,10 @@ impl UpdateUi {
             failed: None,
             explicit_pending: false,
             explicit_error: None,
+            error_from_install: false,
+            install_pending: false,
             confirm_open: false,
+            launch_flag,
         }
     }
 
@@ -128,6 +140,7 @@ impl UpdateUi {
     fn settle(&mut self, failed: Option<String>) {
         self.failed = failed;
         self.explicit_pending = false;
+        self.install_pending = false;
         self.explicit_error = None;
     }
 
@@ -143,7 +156,25 @@ impl UpdateUi {
     fn send(&mut self, cmd: UpdateCmd) {
         self.explicit_pending = true;
         self.explicit_error = None;
+        self.error_from_install = cmd == UpdateCmd::Install;
+        self.install_pending = cmd == UpdateCmd::Install;
         let _ = self.tx.send(cmd);
+    }
+
+    /// Tells the checker a launch is (not) running, so it never starts the installer under one.
+    pub fn set_launch_running(&self, running: bool) {
+        self.launch_flag.store(running, Ordering::SeqCst);
+    }
+
+    /// The toggle was saved: the checker looks at the setting now (switching on checks at once).
+    pub fn settings_changed(&self) {
+        let _ = self.tx.send(UpdateCmd::SettingsChanged);
+    }
+
+    /// Why Obsidian cannot be started right now (a download or the installer is running).
+    pub fn start_block_reason(&self) -> Option<&'static str> {
+        (self.downloading() || self.install_pending || self.state == UpdateState::Installing)
+            .then_some("Ein Update wird gerade installiert.")
     }
 
     pub fn check_now(&mut self) {
@@ -175,12 +206,13 @@ impl UpdateUi {
     }
 
     fn install_button(&mut self, ui: &mut egui::Ui, launch_running: bool) {
-        if self.downloading() {
+        if self.downloading() || self.install_pending {
             ui.spinner();
             ui.label(RichText::new("Update wird geladen …").size(13.0).color(MUTED));
             return;
         }
-        let reason = install_block_reason(launch_running);
+        let reason = install_block_reason(launch_running)
+            .or((self.state == UpdateState::Installing).then_some(RUNNING_TEXT));
         let response = ui.add_enabled(
             reason.is_none(),
             egui::Button::new(RichText::new("Jetzt aktualisieren").size(13.0).color(CYAN)).frame(false),
@@ -200,7 +232,8 @@ impl UpdateUi {
             HintLine::None => {}
             HintLine::Available(_) => {
                 self.available_row(ui, launch_running);
-                if let Some(error) = &self.explicit_error {
+                // A failed "Jetzt prüfen" is shown in the drawer only; a failed install here too.
+                if let (Some(error), true) = (&self.explicit_error, self.error_from_install) {
                     ui.add(egui::Label::new(RichText::new(error).size(13.0).color(AMBER)).wrap());
                 }
             }
@@ -213,19 +246,30 @@ impl UpdateUi {
 
     /// The update part of the drawer's "Über" section. Returns the new value of "Nach Updates
     /// suchen" when it was clicked; the caller saves it.
-    pub fn draw_about(&mut self, ui: &mut egui::Ui, check_updates: bool, can_save: bool, launch_running: bool) -> Option<bool> {
+    pub fn draw_about(&mut self, ui: &mut egui::Ui, check_updates: bool, can_save: bool, settings_ok: bool, launch_running: bool) -> Option<bool> {
         ui.label(format!("Cerberus Usage {CURRENT_VERSION}"));
         ui.add(egui::Label::new(RichText::new("Cerberus Usage von Cerberus Lab").size(12.0).color(MUTED)));
         ui.add_space(4.0);
 
         let mut toggled = None;
-        ui.add_enabled_ui(can_save, |ui| {
-            let mut on = check_updates;
-            if ui.checkbox(&mut on, "Nach Updates suchen").changed() {
-                toggled = Some(on);
-            }
-        });
-        if !check_updates {
+        if settings_ok {
+            ui.add_enabled_ui(can_save, |ui| {
+                let mut on = check_updates;
+                if ui.checkbox(&mut on, "Nach Updates suchen").changed() {
+                    toggled = Some(on);
+                }
+            });
+        } else {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Einstellungsdatei nicht lesbar: automatische Prüfung ist aus.")
+                        .size(12.0)
+                        .color(MUTED),
+                )
+                .wrap(),
+            );
+        }
+        if settings_ok && !check_updates {
             ui.add(
                 egui::Label::new(
                     RichText::new(
@@ -261,7 +305,8 @@ impl UpdateUi {
         }
 
         ui.add_space(4.0);
-        if link(ui, REPO_URL).clicked() {
+        // Shown without the scheme so it fits the 360 px drawer; the click opens the full address.
+        if link(ui, REPO_URL.trim_start_matches("https://")).clicked() {
             Self::open(ui.ctx(), REPO_URL);
         }
         ui.add(egui::Label::new(RichText::new("Lizenz: MIT").size(12.0).color(MUTED)));
@@ -277,7 +322,7 @@ impl UpdateUi {
         egui::Modal::new(egui::Id::unique("confirm-update")).show(ctx, |ui| {
             ui.set_width(380.0);
             ui.heading("Jetzt aktualisieren?");
-            ui.label(NOT_NOW_TEXT);
+            ui.label(CONFIRM_TEXT);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let reason = install_block_reason(launch_running);
@@ -329,7 +374,7 @@ mod tests {
     fn ui_with() -> (UpdateUi, Sender<UpdateState>, Receiver<UpdateCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (state_tx, state_rx) = mpsc::channel();
-        (UpdateUi::new(cmd_tx, state_rx), state_tx, cmd_rx)
+        (UpdateUi::new(cmd_tx, state_rx, Default::default()), state_tx, cmd_rx)
     }
 
     #[test]
@@ -339,6 +384,7 @@ mod tests {
         for bad in [
             "http://github.com/Cerberus-Lab-de/cerberus-usage/",
             "https://github.com/Cerberus-Lab-de/cerberus-usage-evil",
+            "https://github.com/Cerberus-Lab-de/cerberus-usage.evil.com/",
             "https://github.com/Cerberus-Lab-de/other/releases",
             "https://evil.example/https://github.com/Cerberus-Lab-de/cerberus-usage/",
             "file:///C:/Windows/System32/calc.exe",
@@ -396,6 +442,44 @@ mod tests {
         assert!(!ui.busy());
         assert!(ui.available.is_some());
         assert_eq!(ui.explicit_error.as_deref(), Some("Update-Schlüssel fehlt in dieser Version."));
+    }
+
+    #[test]
+    fn every_answer_clears_the_pending_flags_and_repeats_are_shown() {
+        let (mut ui, tx, _cmds) = ui_with();
+        for _ in 0..2 {
+            ui.send(UpdateCmd::Install);
+            assert!(ui.explicit_pending && ui.install_pending && ui.start_block_reason().is_some());
+            tx.send(UpdateState::Failed("Update-Schlüssel fehlt in dieser Version.".into())).unwrap();
+            ui.poll();
+            assert!(!ui.explicit_pending && !ui.install_pending && ui.start_block_reason().is_none());
+            assert_eq!(ui.explicit_error.as_deref(), Some("Update-Schlüssel fehlt in dieser Version."));
+        }
+        // A later automatic failure is not shown as an explicit one.
+        tx.send(UpdateState::Failed("offline".into())).unwrap();
+        ui.poll();
+        assert_eq!(ui.explicit_error, None);
+        // Each explicit check answers and clears the flag, whatever the answer is.
+        for answer in [UpdateState::UpToDate { checked: Local::now() }, UpdateState::Available(release("1.0.1"))] {
+            ui.check_now();
+            assert!(ui.explicit_pending);
+            tx.send(UpdateState::Checking).unwrap();
+            tx.send(answer).unwrap();
+            ui.poll();
+            assert!(!ui.explicit_pending);
+        }
+    }
+
+    #[test]
+    fn a_failed_check_with_a_release_available_is_not_repeated_in_the_cockpit() {
+        let (mut ui, tx, _cmds) = ui_with();
+        tx.send(UpdateState::Available(release("1.0.1"))).unwrap();
+        ui.poll();
+        ui.check_now();
+        tx.send(UpdateState::Failed("offline".into())).unwrap();
+        ui.poll();
+        assert_eq!(ui.explicit_error.as_deref(), Some("offline"));
+        assert!(!ui.error_from_install, "the cockpit shows explicit errors of installs only");
     }
 
     #[test]
