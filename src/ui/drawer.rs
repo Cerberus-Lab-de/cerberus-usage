@@ -47,6 +47,7 @@ pub enum NoteKey {
     LowBalance,
     Obsidian,
     Logs,
+    Updates,
 }
 
 pub type Notes = HashMap<NoteKey, Notice>;
@@ -202,6 +203,21 @@ impl CerberusApp {
                 self.set_note(key, NoticeKind::Info, text);
             }
             Err(text) => self.set_note(key, NoticeKind::Error, text),
+        }
+    }
+
+    /// "Nach Updates suchen" applies at once, through the same safe save as every other setting.
+    fn apply_check_updates(&mut self, on: bool) {
+        let Some(path) = self.state.settings_path.clone() else {
+            self.set_note(NoteKey::Updates, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            return;
+        };
+        match update_settings(&path, |s| Ok(crate::settings::Settings { check_updates: on, ..s.clone() })) {
+            Ok(settings) => {
+                self.state.settings = settings;
+                self.notes.remove(&NoteKey::Updates);
+            }
+            Err(text) => self.set_note(NoteKey::Updates, NoticeKind::Error, text),
         }
     }
 
@@ -375,8 +391,12 @@ impl CerberusApp {
 
         // -- Über
         section_title(ui, "Über");
-        ui.label(format!("Cerberus Usage {}", env!("CARGO_PKG_VERSION")));
-        hint(ui, "Cerberus Usage von Cerberus Lab");
+        let launch_running = self.launch_running();
+        let check_updates = self.state.settings.check_updates;
+        if let Some(on) = self.update.draw_about(ui, check_updates, can_save, launch_running) {
+            self.apply_check_updates(on);
+        }
+        field_note(ui, self.note(NoteKey::Updates));
         ui.add_space(8.0);
     }
 

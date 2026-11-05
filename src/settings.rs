@@ -22,7 +22,7 @@ pub struct TopUp {
     pub at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub baseline: Option<Baseline>,
@@ -33,6 +33,28 @@ pub struct Settings {
     pub obsidian_path: Option<PathBuf>,
     /// Claude projects folder; `None` uses `CLAUDE_CONFIG_DIR` or `%USERPROFILE%\.claude\projects`.
     pub logs_root: Option<PathBuf>,
+    /// Look for new releases on GitHub (at start and every 24 h). Off: no request to GitHub unless the
+    /// user clicks "Jetzt prüfen" or installs.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            baseline: None,
+            topups: Vec::new(),
+            monthly_budget_nano: None,
+            low_balance_nano: None,
+            obsidian_path: None,
+            logs_root: None,
+            check_updates: true,
+        }
+    }
 }
 
 /// `%LOCALAPPDATA%\CerberusUsage\settings.json`. Errors when `LOCALAPPDATA` is missing:
@@ -120,12 +142,24 @@ mod tests {
             low_balance_nano: None,
             obsidian_path: None,
             logs_root: None,
+            check_updates: false,
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), (s, None));
         assert!(!dir.path().join("sub").join("settings.json.tmp").exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("2026-11-01T08:30:00Z"), "RFC 3339 expected: {text}");
+    }
+
+    #[test]
+    fn old_settings_file_defaults_to_checking() {
+        // A file written before the setting existed, and an empty object, both mean "check".
+        let old: Settings = serde_json::from_str(r#"{"monthly_budget_nano": 5}"#).unwrap();
+        assert!(old.check_updates);
+        let empty: Settings = serde_json::from_str("{}").unwrap();
+        assert!(empty.check_updates && Settings::default().check_updates);
+        let off: Settings = serde_json::from_str(r#"{"check_updates": false}"#).unwrap();
+        assert!(!off.check_updates);
     }
 
     #[test]

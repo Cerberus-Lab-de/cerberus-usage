@@ -6,6 +6,7 @@ mod cockpit;
 mod details;
 mod drawer;
 pub mod theme;
+mod updates;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,8 @@ use chrono::{DateTime, Local};
 use eframe::egui::{self, RichText};
 
 use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
+use crate::update::UpdateHttp;
+use crate::update_worker::spawn_update_checker;
 use crate::cards::{BalanceCard, api_card, balance_card};
 use crate::format::{COST_NOTE, outcome_message, pause_text, unpriced_text};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
@@ -420,6 +423,8 @@ pub struct CerberusApp {
     requested_at: Option<Instant>,
     /// When to grow or give back height.
     grow: GrowState,
+    /// Last state of the update checker and its dialogs.
+    update: updates::UpdateUi,
 }
 
 /// A request younger than this may not have reached the window yet.
@@ -457,6 +462,12 @@ impl CerberusApp {
                 settings_path: crate::settings::default_path().ok(),
             },
             Box::new(move || notify_ctx.request_repaint()),
+        );
+        let update_ctx = ctx.clone();
+        let (update_tx, update_rx) = spawn_update_checker(
+            Arc::new(UpdateHttp::new()),
+            crate::settings::default_path().ok(),
+            move || update_ctx.request_repaint(),
         );
         let obsidian_running = spawn_mode_poller(ctx);
 
@@ -499,6 +510,7 @@ impl CerberusApp {
             size_before_request: None,
             requested_at: None,
             grow: GrowState::default(),
+            update: updates::UpdateUi::new(update_tx, update_rx),
         }
     }
 
@@ -527,6 +539,10 @@ impl CerberusApp {
             self.paths.refresh(&self.state.settings);
         }
         self.paths.poll_dialog();
+        if self.update.poll() {
+            // The installer is running: leave through the normal quit path.
+            self.control.quit(ctx);
+        }
         let now = Instant::now();
         self.state.apply_running(self.obsidian_running.load(Ordering::Relaxed), now);
         if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
@@ -563,6 +579,11 @@ impl CerberusApp {
                 }
             }
         }
+    }
+
+    /// Obsidian is being started: updating is refused until that is done.
+    fn launch_running(&self) -> bool {
+        self.launch_rx.is_some() || self.state.launching.is_some()
     }
 
     fn start_launch(&mut self, ctx: &egui::Context, mode: Mode, confirmed_close: bool) {
@@ -640,6 +661,8 @@ impl eframe::App for CerberusApp {
         );
         self.draw_drawer(&ctx, body);
         self.draw_confirm(&ctx);
+        let launch_running = self.launch_running();
+        self.update.draw_confirm(&ctx, launch_running);
         self.text_focused_last_frame = ctx.egui_wants_keyboard_input();
     }
 }
@@ -848,7 +871,8 @@ impl CerberusApp {
                 .wrap(),
             );
         }
-        // The update hint (task 8) goes here.
+        let launch_running = self.launch_running();
+        self.update.draw_hint(ui, launch_running);
     }
 
     fn draw_confirm(&mut self, ctx: &egui::Context) {

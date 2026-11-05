@@ -203,9 +203,9 @@ fn nibble(c: u8) -> Option<u8> {
 // Network: release lookup, verified download, installer start
 // ---------------------------------------------------------------------------------------------
 
-const LATEST_URL: &str =
+pub(crate) const LATEST_URL: &str =
     "https://api.github.com/repos/Cerberus-Lab-de/cerberus-usage/releases/latest";
-const DOWNLOAD_PREFIX: &str =
+pub(crate) const DOWNLOAD_PREFIX: &str =
     "https://github.com/Cerberus-Lab-de/cerberus-usage/releases/download/";
 const NOTES_PREFIX: &str = "https://github.com/Cerberus-Lab-de/cerberus-usage/";
 const USER_AGENT: &str = concat!("cerberus-usage/", env!("CARGO_PKG_VERSION"));
@@ -342,7 +342,8 @@ pub fn latest_release(http: &dyn Http, current: &Version) -> Result<Option<Relea
     }
     let tag = dto.tag_name.strip_prefix('v').unwrap_or(&dto.tag_name);
     let version = Version::parse(tag).map_err(|_| bad_release())?;
-    if !version.pre.is_empty() || !is_newer(&version, current) {
+    // Build metadata is never part of a published tag; ignore such a release instead of trusting it.
+    if !version.pre.is_empty() || !version.build.is_empty() || !is_newer(&version, current) {
         return Ok(None);
     }
     if !dto.html_url.starts_with(NOTES_PREFIX) {
@@ -399,6 +400,18 @@ pub fn download_verified(
     key: Option<[u8; 32]>,
     dir: &Path,
 ) -> Result<PathBuf, UpdateError> {
+    download_verified_with_hash(http, r, current, key, dir).map(|(path, _)| path)
+}
+
+/// [`download_verified`] that also returns the manifest's SHA-256, so the caller can re-hash the
+/// written file right before starting it (see [`recheck_installer`]).
+pub fn download_verified_with_hash(
+    http: &dyn Http,
+    r: &Release,
+    current: &Version,
+    key: Option<[u8; 32]>,
+    dir: &Path,
+) -> Result<(PathBuf, String), UpdateError> {
     let key = key.ok_or(UpdateError::NoKey)?;
     if !dir.is_absolute() {
         return Err(UpdateError::Malformed("Download-Ordner ungültig".to_string()));
@@ -438,7 +451,20 @@ pub fn download_verified(
         let _ = std::fs::remove_file(&tmp);
         return Err(io_err(e));
     }
-    Ok(target)
+    Ok((target, manifest.sha256))
+}
+
+/// Hashes the file on disk against the manifest's SHA-256, closing the gap between "verified in
+/// memory" and "started from disk". A mismatch (or an unreadable file) deletes the file.
+pub fn recheck_installer(path: &Path, sha256: &str) -> Result<(), UpdateError> {
+    let ok = std::fs::read(path)
+        .map(|bytes| hex_encode(Sha256::digest(&bytes).as_slice()) == sha256)
+        .unwrap_or(false);
+    if ok {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    Err(UpdateError::ChecksumMismatch)
 }
 
 /// Silent installer switches; `/UPDATE=1` tells the setup that this is an update.
@@ -753,6 +779,56 @@ mod tests {
         assert!(matches!(lookup(b"nope".to_vec(), 200, "1.0.0"), Err(UpdateError::Malformed(_))));
         let bad_tag = release_json("latest", false, false, &[]);
         assert!(matches!(lookup(bad_tag, 200, "1.0.0"), Err(UpdateError::Malformed(_))));
+    }
+
+    #[test]
+    fn latest_release_ignores_tags_with_build_metadata() {
+        let tagged = release_json("v1.0.1+evil", false, false, &good_assets("1.0.1+evil"));
+        assert_eq!(lookup(tagged, 200, "1.0.0"), Ok(None));
+    }
+
+    #[test]
+    fn requests_carry_only_user_agent_and_accept() {
+        struct Spy(std::cell::RefCell<Vec<Vec<(String, String)>>>);
+        impl Http for Spy {
+            fn get(&self, _u: &str, _h: &[(&str, &str)]) -> Result<(u16, String), NetError> {
+                unreachable!()
+            }
+            fn get_bytes(&self, _u: &str, h: &[(&str, &str)], _m: usize) -> Result<(u16, Vec<u8>), NetError> {
+                self.0.borrow_mut().push(h.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect());
+                Ok((404, Vec::new()))
+            }
+        }
+        let spy = Spy(Default::default());
+        let _ = latest_release(&spy, &v("1.0.0"));
+        let r = dl("1.0.1", None, INSTALLER).release;
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = download_verified(&spy, &r, &v("1.0.0"), Some(pk(&key(1))), tmp.path());
+        let calls = spy.0.borrow();
+        assert_eq!(calls.len(), 2);
+        let ua = format!("cerberus-usage/{CURRENT_VERSION}");
+        assert_eq!(
+            calls[0],
+            vec![
+                ("User-Agent".to_string(), ua.clone()),
+                ("Accept".to_string(), "application/vnd.github+json".to_string())
+            ]
+        );
+        assert_eq!(calls[1], vec![("User-Agent".to_string(), ua)]);
+    }
+
+    #[test]
+    fn recheck_installer_deletes_a_tampered_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dl("1.0.1", None, INSTALLER);
+        let dir = update_dir_in(tmp.path());
+        let (path, sha) =
+            download_verified_with_hash(&d.http, &d.release, &v("1.0.0"), Some(pk(&key(1))), &dir).unwrap();
+        assert_eq!(recheck_installer(&path, &sha), Ok(()));
+        std::fs::write(&path, b"swapped after verification").unwrap();
+        assert_eq!(recheck_installer(&path, &sha), Err(UpdateError::ChecksumMismatch));
+        assert!(!path.exists());
+        assert_eq!(recheck_installer(&path, &sha), Err(UpdateError::ChecksumMismatch));
     }
 
     #[test]
