@@ -54,6 +54,10 @@ pub fn parse_usd_nano(input: &str) -> Result<u64, String> {
     if (whole.is_empty() && frac.is_empty()) || !digits(whole) || !digits(frac) {
         return Err(INVALID.to_string());
     }
+    // "1.000" could be one thousand (German) or exactly one (English): never guess with money.
+    if frac.len() == 3 {
+        return Err("Mehrdeutiger Betrag. Bitte mit zwei Nachkommastellen eingeben, z. B. 65,03.".to_string());
+    }
     if frac.len() > MAX_DECIMALS {
         return Err("Zu viele Nachkommastellen (höchstens 9).".to_string());
     }
@@ -173,21 +177,25 @@ pub fn with_topup(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Setti
     Ok(out)
 }
 
-pub fn without_topup(s: &Settings, index: usize) -> Settings {
+/// Removes the first top-up equal to `entry`. `None` when the file no longer has it (changed meanwhile).
+pub fn without_topup(s: &Settings, entry: &TopUp) -> Option<Settings> {
+    let index = s.topups.iter().position(|t| t == entry)?;
     let mut out = s.clone();
-    if index < out.topups.len() {
-        out.topups.remove(index);
-    }
-    out
+    out.topups.remove(index);
+    Some(out)
 }
 
-/// Both limits are optional; empty input clears one.
-pub fn with_limits(s: &Settings, budget: &str, low_balance: &str) -> Result<Settings, String> {
-    Ok(Settings {
-        monthly_budget_nano: parse_optional_usd_nano(budget).map_err(|e| format!("Monatsbudget: {e}"))?,
-        low_balance_nano: parse_optional_usd_nano(low_balance).map_err(|e| format!("Guthaben-Grenze: {e}"))?,
-        ..s.clone()
-    })
+/// Both limits are optional; empty input clears one. `None` leaves that limit as it is in `s`
+/// (the field was not edited), so a stale field can never overwrite the file.
+pub fn with_limits(s: &Settings, budget: Option<&str>, low_balance: Option<&str>) -> Result<Settings, String> {
+    let mut out = s.clone();
+    if let Some(text) = budget {
+        out.monthly_budget_nano = parse_optional_usd_nano(text).map_err(|e| format!("Monatsbudget: {e}"))?;
+    }
+    if let Some(text) = low_balance {
+        out.low_balance_nano = parse_optional_usd_nano(text).map_err(|e| format!("Guthaben-Grenze: {e}"))?;
+    }
+    Ok(out)
 }
 
 /// Re-reads the file, applies `edit` and saves. A broken file is never overwritten; the error names the file.
@@ -253,12 +261,18 @@ mod tests {
             "18446744073,709551616", // one nano over u64
             "99999999999999999999",  // overflow
             "65,0x",
+            "1.000",
+            "1,000",
+            "65,123", // three decimals: ambiguous with a thousands separator
         ];
         for input in bad {
             let err = parse_usd_nano(input).expect_err(input);
             assert!(!err.is_empty(), "German message expected for {input:?}");
         }
         assert!(parse_usd_nano("-5").unwrap_err().contains("negativ"));
+        assert!(parse_usd_nano("1.000").unwrap_err().contains("65,03"));
+        assert_eq!(parse_usd_nano("1.00"), Ok(1_000_000_000));
+        assert_eq!(parse_usd_nano("1,0000"), Ok(1_000_000_000));
     }
 
     #[test]
@@ -380,13 +394,34 @@ mod tests {
         assert_eq!(s.topups, vec![TopUp { amount_nano: 10_000_000_000, at: now }]);
         assert!(with_topup(&s, "0", now).is_err());
         assert!(with_topup(&s, "", now).is_err());
-        let s = without_topup(&s, 0);
+        let entry = s.topups[0].clone();
+        let s = without_topup(&s, &entry).unwrap();
         assert!(s.topups.is_empty());
-        assert_eq!(without_topup(&s, 7), s);
+        assert_eq!(without_topup(&s, &entry), None);
 
-        let s = with_limits(&s, "20", "").unwrap();
+        let s = with_limits(&s, Some("20"), Some("")).unwrap();
         assert_eq!((s.monthly_budget_nano, s.low_balance_nano), (Some(20_000_000_000), None));
-        assert!(with_limits(&s, "20", "x").is_err());
+        assert!(with_limits(&s, Some("20"), Some("x")).is_err());
+    }
+
+    #[test]
+    fn untouched_limit_fields_keep_the_value_from_the_file() {
+        let s = Settings { monthly_budget_nano: Some(5), low_balance_nano: Some(7), ..Settings::default() };
+        let same = with_limits(&s, None, None).unwrap();
+        assert_eq!(same, s);
+        let only_budget = with_limits(&s, Some("1"), None).unwrap();
+        assert_eq!((only_budget.monthly_budget_nano, only_budget.low_balance_nano), (Some(1_000_000_000), Some(7)));
+    }
+
+    #[test]
+    fn removing_a_topup_targets_the_entry_not_the_position() {
+        let a = TopUp { amount_nano: 1_000_000_000, at: utc("2026-11-02T10:00:00Z") };
+        let b = TopUp { amount_nano: 2_000_000_000, at: utc("2026-11-03T10:00:00Z") };
+        let inserted = TopUp { amount_nano: 9_000_000_000, at: utc("2026-11-01T10:00:00Z") };
+        // The UI showed [a, b] and wants to remove b (index 1); the file changed to [inserted, a, b].
+        let file = Settings { topups: vec![inserted.clone(), a.clone(), b.clone()], ..Settings::default() };
+        let after = without_topup(&file, &b).unwrap();
+        assert_eq!(after.topups, vec![inserted, a]);
     }
 
     #[test]

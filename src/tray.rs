@@ -184,10 +184,14 @@ impl Tray {
         if self.shown.as_ref().is_some_and(|(t, s)| *t == tooltip && *s == state) {
             return;
         }
-        let _ = self.icon.set_tooltip(Some(tooltip.as_str()));
+        // `shown` is only set after both calls worked, so a failed update is retried at the next poll.
+        let tip_ok = self.icon.set_tooltip(Some(tooltip.as_str())).is_ok();
         let rgba = icon_with_badge(&self.base_rgba, self.size.0, self.size.1, state);
-        if let Ok(icon) = Icon::from_rgba(rgba, self.size.0, self.size.1) {
-            let _ = self.icon.set_icon(Some(icon));
+        let icon_ok = Icon::from_rgba(rgba, self.size.0, self.size.1)
+            .ok()
+            .is_some_and(|icon| self.icon.set_icon(Some(icon)).is_ok());
+        if !(tip_ok && icon_ok) {
+            return;
         }
         self.shown = Some((tooltip, state));
     }

@@ -337,6 +337,19 @@ mod tests {
         }
     }
 
+    /// Receives until a snapshot carries an API status (or the deadline passes). Snapshots may arrive in
+    /// between, e.g. from a scan tick; the test must not depend on their exact order.
+    fn next_with_api(rx: &Receiver<Snapshot>) -> Snapshot {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let snap = rx.recv_timeout(left).expect("no API snapshot in time");
+            if snap.api.is_some() {
+                return snap;
+            }
+        }
+    }
+
     #[test]
     fn sends_progress_then_report() {
         let dir = tempfile::tempdir().unwrap();
@@ -473,7 +486,7 @@ mod tests {
         // The report is not held back by the API call: first full snapshot has no status yet.
         let (_, first) = until_report(&rx);
         assert!(first.api.is_none());
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         let api = second.api.expect("api status missing");
         assert_eq!((api.today_nano, api.month_nano, api.error), (0, 0, None));
         assert!(second.report.is_some());
@@ -488,7 +501,7 @@ mod tests {
         let (cfg, _http) = config_with_api(dir.path(), Some(key), vec![Ok((401, "{}".to_string()))]);
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         assert_eq!(second.api.as_ref().and_then(|a| a.error.clone()), Some(crate::analytics::ApiError::Unauthorized));
         for snap in [&first, &second] {
             let shown = format!("{snap:?}");
@@ -503,7 +516,7 @@ mod tests {
         let (cfg, http) = config_with_api(dir.path(), Some("sk-ant-admin01-NICHTECHT-1234"), vec![ok(body)]);
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         assert!(first.balance.is_none() && second.balance.is_none());
         assert!(second.alerts.is_empty() && second.settings_error.is_none());
         assert_eq!(http.request_count(), 1);
@@ -536,7 +549,7 @@ mod tests {
         write_settings(&cfg, BASELINE_JSON);
         let rx = spawn_worker(cfg, noop());
         let (_, _first) = until_report(&rx);
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         let api = second.api.as_ref().expect("api status missing");
         assert!(!api.has_data && api.error.is_some());
         assert!(!second.alerts.contains(&Alert::BudgetExceeded), "alerts: {:?}", second.alerts);
@@ -552,7 +565,7 @@ mod tests {
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
         assert!(!first.balance.unwrap().cost_deducted);
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         // 20000 cents = 200 USD.
         let balance = second.balance.expect("balance missing");
         assert_eq!(balance.cost_since_nano, Some(200_000_000_000));
@@ -613,7 +626,7 @@ mod tests {
         write_settings(&cfg, BASELINE_JSON);
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
-        let second = rx.recv_timeout(WAIT).expect("no API snapshot in time");
+        let second = next_with_api(&rx);
         assert!(second.balance.is_some());
         for snap in [&first, &second] {
             let shown = format!("{snap:?}");

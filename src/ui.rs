@@ -20,7 +20,7 @@ use crate::format::{
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch};
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
-use crate::settings::Settings;
+use crate::settings::{Settings, TopUp};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{Tray, WindowControl, icon_state, tooltip};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
@@ -91,6 +91,10 @@ pub struct AppState {
     pub topup_input: String,
     pub budget_input: String,
     pub low_balance_input: String,
+    /// The user typed in the limit field since it was last filled from the file. Only edited fields are
+    /// saved, so a stale field can never overwrite the limit in the file.
+    pub budget_edited: bool,
+    pub low_balance_edited: bool,
 }
 
 impl AppState {
@@ -114,6 +118,8 @@ impl AppState {
             topup_input: String::new(),
             budget_input: String::new(),
             low_balance_input: String::new(),
+            budget_edited: false,
+            low_balance_edited: false,
         }
     }
 
@@ -124,6 +130,13 @@ impl AppState {
             let (settings, error) = crate::settings::load(path);
             if error.is_none() {
                 self.settings = settings;
+                // Fields the user has not touched follow the file (broken at start, edited externally).
+                if !self.budget_edited {
+                    self.budget_input = amount_input(self.settings.monthly_budget_nano);
+                }
+                if !self.low_balance_edited {
+                    self.low_balance_input = amount_input(self.settings.low_balance_nano);
+                }
             }
         }
     }
@@ -226,7 +239,7 @@ fn amount_input(nano: Option<u64>) -> String {
 enum SettingsAction {
     Baseline,
     TopUp,
-    Remove(usize),
+    Remove(TopUp),
     Limits,
 }
 
@@ -323,8 +336,6 @@ impl CerberusApp {
         state.admin_key_stored = key_stored(&store, Slot::AdminKey);
         state.settings_path = crate::settings::default_path().ok();
         state.reload_settings();
-        state.budget_input = amount_input(state.settings.monthly_budget_nano);
-        state.low_balance_input = amount_input(state.settings.low_balance_nano);
 
         Self {
             state,
@@ -400,7 +411,8 @@ impl CerberusApp {
     }
 
     fn save_key(&mut self, ctx: &egui::Context, slot: Slot) {
-        let input = self.input_mut(slot).clone();
+        // Take the text out of the field while saving; on failure it goes back so the user can fix it.
+        let input = std::mem::take(self.input_mut(slot));
         match save_key(&self.store, slot, &input) {
             Ok(()) => {
                 wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
@@ -409,6 +421,7 @@ impl CerberusApp {
                     Some(Notice { kind: NoticeKind::Info, text: format!("{} gespeichert.", key_label(slot)) });
             }
             Err(msg) => {
+                *self.input_mut(slot) = input;
                 self.state.notice = Some(Notice { kind: NoticeKind::Error, text: msg });
             }
         }
@@ -436,11 +449,21 @@ impl CerberusApp {
         };
         let now = Utc::now();
         let st = &self.state;
+        if matches!(action, SettingsAction::Limits) && !st.budget_edited && !st.low_balance_edited {
+            self.state.notice = Some(Notice { kind: NoticeKind::Info, text: "Keine Änderung an den Grenzen.".into() });
+            return;
+        }
         let result = update_settings(&path, |s| match &action {
             SettingsAction::Baseline => with_baseline(s, &st.baseline_input, now),
             SettingsAction::TopUp => with_topup(s, &st.topup_input, now),
-            SettingsAction::Remove(i) => Ok(without_topup(s, *i)),
-            SettingsAction::Limits => with_limits(s, &st.budget_input, &st.low_balance_input),
+            SettingsAction::Remove(entry) => without_topup(s, entry).ok_or_else(|| {
+                "Diese Aufladung steht nicht mehr in der Einstellungsdatei. Es wurde nichts geändert.".to_string()
+            }),
+            SettingsAction::Limits => with_limits(
+                s,
+                st.budget_edited.then_some(st.budget_input.as_str()),
+                st.low_balance_edited.then_some(st.low_balance_input.as_str()),
+            ),
         });
         self.state.notice = Some(match result {
             Ok(settings) => {
@@ -448,7 +471,11 @@ impl CerberusApp {
                 match action {
                     SettingsAction::Baseline => self.state.baseline_input.clear(),
                     SettingsAction::TopUp => self.state.topup_input.clear(),
-                    _ => {}
+                    SettingsAction::Limits => {
+                        self.state.budget_edited = false;
+                        self.state.low_balance_edited = false;
+                    }
+                    SettingsAction::Remove(_) => {}
                 }
                 Notice {
                     kind: NoticeKind::Info,
@@ -543,8 +570,8 @@ impl CerberusApp {
             ui.add_space(8.0);
         }
         if let Some(err) = self.state.snapshot.as_ref().and_then(|s| s.settings_error.as_ref()) {
-            let place = self.state.settings_path.as_ref().map(|p| format!(" Datei: {}", p.display())).unwrap_or_default();
-            banner(ui, Color32::from_rgb(170, 60, 50), &format!("{err}.{place}"));
+            let place = self.state.settings_path.as_ref().map(|p| format!(". Datei: {}", p.display())).unwrap_or_default();
+            banner(ui, Color32::from_rgb(170, 60, 50), &format!("{}{place}", err.trim_end_matches('.')));
             ui.add_space(8.0);
         }
         for alert in self.state.snapshot.iter().flat_map(|s| s.alerts.iter()) {
@@ -737,11 +764,14 @@ impl CerberusApp {
         let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
         let can_save = !broken && self.state.settings_path.is_some();
         if !can_save {
-            let place = self.state.settings_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-            ui.colored_label(
-                Color32::from_rgb(230, 150, 30),
-                format!("Speichern ist gesperrt, solange die Einstellungsdatei nicht lesbar ist. Bitte die Datei prüfen oder löschen: {place}"),
-            );
+            let text = match &self.state.settings_path {
+                Some(p) => format!(
+                    "Speichern ist gesperrt, solange die Einstellungsdatei nicht lesbar ist. Bitte die Datei prüfen oder löschen: {}",
+                    p.display()
+                ),
+                None => "Speichern nicht möglich: Die Umgebungsvariable LOCALAPPDATA ist nicht gesetzt, es gibt keinen Ort für die Einstellungen.".to_string(),
+            };
+            ui.colored_label(Color32::from_rgb(230, 150, 30), text);
         }
         let mut action: Option<SettingsAction> = None;
         ui.add_enabled_ui(can_save, |ui| {
@@ -760,7 +790,7 @@ impl CerberusApp {
                     action = Some(SettingsAction::TopUp);
                 }
             });
-            for (i, topup) in self.state.settings.topups.iter().enumerate() {
+            for topup in &self.state.settings.topups {
                 ui.horizontal(|ui| {
                     ui.label(format!(
                         "{} · {}",
@@ -768,15 +798,17 @@ impl CerberusApp {
                         format_usd(topup.amount_nano)
                     ));
                     if ui.small_button("Entfernen").clicked() {
-                        action = Some(SettingsAction::Remove(i));
+                        action = Some(SettingsAction::Remove(topup.clone()));
                     }
                 });
             }
             ui.horizontal(|ui| {
                 ui.label("Monatsbudget (USD, optional):");
-                ui.add(egui::TextEdit::singleline(&mut self.state.budget_input).hint_text("20").desired_width(90.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.state.budget_input).hint_text("20").desired_width(90.0));
+                self.state.budget_edited |= r.changed();
                 ui.label("Warngrenze Guthaben (USD, optional):");
-                ui.add(egui::TextEdit::singleline(&mut self.state.low_balance_input).hint_text("10").desired_width(90.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.state.low_balance_input).hint_text("10").desired_width(90.0));
+                self.state.low_balance_edited |= r.changed();
                 if ui.button("Grenzen speichern").clicked() {
                     action = Some(SettingsAction::Limits);
                 }
@@ -1088,6 +1120,37 @@ mod tests {
         assert_eq!(key_stored(&store, Slot::AdminKey), Some(false));
         save_key(&store, Slot::AdminKey, "sk-ant-admin01-fake-test-value").unwrap();
         assert_eq!(key_stored(&store, Slot::AdminKey), Some(true));
+    }
+
+    #[test]
+    fn limits_from_a_fixed_file_survive_a_save_that_did_not_touch_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ broken").unwrap();
+        let mut st = AppState::new();
+        st.settings_path = Some(path.clone());
+        st.reload_settings();
+        assert!(st.budget_input.is_empty() && !st.budget_edited);
+
+        // The file gets repaired outside; untouched fields follow it.
+        std::fs::write(&path, r#"{"monthly_budget_nano": 20000000000, "low_balance_nano": 5000000000}"#).unwrap();
+        st.reload_settings();
+        assert_eq!((st.budget_input.as_str(), st.low_balance_input.as_str()), ("20.00", "5.00"));
+
+        // Saving only the budget field leaves the other limit as in the file.
+        st.budget_input = "30".into();
+        st.budget_edited = true;
+        let saved = update_settings(&path, |s| {
+            with_limits(s, st.budget_edited.then_some(st.budget_input.as_str()), st.low_balance_edited.then_some(st.low_balance_input.as_str()))
+        })
+        .unwrap();
+        assert_eq!((saved.monthly_budget_nano, saved.low_balance_nano), (Some(30_000_000_000), Some(5_000_000_000)));
+
+        // An edited field keeps the user text over a reload.
+        std::fs::write(&path, r#"{"monthly_budget_nano": 1000000000}"#).unwrap();
+        st.reload_settings();
+        assert_eq!(st.budget_input, "30");
+        assert_eq!(st.low_balance_input, "");
     }
 
     #[test]
