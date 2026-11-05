@@ -175,16 +175,36 @@ pub fn alert_banner_text(alert: &Alert) -> Option<&'static str> {
     }
 }
 
+/// Whether a text field commits now: only a user-edited, changed value, and only on Enter or blur.
+/// Half-typed input never reaches the file because nothing commits while the field has focus.
+pub fn should_commit(edited: bool, lost_focus: bool, enter: bool, input: &str, current: &str) -> bool {
+    edited && input != current && (lost_focus || enter)
+}
+
+/// Amount for a *commit* (baseline, top-up, limits). Stricter than [`parse_usd_nano`]: a dangling
+/// decimal separator ("12,") looks half-typed, so it is refused instead of saved as 12.
+fn parse_committed_nano(input: &str) -> Result<u64, String> {
+    let text = input.trim().trim_end_matches('$').trim_end();
+    if text.ends_with([',', '.']) {
+        return Err("Unvollständiger Betrag. Bitte die Nachkommastellen ergänzen, z. B. 12,00.".to_string());
+    }
+    parse_usd_nano(input)
+}
+
+fn parse_committed_optional(input: &str) -> Result<Option<u64>, String> {
+    if input.trim().is_empty() { Ok(None) } else { parse_committed_nano(input).map(Some) }
+}
+
 // ---- settings edits ------------------------------------------------------------------------------
 
 /// New starting balance, dated `now`. Existing top-ups stay (those before `now` are ignored by the estimate).
 pub fn with_baseline(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Settings, String> {
-    let amount_nano = parse_usd_nano(input)?;
+    let amount_nano = parse_committed_nano(input)?;
     Ok(Settings { baseline: Some(Baseline { amount_nano, at: now }), ..s.clone() })
 }
 
 pub fn with_topup(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Settings, String> {
-    let amount_nano = parse_usd_nano(input)?;
+    let amount_nano = parse_committed_nano(input)?;
     if amount_nano == 0 {
         return Err("Eine Aufladung muss größer als 0 sein.".to_string());
     }
@@ -206,10 +226,10 @@ pub fn without_topup(s: &Settings, entry: &TopUp) -> Option<Settings> {
 pub fn with_limits(s: &Settings, budget: Option<&str>, low_balance: Option<&str>) -> Result<Settings, String> {
     let mut out = s.clone();
     if let Some(text) = budget {
-        out.monthly_budget_nano = parse_optional_usd_nano(text).map_err(|e| format!("Monatsbudget: {e}"))?;
+        out.monthly_budget_nano = parse_committed_optional(text).map_err(|e| format!("Monatsbudget: {e}"))?;
     }
     if let Some(text) = low_balance {
-        out.low_balance_nano = parse_optional_usd_nano(text).map_err(|e| format!("Guthaben-Grenze: {e}"))?;
+        out.low_balance_nano = parse_committed_optional(text).map_err(|e| format!("Guthaben-Grenze: {e}"))?;
     }
     Ok(out)
 }
@@ -486,5 +506,51 @@ mod tests {
         let err = update_settings(&path, |s| with_baseline(s, "1", now)).unwrap_err();
         assert!(err.contains("settings.json"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+    }
+
+    #[test]
+    fn commit_only_on_enter_or_blur_with_change() {
+        // Unchanged text that loses focus: nothing to save.
+        assert!(!should_commit(true, true, false, "65.03", "65.03"));
+        // Changed but still typing: no commit.
+        assert!(!should_commit(true, false, false, "65.0", "65.03"));
+        // Changed and Enter / blur: commit.
+        assert!(should_commit(true, false, true, "70", "65.03"));
+        assert!(should_commit(true, true, false, "70", "65.03"));
+        // Never edited by the user (a reload filled it): never commit.
+        assert!(!should_commit(false, true, true, "70", "65.03"));
+    }
+
+    #[test]
+    fn half_typed_amount_keeps_old_value_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        update_settings(&path, |s| with_limits(s, Some("20"), Some("5"))).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for typed in ["12,", "12.", "1.000", "1,000", "", "abc"] {
+            let budget = update_settings(&path, |s| with_limits(s, Some(typed), None));
+            // An empty optional limit is a valid "clear"; everything else here must be refused.
+            if typed.is_empty() {
+                assert!(budget.is_ok());
+                std::fs::write(&path, &before).unwrap();
+                continue;
+            }
+            assert!(budget.is_err(), "{typed:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "file changed for {typed:?}");
+            assert!(update_settings(&path, |s| with_limits(s, None, Some(typed))).is_err(), "{typed:?}");
+            assert!(update_settings(&path, |s| with_baseline(s, typed, Utc::now())).is_err(), "{typed:?}");
+            assert!(update_settings(&path, |s| with_topup(s, typed, Utc::now())).is_err(), "{typed:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "file changed for {typed:?}");
+        }
+        assert!(with_limits(&Settings::default(), Some("12,"), None).unwrap_err().contains("Unvollständig"));
+    }
+
+    #[test]
+    fn empty_optional_limit_clears_only_that_limit() {
+        let s = Settings { monthly_budget_nano: Some(5), low_balance_nano: Some(7), ..Settings::default() };
+        let no_budget = with_limits(&s, Some(" "), None).unwrap();
+        assert_eq!((no_budget.monthly_budget_nano, no_budget.low_balance_nano), (None, Some(7)));
+        let no_low = with_limits(&s, None, Some("")).unwrap();
+        assert_eq!((no_low.monthly_budget_nano, no_low.low_balance_nano), (Some(5), None));
     }
 }

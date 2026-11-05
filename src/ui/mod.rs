@@ -4,6 +4,7 @@ mod banners;
 mod chart;
 mod cockpit;
 mod details;
+mod drawer;
 pub mod theme;
 
 use std::path::{Path, PathBuf};
@@ -12,21 +13,18 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local};
 use eframe::egui::{self, RichText};
 
 use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
-use crate::cards::{
-    BalanceCard, api_card, balance_card, inert_limits_hint, update_settings, with_baseline, with_limits,
-    with_topup, without_topup,
-};
+use crate::cards::{BalanceCard, api_card, balance_card};
 use crate::format::{COST_NOTE, outcome_message, pause_text, unpriced_text};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
 use crate::paths::{Env, real_env, resolve_logs_root};
-use crate::paths_ui::{PathsAction, PathsPanel};
+use crate::paths_ui::PathsPanel;
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
-use crate::settings::{Settings, TopUp};
+use crate::settings::Settings;
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
@@ -35,7 +33,8 @@ use crate::view::{
 };
 use banners::{BannerInput, banner_items, banner_strip};
 use details::{DetailData, DetailView, animated_area, effective_tab};
-use theme::palette::{AMBER, BG, MUTED, PANEL};
+use drawer::{Notes, Section};
+use theme::palette::{BG, MUTED, PANEL};
 use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 
 /// How often the background thread asks whether Obsidian runs (each check spawns `tasklist`).
@@ -101,6 +100,8 @@ pub struct AppState {
     /// saved, so a stale field can never overwrite the limit in the file.
     pub budget_edited: bool,
     pub low_balance_edited: bool,
+    /// Same for the start value field (filled from the file, committed on Enter or blur).
+    pub baseline_edited: bool,
     /// The background service has ended (its channel is closed): the numbers are no longer updated.
     pub worker_gone: bool,
     /// The note about an unreadable saved state is shown once.
@@ -130,6 +131,7 @@ impl AppState {
             low_balance_input: String::new(),
             budget_edited: false,
             low_balance_edited: false,
+            baseline_edited: false,
             worker_gone: false,
             state_note_shown: false,
         }
@@ -163,6 +165,9 @@ impl AppState {
             if error.is_none() {
                 self.settings = settings;
                 // Fields the user has not touched follow the file (broken at start, edited externally).
+                if !self.baseline_edited {
+                    self.baseline_input = amount_input(self.settings.baseline.as_ref().map(|b| b.amount_nano));
+                }
                 if !self.budget_edited {
                     self.budget_input = amount_input(self.settings.monthly_budget_nano);
                 }
@@ -311,13 +316,6 @@ pub fn logs_target(settings_path: Option<&Path>, env: Env) -> (PathBuf, Option<S
     }
 }
 
-enum SettingsAction {
-    Baseline,
-    TopUp,
-    Remove(TopUp),
-    Limits,
-}
-
 enum LaunchMsg {
     Done(Mode, LaunchOutcome),
     StoreError(SecretError),
@@ -403,10 +401,12 @@ pub struct CerberusApp {
     detail_view: DetailView,
     /// Openness (0..=1) of the detail area this frame.
     detail_openness: f32,
-    /// The settings drawer (drawn in a later task; for now only the flag).
+    /// The settings drawer is open (the slide itself is animated in `draw_drawer`).
     drawer_open: bool,
-    /// Until the drawer exists: open the temporary settings header and scroll to it.
-    settings_focus: bool,
+    /// Section the drawer should scroll to once drawn.
+    drawer_scroll: Option<Section>,
+    /// Result messages shown directly under the settings field they belong to.
+    notes: Notes,
     /// Height the app added to the window for an open detail.
     grown_by: f32,
     /// The window size differs from what the app last asked for: the user resized it.
@@ -488,7 +488,8 @@ impl CerberusApp {
             detail_view: DetailView::default(),
             detail_openness: 0.0,
             drawer_open: false,
-            settings_focus: false,
+            drawer_scroll: None,
+            notes: Notes::new(),
             grown_by: 0.0,
             user_resized: false,
             last_requested: None,
@@ -584,101 +585,6 @@ impl CerberusApp {
             Slot::AdminKey => self.state.admin_key_stored = Some(stored),
         }
     }
-
-    fn save_key(&mut self, ctx: &egui::Context, slot: Slot) {
-        // Take the text out of the field while saving; on failure it goes back so the user can fix it.
-        let input = std::mem::take(self.input_mut(slot));
-        match save_key(&self.store, slot, &input) {
-            Ok(()) => {
-                wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
-                self.set_stored(slot, true);
-                self.state.notice =
-                    Some(Notice { kind: NoticeKind::Info, text: format!("{} gespeichert.", key_label(slot)) });
-            }
-            Err(msg) => {
-                *self.input_mut(slot) = input;
-                self.state.notice = Some(Notice { kind: NoticeKind::Error, text: msg });
-            }
-        }
-    }
-
-    fn delete_key(&mut self, ctx: &egui::Context, slot: Slot) {
-        wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
-        match self.store.delete(slot) {
-            Ok(()) => {
-                self.set_stored(slot, false);
-                self.state.notice =
-                    Some(Notice { kind: NoticeKind::Info, text: format!("{} gelöscht.", key_label(slot)) });
-            }
-            Err(e) => {
-                self.state.notice = Some(Notice { kind: NoticeKind::Error, text: e.to_string() });
-            }
-        }
-    }
-
-    fn apply_paths_action(&mut self, ctx: &egui::Context, action: PathsAction) {
-        if let PathsAction::Browse(field) = action {
-            self.paths.browse(field, ctx);
-            return;
-        }
-        let Some(path) = self.state.settings_path.clone() else {
-            self.state.notice =
-                Some(Notice { kind: NoticeKind::Error, text: "Einstellungen sind nicht verfügbar.".into() });
-            return;
-        };
-        self.state.notice = Some(match self.paths.apply(action, &path) {
-            Ok(settings) => {
-                self.state.settings = settings;
-                Notice { kind: NoticeKind::Info, text: "Gespeichert. Obsidian-Pfade gelten ab dem nächsten Start, der Protokollordner nach einem Neustart der App.".into() }
-            }
-            Err(text) => Notice { kind: NoticeKind::Error, text },
-        });
-    }
-
-    fn apply_settings_action(&mut self, action: SettingsAction) {
-        let Some(path) = self.state.settings_path.clone() else {
-            self.state.notice =
-                Some(Notice { kind: NoticeKind::Error, text: "Einstellungen sind nicht verfügbar.".into() });
-            return;
-        };
-        let now = Utc::now();
-        let st = &self.state;
-        if matches!(action, SettingsAction::Limits) && !st.budget_edited && !st.low_balance_edited {
-            self.state.notice = Some(Notice { kind: NoticeKind::Info, text: "Keine Änderung an den Grenzen.".into() });
-            return;
-        }
-        let result = update_settings(&path, |s| match &action {
-            SettingsAction::Baseline => with_baseline(s, &st.baseline_input, now),
-            SettingsAction::TopUp => with_topup(s, &st.topup_input, now),
-            SettingsAction::Remove(entry) => without_topup(s, entry).ok_or_else(|| {
-                "Diese Aufladung steht nicht mehr in der Einstellungsdatei. Es wurde nichts geändert.".to_string()
-            }),
-            SettingsAction::Limits => with_limits(
-                s,
-                st.budget_edited.then_some(st.budget_input.as_str()),
-                st.low_balance_edited.then_some(st.low_balance_input.as_str()),
-            ),
-        });
-        self.state.notice = Some(match result {
-            Ok(settings) => {
-                self.state.settings = settings;
-                match action {
-                    SettingsAction::Baseline => self.state.baseline_input.clear(),
-                    SettingsAction::TopUp => self.state.topup_input.clear(),
-                    SettingsAction::Limits => {
-                        self.state.budget_edited = false;
-                        self.state.low_balance_edited = false;
-                    }
-                    SettingsAction::Remove(_) => {}
-                }
-                Notice {
-                    kind: NoticeKind::Info,
-                    text: "Gespeichert. Die Karten übernehmen die Änderung beim nächsten Durchlauf (höchstens eine Minute).".into(),
-                }
-            }
-            Err(text) => Notice { kind: NoticeKind::Error, text },
-        });
-    }
 }
 
 
@@ -712,13 +618,14 @@ impl eframe::App for CerberusApp {
         egui::Panel::top("top-bar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| cockpit::top_bar(ui, &self.logo, &mut self.drawer_open));
-        self.stand_in_for_drawer();
         if !items.is_empty() {
             egui::Panel::top("banner-strip")
                 .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
                 .show_separator_line(false)
                 .show(ui, |ui| banner_strip(ui, &items));
         }
+        // Below the top bar and the banner strip: where the backdrop and the drawer go.
+        let body = ui.available_rect_before_wrap();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(12))).show(
             ui,
             |ui| {
@@ -728,6 +635,7 @@ impl eframe::App for CerberusApp {
                 self.fit_window(&ctx, out.content_size.y, out.inner_rect.height());
             },
         );
+        self.draw_drawer(&ctx, body);
         self.draw_confirm(&ctx);
     }
 }
@@ -772,22 +680,12 @@ impl CerberusApp {
         }
     }
 
-    /// Until the drawer exists (task 5) the gear and the balance link open the temporary settings header
-    /// and scroll to it. The request is consumed here, so `drawer_open` never stays set without a drawer.
-    fn stand_in_for_drawer(&mut self) {
-        if self.drawer_open {
-            self.drawer_open = false;
-            self.settings_focus = true;
-        }
-    }
-
     /// Esc closes the topmost layer: confirm dialog, drawer, detail. A focused text field keeps its Esc.
     fn handle_escape(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) || ctx.egui_wants_keyboard_input() {
             return;
         }
-        // No drawer is drawn yet, so it is never the target.
-        match esc_target(self.state.confirm.is_some(), false, self.detail.is_some()) {
+        match esc_target(self.state.confirm.is_some(), self.drawer_open, self.detail.is_some()) {
             EscTarget::Confirm => self.state.confirm = None,
             EscTarget::Drawer => self.drawer_open = false,
             EscTarget::Detail => self.set_detail(None),
@@ -921,7 +819,9 @@ impl CerberusApp {
             self.set_detail(toggle_detail(self.detail, kind));
         }
         if let Some(out) = area_out {
-            self.drawer_open |= out.open_drawer;
+            if out.open_drawer {
+                self.open_drawer(ctx, Some(Section::Balance));
+            }
             if out.layout_changed && self.detail.is_some() {
                 self.grow.content_grew();
             }
@@ -944,7 +844,6 @@ impl CerberusApp {
             );
         }
         // The update hint (task 8) goes here.
-        self.draw_settings(ui);
     }
 
     fn draw_confirm(&mut self, ctx: &egui::Context) {
@@ -971,135 +870,6 @@ impl CerberusApp {
             }
             Some(false) => self.state.confirm = None,
             None => {}
-        }
-    }
-
-    fn draw_key_row(&mut self, ui: &mut egui::Ui, slot: Slot, hint: &str) {
-        let (stored, id) = (
-            match slot {
-                Slot::ApiKey => self.state.key_stored,
-                Slot::AdminKey => self.state.admin_key_stored,
-            },
-            key_field_id(slot),
-        );
-        ui.label(key_status_text(stored));
-        let mut save = false;
-        let mut delete = false;
-        ui.horizontal(|ui| {
-            let input = self.input_mut(slot);
-            ui.add(
-                egui::TextEdit::singleline(input)
-                    .id(id)
-                    .password(true)
-                    .hint_text(hint)
-                    .desired_width((ui.available_width() - 190.0).clamp(100.0, 320.0)),
-            );
-            let empty = input.is_empty();
-            save = ui.add_enabled(!empty, egui::Button::new("Speichern")).clicked();
-            delete = ui.add_enabled(stored == Some(true), egui::Button::new("Löschen")).clicked();
-        });
-        if save {
-            self.save_key(ui.ctx(), slot);
-        }
-        if delete {
-            self.delete_key(ui.ctx(), slot);
-        }
-    }
-
-    fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        let focus = std::mem::take(&mut self.settings_focus);
-        let mut header = egui::CollapsingHeader::new("Einstellungen (vorübergehend)").default_open(false);
-        if focus {
-            header = header.open(Some(true));
-        }
-        let shown = header.show(ui, |ui| {
-            ui.label("API-Key (nur für „Mit API-Key starten“, liegt im Windows-Anmeldeinformationsspeicher)");
-            self.draw_key_row(ui, Slot::ApiKey, "sk-ant-…");
-            ui.label(
-                RichText::new("Key muss einem Workspace zugeordnet sein (Geltungsbereich Default), sonst lehnt die API Anfragen ab.")
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(10.0);
-
-            ui.label("Admin-Key (nur für die Kosten-API, braucht ein Organisations-Konto)");
-            self.draw_key_row(ui, Slot::AdminKey, "sk-ant-admin01-…");
-            ui.add_space(10.0);
-
-            let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
-            if let Some(action) = self.paths.draw(ui, !broken && self.state.settings_path.is_some()) {
-                self.apply_paths_action(ui.ctx(), action);
-            }
-            ui.add_space(10.0);
-
-            self.draw_balance_settings(ui);
-        });
-        if focus {
-            shown.header_response.scroll_to_me(Some(egui::Align::TOP));
-        }
-    }
-
-    fn draw_balance_settings(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Guthaben und Grenzen").strong());
-        let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
-        let can_save = !broken && self.state.settings_path.is_some();
-        if !can_save {
-            let text = match &self.state.settings_path {
-                Some(p) => format!(
-                    "Speichern ist gesperrt, solange die Einstellungsdatei nicht lesbar ist. Bitte die Datei prüfen oder löschen: {}",
-                    p.display()
-                ),
-                None => "Speichern nicht möglich: Die Umgebungsvariable LOCALAPPDATA ist nicht gesetzt, es gibt keinen Ort für die Einstellungen.".to_string(),
-            };
-            ui.colored_label(AMBER, text);
-        }
-        let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
-        let mut action: Option<SettingsAction> = None;
-        ui.add_enabled_ui(can_save, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Startwert aus der Console (USD):");
-                ui.add(egui::TextEdit::singleline(&mut self.state.baseline_input).hint_text("65,03").desired_width(90.0));
-                if ui.button("Als Startwert speichern").clicked() {
-                    action = Some(SettingsAction::Baseline);
-                }
-            });
-            ui.label(RichText::new("Der Startwert gilt ab jetzt; Aufladungen und Kosten davor zählen nicht.").weak().small());
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Aufladung (USD):");
-                ui.add(egui::TextEdit::singleline(&mut self.state.topup_input).hint_text("10").desired_width(90.0));
-                if ui.button("Aufladung hinzufügen").clicked() {
-                    action = Some(SettingsAction::TopUp);
-                }
-            });
-            for topup in &self.state.settings.topups {
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{} · {}",
-                        topup.at.with_timezone(&Local).format("%d.%m.%Y"),
-                        format_usd(topup.amount_nano)
-                    ));
-                    if ui.small_button("Entfernen").clicked() {
-                        action = Some(SettingsAction::Remove(topup.clone()));
-                    }
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Monatsbudget (USD, optional):");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.state.budget_input).hint_text("20").desired_width(90.0));
-                self.state.budget_edited |= r.changed();
-                ui.label("Warngrenze Guthaben (USD, optional):");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.state.low_balance_input).hint_text("10").desired_width(90.0));
-                self.state.low_balance_edited |= r.changed();
-                if ui.button("Grenzen speichern").clicked() {
-                    action = Some(SettingsAction::Limits);
-                }
-            });
-            if let Some(hint) = inert_limits_hint(api) {
-                ui.colored_label(AMBER, hint);
-            }
-        });
-        if let Some(action) = action {
-            self.apply_settings_action(action);
         }
     }
 }
@@ -1137,6 +907,7 @@ pub fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cards::{update_settings, with_limits};
     use std::cell::RefCell;
 
     #[test]

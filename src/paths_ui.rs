@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
+
+use crate::ui::theme::palette::{AMBER, CYAN, MUTED};
 
 use crate::cards::update_settings;
 use crate::paths::{real_env, resolve_logs_root, resolve_obsidian, with_logs_root, with_obsidian_path};
@@ -156,23 +158,41 @@ impl PathsPanel {
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, can_save: bool) -> Option<PathsAction> {
+    /// The rows only; the drawer draws the section title. Every row stacks: field on its own line, the
+    /// buttons wrap below it, so nothing is wider than the 360 px drawer.
+    pub fn draw(&mut self, ui: &mut egui::Ui, can_save: bool, notes: [Option<RowNote<'_>>; 2]) -> Option<PathsAction> {
         let mut action = None;
-        ui.label(RichText::new("Pfade").strong());
         let busy = self.dialog.is_some();
+        let [obsidian_note, logs_note] = notes;
         ui.add_enabled_ui(can_save, |ui| {
             ui.label("Obsidian (leer: automatisch suchen)");
             let (input, edited) = (&mut self.obsidian_input, &mut self.obsidian_edited);
-            row(ui, Field::Obsidian, input, edited, busy, r"C:\Users\…\AppData\Local\Programs\Obsidian\Obsidian.exe", &mut action);
+            row(ui, Field::Obsidian, input, edited, busy, r"…\Obsidian\Obsidian.exe", &mut action);
             used_line(ui, &self.obsidian, None);
+            row_note(ui, obsidian_note);
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.label("Claude-Protokolle (leer: automatisch suchen)");
             let (input, edited) = (&mut self.logs_input, &mut self.logs_edited);
-            row(ui, Field::Logs, input, edited, busy, r"C:\Users\…\.claude\projects", &mut action);
+            row(ui, Field::Logs, input, edited, busy, r"…\.claude\projects", &mut action);
             used_line(ui, &self.logs, Some("Wird nach einem Neustart der App wirksam."));
+            row_note(ui, logs_note);
         });
         action
+    }
+}
+
+/// A message directly under a path row (result of the last save or reset of that row).
+#[derive(Debug, Clone, Copy)]
+pub struct RowNote<'a> {
+    pub error: bool,
+    pub text: &'a str,
+}
+
+fn row_note(ui: &mut egui::Ui, note: Option<RowNote<'_>>) {
+    if let Some(note) = note {
+        let color = if note.error { AMBER } else { CYAN };
+        ui.label(RichText::new(note.text).color(color));
     }
 }
 
@@ -189,9 +209,9 @@ fn row(
     hint: &str,
     action: &mut Option<PathsAction>,
 ) {
-    ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(input).hint_text(hint).desired_width(380.0));
-        *edited |= r.changed();
+    let r = ui.add(egui::TextEdit::singleline(input).hint_text(hint).desired_width(ui.available_width()));
+    *edited |= r.changed();
+    ui.horizontal_wrapped(|ui| {
         if ui.add_enabled(!busy, egui::Button::new("Durchsuchen")).clicked() {
             *action = Some(PathsAction::Browse(field));
         }
@@ -207,14 +227,14 @@ fn row(
 fn used_line(ui: &mut egui::Ui, used: &Used, note: Option<&str>) {
     match used {
         Used::Ok(p) => {
-            ui.label(RichText::new(format!("Verwendet: {}", p.display())).weak().small());
+            ui.label(RichText::new(format!("Verwendet: {}", p.display())).color(MUTED).size(12.0));
         }
         Used::Problem(text) => {
-            ui.colored_label(Color32::from_rgb(230, 150, 30), text);
+            ui.label(RichText::new(text).color(AMBER));
         }
     }
     if let Some(note) = note {
-        ui.label(RichText::new(note).weak().small());
+        ui.label(RichText::new(note).color(MUTED).size(12.0));
     }
 }
 
