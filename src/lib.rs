@@ -2,6 +2,8 @@
 
 pub mod analytics;
 pub mod balance;
+pub mod paths;
+pub mod paths_ui;
 pub mod settings;
 pub mod log_scan;
 pub mod pricing;

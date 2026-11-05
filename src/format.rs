@@ -70,6 +70,7 @@ pub fn outcome_message(mode: Mode, outcome: LaunchOutcome) -> Option<String> {
             "Kein API-Key gespeichert. Bitte unter Einstellungen einen Key speichern.".to_string(),
         ),
         LaunchOutcome::ObsidianNotFound => Some("Obsidian konnte nicht gestartet werden.".to_string()),
+        LaunchOutcome::ObsidianUnavailable(e) => Some(e.to_string()),
     }
 }
 
@@ -115,6 +116,7 @@ mod tests {
             LaunchOutcome::CloseTimedOut,
             LaunchOutcome::MissingKey,
             LaunchOutcome::ObsidianNotFound,
+            LaunchOutcome::ObsidianUnavailable(crate::paths::PathError::NoHome),
         ] {
             assert!(outcome_message(Mode::ApiKey, o).is_some());
         }
@@ -123,5 +125,8 @@ mod tests {
                 .unwrap()
                 .contains("konnte nicht gestartet werden")
         );
+        let missing = crate::paths::PathError::ConfiguredMissing(r"D:pps\Obsidian.exe".into());
+        let text = outcome_message(Mode::Max, LaunchOutcome::ObsidianUnavailable(missing)).unwrap();
+        assert!(text.contains(r"D:pps\Obsidian.exe") && text.contains("Einstellungen"), "{text}");
     }
 }

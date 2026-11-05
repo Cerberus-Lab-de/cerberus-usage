@@ -49,6 +49,27 @@ Unter `%LOCALAPPDATA%\CerberusUsage\`:
 
 Ist `settings.json` kaputt, zeigt die App eine Meldung mit dem Pfad und sperrt das Speichern, damit die Datei nicht überschrieben wird.
 
+## Andere Pfade
+
+Liegt Obsidian oder der Claude-Protokollordner woanders, trägst du den Pfad in den Einstellungen unter „Pfade“ ein (Feld, „Durchsuchen“, „Speichern“; „Zurücksetzen“ geht zurück auf automatisch). Die Zeile „Verwendet“ zeigt, was gerade gilt. Beide Felder stehen in `settings.json` (`obsidian_path`, `logs_root`).
+
+Suchreihenfolge Obsidian:
+
+1. der eingestellte Pfad (muss auf eine `.exe` zeigen; fehlt die Datei, gibt es einen Fehler und keine stille Suche)
+2. `%LOCALAPPDATA%\Programs\Obsidian\Obsidian.exe`
+3. `%ProgramFiles%\Obsidian\Obsidian.exe`
+4. `%ProgramFiles(x86)%\Obsidian\Obsidian.exe`
+
+Der Prozessname zum Erkennen und Schließen kommt aus dem Dateinamen der gefundenen `.exe`. Eine Änderung gilt beim nächsten Start von Obsidian.
+
+Suchreihenfolge Protokolle:
+
+1. der eingestellte Ordner
+2. `%CLAUDE_CONFIG_DIR%\projects`
+3. `%USERPROFILE%\.claude\projects`
+
+Ohne `USERPROFILE` zeigt das Fenster einen Hinweis und liest nichts. Eine Änderung des Protokollordners gilt nach einem Neustart der App; die gelesenen Zahlen werden dann aus dem neuen Ordner neu aufgebaut.
+
 ## Einschränkung: Einzelkonto
 
 Die Kosten-API gibt es nur für Organisations-Konten. Bei einem Einzelkonto antwortet Anthropic mit „nicht verfügbar“. Die Karte „API-Kosten laut Anthropic“ sagt das dann offen, und das Guthaben wird ohne Kostenabzug gezeigt: Startwert plus Aufladungen. Wer den Betrag aus der Console neu einträgt, hat wieder einen frischen Stand. Mit einer Organisation und einem Admin-Key werden die Kosten seit dem Startwert automatisch abgezogen.

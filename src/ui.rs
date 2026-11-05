@@ -18,6 +18,8 @@ use crate::format::{
     COST_NOTE, format_count, outcome_message, pause_text, progress_text, unpriced_text,
 };
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch};
+use crate::paths::{real_env, resolve_logs_root};
+use crate::paths_ui::{PathsAction, PathsPanel};
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
 use crate::settings::{Settings, TopUp};
@@ -259,7 +261,10 @@ fn spawn_launch(mode: Mode, confirmed_close: bool, ctx: egui::Context) -> Receiv
                 Mode::ApiKey => KeyringStore::new().get(Slot::ApiKey),
             };
             match key {
-                Ok(key) => LaunchMsg::Done(mode, launch(&WindowsSystem, mode, key.as_deref(), confirmed_close)),
+                Ok(key) => {
+                    let sys = WindowsSystem { settings_path: crate::settings::default_path().ok() };
+                    LaunchMsg::Done(mode, launch(&sys, mode, key.as_deref(), confirmed_close))
+                }
                 Err(e) => LaunchMsg::StoreError(e),
             }
         };
@@ -274,10 +279,11 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(false));
     let shared = running.clone();
     std::thread::spawn(move || {
-        let sys = WindowsSystem;
+        let sys = WindowsSystem { settings_path: crate::settings::default_path().ok() };
         let mut last: Option<bool> = None;
         loop {
-            let now_running = sys.obsidian_running();
+            // The image name follows the Obsidian path from the settings.
+            let now_running = sys.obsidian_running(&sys.current_image_name());
             shared.store(now_running, Ordering::Relaxed);
             if last != Some(now_running) {
                 last = Some(now_running);
@@ -294,6 +300,7 @@ pub struct CerberusApp {
     snapshots: Receiver<Snapshot>,
     obsidian_running: Arc<AtomicBool>,
     launch_rx: Option<Receiver<LaunchMsg>>,
+    paths: PathsPanel,
     control: Arc<WindowControl>,
     store: KeyringStore,
     prices_as_of: String,
@@ -314,10 +321,19 @@ impl CerberusApp {
         let prices_path = PriceTable::default_override_path().unwrap_or_else(|| data_dir.join("prices.json"));
         let prices_as_of = PriceTable::load(&prices_path).as_of().to_string();
 
+        let settings_path = crate::settings::default_path().ok();
+        let configured_logs = settings_path.as_ref().and_then(|p| crate::settings::load(p).0.logs_root);
+        // Resolved once: a changed setting applies after a restart. Never a relative path.
+        let (logs_root, logs_unavailable) = match resolve_logs_root(configured_logs.as_deref(), &real_env) {
+            Ok(p) => (p, None),
+            Err(e) => (PathBuf::new(), Some(e.to_string())),
+        };
+
         let notify_ctx = ctx.clone();
         let snapshots = spawn_worker(
             WorkerConfig {
-                logs_root: logs_root(),
+                logs_root,
+                logs_unavailable,
                 state_path: data_dir.join("scan_state.json"),
                 prices_path,
                 interval: DEFAULT_INTERVAL,
@@ -336,12 +352,14 @@ impl CerberusApp {
         state.admin_key_stored = key_stored(&store, Slot::AdminKey);
         state.settings_path = crate::settings::default_path().ok();
         state.reload_settings();
+        let paths = PathsPanel::new(&state.settings);
 
         Self {
             state,
             snapshots,
             obsidian_running,
             launch_rx: None,
+            paths,
             control,
             store,
             prices_as_of,
@@ -360,7 +378,9 @@ impl CerberusApp {
         }
         if fresh {
             self.state.reload_settings();
+            self.paths.refresh(&self.state.settings);
         }
+        self.paths.poll_dialog();
         let now = Instant::now();
         self.state.apply_running(self.obsidian_running.load(Ordering::Relaxed), now);
         if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
@@ -372,8 +392,9 @@ impl CerberusApp {
                 self.launch_rx = None;
                 match msg {
                     LaunchMsg::Done(mode, outcome) => {
+                        let started = outcome == LaunchOutcome::Started;
                         self.state.apply_outcome(mode, outcome, now);
-                        if outcome == LaunchOutcome::Started {
+                        if started {
                             // Re-check once the grace period is over (the poller only reports changes).
                             ctx.request_repaint_after(START_GRACE + Duration::from_secs(1));
                         }
@@ -439,6 +460,25 @@ impl CerberusApp {
                 self.state.notice = Some(Notice { kind: NoticeKind::Error, text: e.to_string() });
             }
         }
+    }
+
+    fn apply_paths_action(&mut self, ctx: &egui::Context, action: PathsAction) {
+        if let PathsAction::Browse(field) = action {
+            self.paths.browse(field, ctx);
+            return;
+        }
+        let Some(path) = self.state.settings_path.clone() else {
+            self.state.notice =
+                Some(Notice { kind: NoticeKind::Error, text: "Einstellungen sind nicht verfügbar.".into() });
+            return;
+        };
+        self.state.notice = Some(match self.paths.apply(action, &path) {
+            Ok(settings) => {
+                self.state.settings = settings;
+                Notice { kind: NoticeKind::Info, text: "Gespeichert. Obsidian-Pfade gelten ab dem nächsten Start, der Protokollordner nach einem Neustart der App.".into() }
+            }
+            Err(text) => Notice { kind: NoticeKind::Error, text },
+        });
     }
 
     fn apply_settings_action(&mut self, action: SettingsAction) {
@@ -755,6 +795,12 @@ impl CerberusApp {
             self.draw_key_row(ui, Slot::AdminKey, "sk-ant-admin01-…");
             ui.add_space(10.0);
 
+            let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
+            if let Some(action) = self.paths.draw(ui, !broken && self.state.settings_path.is_some()) {
+                self.apply_paths_action(ui.ctx(), action);
+            }
+            ui.add_space(10.0);
+
             self.draw_balance_settings(ui);
         });
     }
@@ -955,10 +1001,6 @@ fn bucket_table(ui: &mut egui::Ui, id: &str, first_col: &str, rows: &[(String, B
 fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("CerberusUsage")
-}
-
-fn logs_root() -> PathBuf {
-    PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(".claude").join("projects")
 }
 
 /// Opens the window and the tray icon and runs until "Beenden".

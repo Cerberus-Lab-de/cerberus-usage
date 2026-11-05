@@ -21,6 +21,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 memchr = "2"
+rfd = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

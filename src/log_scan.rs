@@ -48,6 +48,16 @@ pub struct ScanState {
     pub files: HashMap<PathBuf, FileMark>,
     pub records: HashMap<String, UsageRecord>,
     pub quota: Vec<QuotaEvent>,
+    /// Folder these numbers were read from. `None` in files written before this field existed:
+    /// the next scan adopts its root, so the history of deleted logs is not lost.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+}
+
+/// Same folder, ignoring trailing separators, `/` vs `\` and letter case (Windows).
+fn same_root(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -239,6 +249,12 @@ pub fn scan(
     state: &mut ScanState,
     progress: &dyn Fn(usize, usize),
 ) -> io::Result<ScanStats> {
+    // Numbers of two folders must not mix: a different root rebuilds the state. A state without a
+    // root (old file) is kept and adopts this one.
+    if state.root.as_deref().is_some_and(|old| !same_root(old, root)) {
+        *state = ScanState::default();
+    }
+    state.root = Some(root.to_path_buf());
     let mut files = Vec::new();
     match collect_jsonl(root, &mut files, true) {
         Ok(()) => {}
@@ -709,6 +725,46 @@ mod tests {
                 .records
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn changed_logs_root_resets_scan_state() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_lines(&a.path().join("p/a.jsonl"), &[usage_line("a1", "m", 5)]);
+        write_lines(&b.path().join("p/b.jsonl"), &[usage_line("b1", "m", 7)]);
+
+        let mut state = ScanState::default();
+        run(a.path(), &mut state);
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.root.as_deref(), Some(a.path()));
+
+        // Same root (trailing separator and letter case do not matter): history is kept.
+        let mut upper = a.path().to_string_lossy().to_uppercase();
+        upper.push('\\');
+        run(Path::new(&upper), &mut state);
+        assert_eq!(state.records.len(), 1);
+
+        // Different root: numbers of two folders never mix.
+        run(b.path(), &mut state);
+        assert_eq!(state.records.len(), 1);
+        assert!(state.records.contains_key("b1"));
+        assert_eq!(state.root.as_deref(), Some(b.path()));
+    }
+
+    #[test]
+    fn state_without_root_adopts_the_current_root_and_keeps_history() {
+        let a = tempfile::tempdir().unwrap();
+        let log = a.path().join("p/a.jsonl");
+        write_lines(&log, &[usage_line("old", "m", 5)]);
+        let mut state = ScanState::default();
+        run(a.path(), &mut state);
+        // An old state file has no root; the log it came from is gone by now.
+        state.root = None;
+        std::fs::remove_file(&log).unwrap();
+        run(a.path(), &mut state);
+        assert!(state.records.contains_key("old"), "history of deleted logs must survive");
+        assert_eq!(state.root.as_deref(), Some(a.path()));
     }
 
     #[test]

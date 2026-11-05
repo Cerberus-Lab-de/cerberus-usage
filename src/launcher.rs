@@ -8,9 +8,11 @@
 //! - the key is set on the child `Command` only, never on this process.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use crate::paths::{DEFAULT_IMAGE_NAME, PathError, image_name, real_env, resolve_obsidian};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -18,7 +20,7 @@ pub enum Mode {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
     Started,
     /// Obsidian runs and the user has not agreed to close it yet.
@@ -26,18 +28,23 @@ pub enum LaunchOutcome {
     /// Obsidian did not exit within the wait time; nothing was started.
     CloseTimedOut,
     MissingKey,
-    /// Executable missing (or the process could not be started).
+    /// The process could not be started.
     ObsidianNotFound,
+    /// The Obsidian executable could not be resolved from the settings or the automatic search.
+    /// Nothing was closed or started.
+    ObsidianUnavailable(PathError),
 }
 
 /// OS access, abstracted so the launch logic is testable without touching real processes.
 pub trait System {
-    fn obsidian_running(&self) -> bool;
+    /// Whether a process with this image name (e.g. `Obsidian.exe`) runs.
+    fn obsidian_running(&self, image: &str) -> bool;
     /// Polite close request (no force).
-    fn request_close(&self);
-    /// Start Obsidian without waiting. `Some` sets `ANTHROPIC_API_KEY` for the child, `None` removes it.
-    fn spawn(&self, api_key: Option<&str>) -> io::Result<()>;
-    fn obsidian_exists(&self) -> bool;
+    fn request_close(&self, image: &str);
+    /// Start `exe` without waiting. `Some` sets `ANTHROPIC_API_KEY` for the child, `None` removes it.
+    fn spawn(&self, exe: &Path, api_key: Option<&str>) -> io::Result<()>;
+    /// Finds the Obsidian executable from the current settings (called at every launch).
+    fn resolve_obsidian(&self) -> Result<PathBuf, PathError>;
     fn sleep(&self, d: Duration);
 }
 
@@ -50,9 +57,12 @@ pub fn launch(
     key: Option<&str>,
     confirmed_close: bool,
 ) -> LaunchOutcome {
-    if !sys.obsidian_exists() {
-        return LaunchOutcome::ObsidianNotFound;
-    }
+    // Resolve first: an unusable setting must never lead to closing a running Obsidian.
+    let exe = match sys.resolve_obsidian() {
+        Ok(exe) => exe,
+        Err(e) => return LaunchOutcome::ObsidianUnavailable(e),
+    };
+    let image = image_name(&exe);
     // Resolve the key first so a missing key never leads to closing Obsidian.
     let api_key = match mode {
         Mode::Max => None,
@@ -62,15 +72,15 @@ pub fn launch(
         },
     };
 
-    if sys.obsidian_running() {
+    if sys.obsidian_running(&image) {
         if !confirmed_close {
             return LaunchOutcome::NeedsConfirmation;
         }
-        sys.request_close();
+        sys.request_close(&image);
         let mut closed = false;
         for _ in 0..CLOSE_POLLS {
             sys.sleep(CLOSE_POLL_INTERVAL);
-            if !sys.obsidian_running() {
+            if !sys.obsidian_running(&image) {
                 closed = true;
                 break;
             }
@@ -80,14 +90,17 @@ pub fn launch(
         }
     }
 
-    match sys.spawn(api_key) {
+    match sys.spawn(&exe, api_key) {
         Ok(()) => LaunchOutcome::Started,
         Err(_) => LaunchOutcome::ObsidianNotFound,
     }
 }
 
 /// Real implementation using fixed-path Windows tools (Git Bash on PATH would shadow e.g. `find`).
-pub struct WindowsSystem;
+pub struct WindowsSystem {
+    /// `settings.json`, read at every call so a changed Obsidian path applies without a restart.
+    pub settings_path: Option<PathBuf>,
+}
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -101,36 +114,47 @@ impl WindowsSystem {
         root.join("System32").join(name)
     }
 
-    fn obsidian_path() -> Option<PathBuf> {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        Some(PathBuf::from(base).join(r"Programs\Obsidian\Obsidian.exe"))
+    fn configured_path(&self) -> Option<PathBuf> {
+        let path = self.settings_path.as_ref()?;
+        // A broken settings file yields defaults here (automatic search); the window reports the problem.
+        crate::settings::load(path).0.obsidian_path
+    }
+
+    /// Image name for process checks: from the resolved exe, else the default name.
+    pub fn current_image_name(&self) -> String {
+        self.resolve_obsidian().map(|p| image_name(&p)).unwrap_or_else(|_| DEFAULT_IMAGE_NAME.to_string())
     }
 }
 
-/// True if `tasklist` output lists the Obsidian process (case-insensitive).
-fn lists_obsidian(tasklist_stdout: &str) -> bool {
-    tasklist_stdout.to_ascii_lowercase().contains("obsidian.exe")
+/// True if a `tasklist /nh` line starts with exactly this image name (case-insensitive), so
+/// `Obsidian.exe` does not match `NotObsidian.exe`.
+fn lists_image(tasklist_stdout: &str, image: &str) -> bool {
+    let image = image.to_lowercase();
+    tasklist_stdout.lines().any(|line| {
+        let line = line.trim_start().to_lowercase();
+        line.strip_prefix(&image).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })
 }
 
 #[cfg(windows)]
 impl System for WindowsSystem {
-    fn obsidian_running(&self) -> bool {
+    fn obsidian_running(&self, image: &str) -> bool {
         use std::os::windows::process::CommandExt;
         Command::new(Self::system32_tool("tasklist.exe"))
-            .args(["/fi", "imagename eq Obsidian.exe", "/nh"])
+            .args(["/fi", &format!("imagename eq {image}"), "/nh"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
-            .map(|o| lists_obsidian(&String::from_utf8_lossy(&o.stdout)))
+            .map(|o| lists_image(&String::from_utf8_lossy(&o.stdout), image))
             .unwrap_or(false)
     }
 
-    fn request_close(&self) {
+    fn request_close(&self, image: &str) {
         use std::os::windows::process::CommandExt;
         // No /f: Obsidian gets the chance to save and exit on its own.
         let _ = Command::new(Self::system32_tool("taskkill.exe"))
-            .args(["/im", "Obsidian.exe"])
+            .args(["/im", image])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -138,11 +162,9 @@ impl System for WindowsSystem {
             .status();
     }
 
-    fn spawn(&self, api_key: Option<&str>) -> io::Result<()> {
+    fn spawn(&self, exe: &Path, api_key: Option<&str>) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
-        let path = Self::obsidian_path()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA not set"))?;
-        let mut cmd = Command::new(path);
+        let mut cmd = Command::new(exe);
         // Set/removed on the child only; this process's environment stays untouched.
         match api_key {
             Some(k) => {
@@ -160,8 +182,8 @@ impl System for WindowsSystem {
         cmd.spawn().map(drop)
     }
 
-    fn obsidian_exists(&self) -> bool {
-        Self::obsidian_path().is_some_and(|p| p.is_file())
+    fn resolve_obsidian(&self) -> Result<PathBuf, PathError> {
+        resolve_obsidian(self.configured_path().as_deref(), &real_env, &|p| p.is_file())
     }
 
     fn sleep(&self, d: Duration) {
@@ -177,7 +199,10 @@ mod tests {
     /// Records calls. `running_polls` = how many `obsidian_running` calls still report true
     /// (u32::MAX = never exits).
     struct FakeSystem {
-        exists: bool,
+        resolve: Result<PathBuf, PathError>,
+        /// Image names passed to `obsidian_running` / `request_close`.
+        images: RefCell<Vec<String>>,
+        spawned: RefCell<Vec<PathBuf>>,
         running_polls: Cell<u32>,
         calls: RefCell<Vec<String>>,
         slept: Cell<u32>,
@@ -186,7 +211,13 @@ mod tests {
     impl FakeSystem {
         fn new(exists: bool, running_polls: u32) -> Self {
             Self {
-                exists,
+                resolve: if exists {
+                    Ok(PathBuf::from(r"C:\Obsidian\Obsidian.exe"))
+                } else {
+                    Err(PathError::ObsidianNotFound { searched: vec![] })
+                },
+                images: RefCell::new(Vec::new()),
+                spawned: RefCell::new(Vec::new()),
                 running_polls: Cell::new(running_polls),
                 calls: RefCell::new(Vec::new()),
                 slept: Cell::new(0),
@@ -201,7 +232,8 @@ mod tests {
     }
 
     impl System for FakeSystem {
-        fn obsidian_running(&self) -> bool {
+        fn obsidian_running(&self, image: &str) -> bool {
+            self.images.borrow_mut().push(image.to_string());
             let n = self.running_polls.get();
             if n == 0 {
                 return false;
@@ -211,15 +243,17 @@ mod tests {
             }
             true
         }
-        fn request_close(&self) {
+        fn request_close(&self, image: &str) {
+            self.images.borrow_mut().push(image.to_string());
             self.calls.borrow_mut().push("close".into());
         }
-        fn spawn(&self, api_key: Option<&str>) -> io::Result<()> {
+        fn spawn(&self, exe: &Path, api_key: Option<&str>) -> io::Result<()> {
+            self.spawned.borrow_mut().push(exe.to_path_buf());
             self.calls.borrow_mut().push(format!("spawn:{api_key:?}"));
             Ok(())
         }
-        fn obsidian_exists(&self) -> bool {
-            self.exists
+        fn resolve_obsidian(&self) -> Result<PathBuf, PathError> {
+            self.resolve.clone()
         }
         fn sleep(&self, _d: Duration) {
             self.slept.set(self.slept.get() + 1);
@@ -298,24 +332,50 @@ mod tests {
     #[test]
     fn missing_exe_reports_not_found() {
         let sys = FakeSystem::new(false, 0);
-        assert_eq!(launch(&sys, Mode::Max, None, true), LaunchOutcome::ObsidianNotFound);
+        assert!(matches!(
+            launch(&sys, Mode::Max, None, true),
+            LaunchOutcome::ObsidianUnavailable(PathError::ObsidianNotFound { .. })
+        ));
         assert!(sys.calls().is_empty());
     }
 
     #[test]
+    fn unresolved_obsidian_is_reported_before_anything_is_closed() {
+        let mut sys = FakeSystem::new(true, u32::MAX);
+        sys.resolve = Err(PathError::ConfiguredMissing(PathBuf::from(r"D:\gone\Obsidian.exe")));
+        let out = launch(&sys, Mode::Max, None, true);
+        assert_eq!(out, LaunchOutcome::ObsidianUnavailable(PathError::ConfiguredMissing(PathBuf::from(r"D:\gone\Obsidian.exe"))));
+        assert!(sys.calls().is_empty(), "nothing may be closed or started: {:?}", sys.calls());
+    }
+
+    #[test]
+    fn renamed_exe_is_used_for_close_and_detection() {
+        let mut sys = FakeSystem::new(true, 2);
+        sys.resolve = Ok(PathBuf::from(r"C:\Tools\MyObs.exe"));
+        assert_eq!(launch(&sys, Mode::Max, None, true), LaunchOutcome::Started);
+        assert_eq!(sys.calls(), vec!["close", "spawn:None"]);
+        assert!(sys.images.borrow().iter().all(|i| i == "MyObs.exe"), "{:?}", sys.images.borrow());
+        assert_eq!(*sys.spawned.borrow(), vec![PathBuf::from(r"C:\Tools\MyObs.exe")]);
+    }
+
+    #[test]
     fn tasklist_output_matching_is_case_insensitive() {
-        assert!(lists_obsidian("Obsidian.exe                  1234 Console   1   150.000 K"));
-        assert!(lists_obsidian("OBSIDIAN.EXE 1"));
-        assert!(!lists_obsidian("INFO: No tasks are running which match the specified criteria."));
-        assert!(!lists_obsidian(
-            "INFO: Es werden keine Aufgaben ausgeführt, die den angegebenen Kriterien entsprechen."
-        ));
-        assert!(!lists_obsidian(""));
+        let o = |s: &str| lists_image(s, "Obsidian.exe");
+        assert!(o("Obsidian.exe                  1234 Console   1   150.000 K"));
+        assert!(o("OBSIDIAN.EXE 1"));
+        assert!(o("\r\nobsidian.exe 1\r\n"));
+        assert!(!o("INFO: No tasks are running which match the specified criteria."));
+        assert!(!o("INFO: Es werden keine Aufgaben ausgeführt, die den angegebenen Kriterien entsprechen."));
+        assert!(!o(""));
+        // Only the exact image name counts, in either direction.
+        assert!(!o("NotObsidian.exe 12 Console 1 10 K"));
+        assert!(!o("Obsidian.exe.bak 12 Console 1 10 K"));
+        assert!(lists_image("MyObs.exe 5 Console 1 10 K", "myobs.exe"));
     }
 
     #[test]
     fn obsidian_exists_is_harmless_on_real_system() {
         // Only checks a file path; never starts or stops anything.
-        let _ = WindowsSystem.obsidian_exists();
+        let _ = WindowsSystem { settings_path: None }.resolve_obsidian();
     }
 }

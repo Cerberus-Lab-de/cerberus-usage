@@ -12,7 +12,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::analytics::{ApiPoller, ApiStatus, Http};
 use crate::balance::{Alert, BalanceStatus, alerts, status as balance_status};
 use crate::settings::{Settings, load as load_settings};
-use crate::log_scan::{ScanState, load_state, save_state, scan};
+use crate::log_scan::{ScanState, ScanStats, load_state, save_state, scan};
 use crate::pricing::PriceTable;
 use crate::report::{Report, build};
 use crate::secrets::SecretStore;
@@ -27,6 +27,9 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct WorkerConfig {
     pub logs_root: PathBuf,
+    /// Set when the log folder could not be determined (`logs_root` is then a placeholder and never
+    /// scanned). Shown as the scan error, so the window explains the empty tables.
+    pub logs_unavailable: Option<String>,
     pub state_path: PathBuf,
     pub prices_path: PathBuf,
     /// Pause between scans (see [`DEFAULT_INTERVAL`]).
@@ -188,6 +191,9 @@ fn tick(
                 }
             }
         };
+        if cfg.logs_unavailable.is_some() {
+            return Ok(ScanStats::default());
+        }
         scan(&cfg.logs_root, state, &progress)
     }));
     if receiver_gone.get() {
@@ -208,6 +214,16 @@ fn tick(
         && let Err(e) = save_state(&cfg.state_path, state)
     {
         error = Some(format!("Zustand konnte nicht gespeichert werden: {e}"));
+    }
+    if error.is_none() {
+        error = match &cfg.logs_unavailable {
+            Some(reason) => Some(reason.clone()),
+            None if !cfg.logs_root.is_dir() => Some(format!(
+                "Protokollordner nicht gefunden: {}. Pfad in den Einstellungen unter „Pfade“ prüfen.",
+                cfg.logs_root.display()
+            )),
+            None => None,
+        };
     }
 
     // After a failed scan keep the previous report; otherwise build a fresh one.
@@ -288,6 +304,7 @@ mod tests {
     fn config(dir: &Path, interval: Duration) -> WorkerConfig {
         WorkerConfig {
             logs_root: dir.join("logs"),
+            logs_unavailable: None,
             state_path: dir.join("data").join("state.json"),
             prices_path: dir.join("data").join("prices.json"),
             interval,
@@ -427,6 +444,20 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_logs_root_is_never_scanned_and_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path(), Duration::from_secs(60));
+        // A log below the (relative) placeholder must not be picked up.
+        cfg.logs_root = PathBuf::new();
+        cfg.logs_unavailable = Some("Der Protokollordner lässt sich nicht bestimmen.".into());
+        let rx = spawn_worker(cfg, noop());
+        let (_, snap) = until_report(&rx);
+        assert_eq!(snap.scan_error.as_deref(), Some("Der Protokollordner lässt sich nicht bestimmen."));
+        assert_eq!(snap.total_files, 0);
+        assert!(snap.report.is_some(), "the rest of the window stays usable");
+    }
+
+    #[test]
     fn missing_logs_root_reports_empty_not_crash() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path(), Duration::from_secs(60));
@@ -434,7 +465,8 @@ mod tests {
         let rx = spawn_worker(cfg, noop());
 
         let (_, snap) = until_report(&rx);
-        assert!(snap.scan_error.is_none());
+        let msg = snap.scan_error.clone().expect("a missing folder must be explained");
+        assert!(msg.starts_with("Protokollordner nicht gefunden:") && msg.contains("logs"), "{msg}");
         assert_eq!(snap.total_files, 0);
         let report = snap.report.unwrap();
         assert_eq!(report.today.requests, 0);

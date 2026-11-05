@@ -29,6 +29,10 @@ pub struct Settings {
     pub topups: Vec<TopUp>,
     pub monthly_budget_nano: Option<u64>,
     pub low_balance_nano: Option<u64>,
+    /// Obsidian executable; `None` searches the usual locations.
+    pub obsidian_path: Option<PathBuf>,
+    /// Claude projects folder; `None` uses `CLAUDE_CONFIG_DIR` or `%USERPROFILE%\.claude\projects`.
+    pub logs_root: Option<PathBuf>,
 }
 
 /// `%LOCALAPPDATA%\CerberusUsage\settings.json`. Errors when `LOCALAPPDATA` is missing:
@@ -114,6 +118,8 @@ mod tests {
             topups: vec![TopUp { amount_nano: 10_000_000_000, at: utc("2026-11-03T12:00:00Z") }],
             monthly_budget_nano: Some(20_000_000_000),
             low_balance_nano: None,
+            obsidian_path: None,
+            logs_root: None,
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), (s, None));
@@ -145,6 +151,21 @@ mod tests {
         let msg = err.expect("a broken file must be reported");
         assert!(!msg.contains("SECRET"), "message must not echo file content");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn old_settings_file_without_paths_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"topups": [], "monthly_budget_nano": 7}"#).unwrap();
+        let (s, err) = load(&path);
+        assert!(err.is_none());
+        assert_eq!(s.monthly_budget_nano, Some(7));
+        assert!(s.obsidian_path.is_none() && s.logs_root.is_none());
+
+        let with = Settings { obsidian_path: Some(PathBuf::from(r"D:\O\Obsidian.exe")), logs_root: Some(PathBuf::from(r"E:\logs")), ..Settings::default() };
+        save(&path, &with).unwrap();
+        assert_eq!(load(&path), (with, None));
     }
 
     #[test]
