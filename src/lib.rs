@@ -18,3 +18,6 @@ pub mod tray;
 pub mod cards;
 pub mod ui;
 pub mod view;
+pub mod update;
+pub mod update_key;
+pub mod release_sign;
