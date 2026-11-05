@@ -43,8 +43,16 @@ pub struct FileMark {
     pub offset: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Version of the saved state. 1: token fields are the maximum over repeated lines.
+/// Older files keep their records (the history of deleted logs) but lose their read marks,
+/// so every existing log is read again and the maximum corrects the records in place.
+pub const STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanState {
+    /// Missing in files from before versioning (read as 0).
+    #[serde(default)]
+    pub version: u32,
     pub files: HashMap<PathBuf, FileMark>,
     pub records: HashMap<String, UsageRecord>,
     pub quota: Vec<QuotaEvent>,
@@ -52,6 +60,34 @@ pub struct ScanState {
     /// the next scan adopts its root, so the history of deleted logs is not lost.
     #[serde(default)]
     pub root: Option<PathBuf>,
+    /// Something changed since the state was last saved. Not persisted.
+    #[serde(skip)]
+    pub dirty: bool,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self {
+            version: STATE_VERSION,
+            files: HashMap::new(),
+            records: HashMap::new(),
+            quota: Vec::new(),
+            root: None,
+            dirty: false,
+        }
+    }
+}
+
+impl ScanState {
+    /// Brings a loaded state to the current version. An older one keeps its records but forgets
+    /// which bytes it has read, so all logs are read again.
+    fn upgrade(&mut self) {
+        if self.version < STATE_VERSION {
+            self.files.clear();
+            self.version = STATE_VERSION;
+            self.dirty = true;
+        }
+    }
 }
 
 /// Same folder, ignoring trailing separators, `/` vs `\` and letter case (Windows).
@@ -255,8 +291,12 @@ pub fn scan(
     if root.is_dir() {
         if state.root.as_deref().is_some_and(|old| !same_root(old, root)) {
             *state = ScanState::default();
+            state.dirty = true;
         }
-        state.root = Some(root.to_path_buf());
+        if state.root.as_deref() != Some(root) {
+            state.root = Some(root.to_path_buf());
+            state.dirty = true;
+        }
     }
     let mut files = Vec::new();
     match collect_jsonl(root, &mut files, true) {
@@ -299,7 +339,7 @@ fn scan_file(root: &Path, path: &Path, state: &mut ScanState) -> io::Result<Opti
         offset = 0;
     }
     if len == offset {
-        state.files.insert(path.to_path_buf(), FileMark { offset });
+        set_mark(state, path, offset);
         return Ok(None);
     }
 
@@ -344,27 +384,48 @@ fn scan_file(root: &Path, path: &Path, state: &mut ScanState) -> io::Result<Opti
             && !state.quota.contains(&event)
         {
             state.quota.push(event);
+            state.dirty = true;
         }
     }
 
-    state.files.insert(path.to_path_buf(), FileMark { offset });
+    set_mark(state, path, offset);
     Ok(Some(pass))
 }
 
-/// Inserts a record unless its id is known. Repeated lines carry identical
-/// usage; a main-session copy replaces a subagent copy so the result does not
-/// depend on file order. Returns true when the id was new.
+/// Stores the read position of a file; marks the state dirty only when it actually changed.
+fn set_mark(state: &mut ScanState, path: &Path, offset: u64) {
+    let mark = FileMark { offset };
+    if state.files.insert(path.to_path_buf(), mark) != Some(mark) {
+        state.dirty = true;
+    }
+}
+
+/// Inserts a record unless its id is known. Repeated lines of one message do not always carry the
+/// same usage (the later lines hold the final `output_tokens`), so every token field becomes the
+/// maximum over all lines, independent of file order. Timestamp, model and project stay from the
+/// first line; a main-session copy replaces a subagent copy's project and session. Returns true
+/// when the id was new.
 fn insert_record(state: &mut ScanState, record: UsageRecord) -> bool {
     match state.records.get_mut(&record.message_id) {
         None => {
             state.records.insert(record.message_id.clone(), record);
+            state.dirty = true;
             true
         }
         Some(existing) => {
+            let before = existing.clone();
+            existing.input = existing.input.max(record.input);
+            existing.cache_read = existing.cache_read.max(record.cache_read);
+            existing.cache_5m = existing.cache_5m.max(record.cache_5m);
+            existing.cache_1h = existing.cache_1h.max(record.cache_1h);
+            existing.output = existing.output.max(record.output);
             if existing.is_subagent && !record.is_subagent {
                 existing.is_subagent = false;
                 existing.project = record.project;
                 existing.session = record.session;
+            }
+            if *existing != before {
+                state.dirty = true;
             }
             false
         }
@@ -373,13 +434,53 @@ fn insert_record(state: &mut ScanState, record: UsageRecord) -> bool {
 
 // --- Persistence -----------------------------------------------------------
 
-/// Loads the saved state; a missing or unreadable file yields an empty state
-/// (the next scan then rebuilds it from the logs).
+/// A loaded state plus a one-time note for the user when something had to be set aside.
+pub struct LoadedState {
+    pub state: ScanState,
+    pub note: Option<String>,
+}
+
+/// Loads the saved state. A missing file is a normal first run. A file that exists but cannot be
+/// read or parsed is renamed to `<name>.bad` (only the newest such copy is kept) and the scan
+/// rebuilds from the logs; the note tells the user, since records of already deleted logs are
+/// only in the `.bad` copy. An older version is upgraded (see [`STATE_VERSION`]).
+pub fn load_state_checked(path: &Path) -> LoadedState {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return LoadedState { state: ScanState::default(), note: None };
+        }
+        Err(_) => return set_aside(path),
+    };
+    match serde_json::from_slice::<ScanState>(&bytes) {
+        Ok(mut state) => {
+            state.upgrade();
+            LoadedState { state, note: None }
+        }
+        Err(_) => set_aside(path),
+    }
+}
+
+fn set_aside(path: &Path) -> LoadedState {
+    let mut bad = path.as_os_str().to_owned();
+    bad.push(".bad");
+    let bad = PathBuf::from(bad);
+    // rename replaces an older .bad on Windows, so only the newest copy stays.
+    let kept = std::fs::rename(path, &bad).is_ok();
+    let note = if kept {
+        format!(
+            "Die gespeicherte Verbrauchsliste war nicht lesbar und wird aus den Protokollen neu aufgebaut. Die alte Datei liegt als {}.",
+            bad.display()
+        )
+    } else {
+        "Die gespeicherte Verbrauchsliste war nicht lesbar und wird aus den Protokollen neu aufgebaut.".to_string()
+    };
+    LoadedState { state: ScanState::default(), note: Some(note) }
+}
+
+/// Like [`load_state_checked`] without the note.
 pub fn load_state(path: &Path) -> ScanState {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_state_checked(path).state
 }
 
 /// Writes the state atomically: temporary file next to the target, then rename.
@@ -456,8 +557,31 @@ mod tests {
         scan(root, state, &|_, _| {}).unwrap()
     }
 
+    /// A line like `usage_line`, but with explicit token fields.
+    fn tokens_line(id: &str, input: u64, cache_read: u64, cache_5m: u64, cache_1h: u64, output: u64) -> String {
+        json!({
+            "timestamp": TS,
+            "cwd": "C:\\Work\\demo-project",
+            "sessionId": "sess-1",
+            "message": {
+                "id": id,
+                "model": "claude-sonnet-5",
+                "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_5m,
+                        "ephemeral_1h_input_tokens": cache_1h
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
     #[test]
-    fn counts_repeated_message_id_once() {
+    fn counts_identical_repeats_once() {
         let dir = tempfile::tempdir().unwrap();
         let line = usage_line("msg_1", "claude-sonnet-5", 77);
         write_lines(
@@ -479,6 +603,57 @@ mod tests {
         assert_eq!(r.speed.as_deref(), Some("standard"));
         assert_eq!(r.geo.as_deref(), Some("us"));
         assert!(!r.is_subagent);
+    }
+
+    #[test]
+    fn growing_output_takes_the_maximum_in_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lines(
+            &dir.path().join("proj").join("a.jsonl"),
+            &[
+                tokens_line("m", 10, 20, 30, 0, 3),
+                tokens_line("m", 10, 20, 30, 0, 250),
+                tokens_line("m", 10, 20, 30, 0, 90),
+            ],
+        );
+        let mut state = ScanState::default();
+        let stats = run(dir.path(), &mut state);
+        assert_eq!(state.records["m"].output, 250);
+        assert_eq!(stats.new_records, 1);
+    }
+
+    #[test]
+    fn maximum_is_independent_of_file_order_and_per_field() {
+        // Two files, scanned in name order; the same two lines in both orders give the same record.
+        let lines = [
+            tokens_line("m", 10, 20, 30, 0, 5),
+            tokens_line("m", 12, 15, 30, 40, 400),
+        ];
+        let mut results = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let dir = tempfile::tempdir().unwrap();
+            write_lines(&dir.path().join("proj/a.jsonl"), std::slice::from_ref(&lines[order[0]]));
+            write_lines(&dir.path().join("proj/b.jsonl"), std::slice::from_ref(&lines[order[1]]));
+            let mut state = ScanState::default();
+            run(dir.path(), &mut state);
+            let r = &state.records["m"];
+            results.push((r.input, r.cache_read, r.cache_5m, r.cache_1h, r.output));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], (12, 20, 30, 40, 400), "each field is the maximum over all lines");
+    }
+
+    #[test]
+    fn a_later_larger_line_in_an_appended_scan_raises_the_stored_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("proj").join("a.jsonl");
+        write_lines(&file, &[tokens_line("m", 10, 20, 30, 0, 5)]);
+        let mut state = ScanState::default();
+        run(dir.path(), &mut state);
+        append(&file, &format!("{}\n", tokens_line("m", 10, 20, 30, 0, 900)));
+        let stats = run(dir.path(), &mut state);
+        assert_eq!(state.records["m"].output, 900);
+        assert_eq!(stats.new_records, 0);
     }
 
     #[test]
@@ -728,6 +903,85 @@ mod tests {
                 .records
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn older_state_keeps_records_of_deleted_logs_and_corrects_low_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        // Log still on disk: the stored record is too low (output 5, real 250).
+        write_lines(&logs.join("p/a.jsonl"), &[tokens_line("alive", 10, 20, 30, 0, 5), tokens_line("alive", 10, 20, 30, 0, 250)]);
+        let mut old = ScanState::default();
+        run(&logs, &mut old);
+        old.records.get_mut("alive").unwrap().output = 5;
+        // A record whose log is long gone.
+        let mut gone = old.records["alive"].clone();
+        gone.message_id = "deleted-log".into();
+        gone.output = 42;
+        old.records.insert("deleted-log".into(), gone);
+        // Write it as a pre-version file: no `version` key.
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("version");
+        let path = dir.path().join("state.json");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = load_state_checked(&path);
+        assert!(loaded.note.is_none());
+        let mut state = loaded.state;
+        assert_eq!(state.version, STATE_VERSION);
+        assert!(state.files.is_empty(), "read marks are cleared so every log is read again");
+        assert_eq!(state.records.len(), 2, "records of deleted logs survive");
+
+        run(&logs, &mut state);
+        assert_eq!(state.records["alive"].output, 250, "too-low record is corrected in place");
+        assert_eq!(state.records["deleted-log"].output, 42);
+        assert!(!path.with_extension("json.bad").exists());
+
+        // Saved and loaded again at the current version: marks stay.
+        save_state(&path, &state).unwrap();
+        let again = load_state(&path);
+        assert_eq!(again.version, STATE_VERSION);
+        assert!(!again.files.is_empty());
+    }
+
+    #[test]
+    fn unreadable_state_is_set_aside_as_bad_keeping_only_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan_state.json");
+        let bad = dir.path().join("scan_state.json.bad");
+        fs::write(&path, "{ first").unwrap();
+        let loaded = load_state_checked(&path);
+        assert!(loaded.state.records.is_empty());
+        assert!(loaded.note.as_deref().unwrap().contains("scan_state.json.bad"));
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&bad).unwrap(), "{ first");
+
+        fs::write(&path, "{ second").unwrap();
+        assert!(load_state_checked(&path).note.is_some());
+        assert_eq!(fs::read_to_string(&bad).unwrap(), "{ second", "only the newest copy is kept");
+
+        // A missing file is a normal first run: no note, nothing set aside.
+        let none = load_state_checked(&dir.path().join("missing.json"));
+        assert!(none.note.is_none() && none.state.records.is_empty());
+    }
+
+    #[test]
+    fn dirty_only_when_the_scan_changed_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("proj").join("a.jsonl");
+        write_lines(&file, &[usage_line("msg_1", "claude-sonnet-5", 1)]);
+        let mut state = ScanState::default();
+        assert!(!state.dirty);
+        run(dir.path(), &mut state);
+        assert!(state.dirty);
+        state.dirty = false;
+
+        run(dir.path(), &mut state);
+        assert!(!state.dirty, "an unchanged scan must not ask for a save");
+
+        append(&file, &format!("{}\n", usage_line("msg_2", "claude-sonnet-5", 2)));
+        run(dir.path(), &mut state);
+        assert!(state.dirty);
     }
 
     #[test]

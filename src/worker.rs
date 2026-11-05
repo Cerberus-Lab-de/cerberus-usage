@@ -12,7 +12,7 @@ use chrono::{DateTime, Local, Utc};
 use crate::analytics::{ApiPoller, ApiStatus, Http};
 use crate::balance::{Alert, BalanceStatus, alerts, status as balance_status};
 use crate::settings::{Settings, load as load_settings};
-use crate::log_scan::{ScanState, ScanStats, load_state, save_state, scan};
+use crate::log_scan::{ScanState, ScanStats, load_state_checked, save_state, scan};
 use crate::pricing::PriceTable;
 use crate::report::{Report, build};
 use crate::secrets::SecretStore;
@@ -22,6 +22,11 @@ const PROGRESS_THROTTLE: Duration = Duration::from_millis(200);
 
 /// Default pause between two scans.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The scan state is written at most this often, and only when the scan changed something.
+/// Re-reading after a crash is idempotent (dedupe by message id takes the maximum), so the gap costs
+/// nothing but a few seconds of re-reading.
+pub const SAVE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// No `Debug` on purpose: it holds the secret store.
 #[derive(Clone)]
@@ -61,6 +66,8 @@ pub struct Snapshot {
     pub alerts: Vec<Alert>,
     /// Why `settings.json` could not be used (the last good settings stay in effect).
     pub settings_error: Option<String>,
+    /// One-time note from loading the saved state (e.g. an unreadable file was set aside).
+    pub state_note: Option<String>,
 }
 
 impl Snapshot {
@@ -81,8 +88,34 @@ impl Snapshot {
             balance: None,
             alerts: Vec::new(),
             settings_error: None,
+            state_note: None,
         }
     }
+}
+
+/// Decides when the scan state is written: not more often than [`SAVE_INTERVAL`]. Time is passed in.
+struct SaveGate {
+    last_save: Option<Instant>,
+}
+
+impl SaveGate {
+    fn due(&self, now: Instant) -> bool {
+        self.last_save.is_none_or(|t| now.saturating_duration_since(t) >= SAVE_INTERVAL)
+    }
+
+    fn saved(&mut self, now: Instant) {
+        self.last_save = Some(now);
+    }
+}
+
+/// Everything the worker thread owns between ticks.
+struct Core {
+    state: ScanState,
+    prices: PriceTable,
+    last_report: Option<Report>,
+    live: Live,
+    gate: SaveGate,
+    state_note: Option<String>,
 }
 
 /// Everything that changes between ticks besides the scan state.
@@ -126,10 +159,13 @@ impl Live {
 }
 
 /// Starts the worker thread. It exits on its own once the receiver is dropped
-/// (detected at the next send).
+/// (detected at the next send). If it dies anyway, the sender is dropped with it and the UI sees a
+/// disconnected channel.
 pub fn spawn_worker(cfg: WorkerConfig, notify: Box<dyn Fn() + Send>) -> Receiver<Snapshot> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || run(cfg, notify, tx));
+    std::thread::spawn(move || {
+        let _ = catch_unwind(AssertUnwindSafe(|| run(cfg, notify, tx)));
+    });
     rx
 }
 
@@ -142,35 +178,57 @@ fn deliver(tx: &Sender<Snapshot>, notify: &dyn Fn(), snapshot: Snapshot) -> bool
     true
 }
 
-fn run(cfg: WorkerConfig, notify: Box<dyn Fn() + Send>, tx: Sender<Snapshot>) {
-    let mut state = load_state(&cfg.state_path);
-    let prices = PriceTable::load(&cfg.prices_path);
-    let mut last_report: Option<Report> = None;
-    let mut live = Live {
-        api: ApiPoller::new(Arc::clone(&cfg.secrets), Arc::clone(&cfg.http), cfg.api_interval),
-        settings: Settings::default(),
-        settings_error: None,
-    };
+fn new_core(cfg: &WorkerConfig) -> Core {
+    let loaded = load_state_checked(&cfg.state_path);
+    Core {
+        state: loaded.state,
+        prices: PriceTable::load(&cfg.prices_path),
+        last_report: None,
+        live: Live {
+            api: ApiPoller::new(Arc::clone(&cfg.secrets), Arc::clone(&cfg.http), cfg.api_interval),
+            settings: Settings::default(),
+            settings_error: None,
+        },
+        gate: SaveGate { last_save: None },
+        state_note: loaded.note,
+    }
+}
 
+fn run(cfg: WorkerConfig, notify: Box<dyn Fn() + Send>, tx: Sender<Snapshot>) {
+    let mut core = new_core(&cfg);
     loop {
-        if !tick(&cfg, &mut state, &prices, &mut last_report, &mut live, &tx, notify.as_ref()) {
-            return;
+        if !guarded_tick(&cfg, &mut core, &tx, notify.as_ref(), Instant::now()) {
+            break;
         }
         std::thread::sleep(cfg.interval);
+    }
+    // Clean end (the window is gone): do not lose what the last ticks read.
+    if core.state.dirty {
+        let _ = save_state(&cfg.state_path, &core.state);
+    }
+}
+
+/// One tick that cannot end the worker: a panic anywhere in it becomes an error snapshot and the
+/// next tick tries again. Returns false when the receiver is gone.
+fn guarded_tick(cfg: &WorkerConfig, core: &mut Core, tx: &Sender<Snapshot>, notify: &dyn Fn(), now: Instant) -> bool {
+    match catch_unwind(AssertUnwindSafe(|| tick(cfg, core, tx, notify, now))) {
+        Ok(alive) => alive,
+        Err(_) => {
+            let mut snapshot = Snapshot::new(
+                core.last_report.clone(),
+                0,
+                0,
+                Some("Interner Fehler im Hintergrunddienst. Der nächste Durchlauf versucht es erneut.".to_string()),
+            );
+            snapshot.state_note = core.state_note.clone();
+            deliver(tx, notify, snapshot)
+        }
     }
 }
 
 /// One scan + report cycle. Returns false when the receiver is gone.
-fn tick(
-    cfg: &WorkerConfig,
-    state: &mut ScanState,
-    prices: &PriceTable,
-    last_report: &mut Option<Report>,
-    live: &mut Live,
-    tx: &Sender<Snapshot>,
-    notify: &dyn Fn(),
-) -> bool {
-    let first_scan = last_report.is_none();
+fn tick(cfg: &WorkerConfig, core: &mut Core, tx: &Sender<Snapshot>, notify: &dyn Fn(), now: Instant) -> bool {
+    let first_scan = core.last_report.is_none();
     let receiver_gone = Cell::new(false);
     let last_sent: Cell<Option<Instant>> = Cell::new(None);
 
@@ -194,7 +252,7 @@ fn tick(
         if cfg.logs_unavailable.is_some() {
             return Ok(ScanStats::default());
         }
-        scan(&cfg.logs_root, state, &progress)
+        scan(&cfg.logs_root, &mut core.state, &progress)
     }));
     if receiver_gone.get() {
         return false;
@@ -210,10 +268,15 @@ fn tick(
         ),
     };
 
-    if !scan_failed
-        && let Err(e) = save_state(&cfg.state_path, state)
-    {
-        error = Some(format!("Zustand konnte nicht gespeichert werden: {e}"));
+    // Written only when the scan changed something and not more often than every SAVE_INTERVAL.
+    if !scan_failed && core.state.dirty && core.gate.due(now) {
+        match save_state(&cfg.state_path, &core.state) {
+            Ok(()) => {
+                core.state.dirty = false;
+                core.gate.saved(now);
+            }
+            Err(e) => error = Some(format!("Zustand konnte nicht gespeichert werden: {e}")),
+        }
     }
     if error.is_none() {
         error = match &cfg.logs_unavailable {
@@ -227,26 +290,27 @@ fn tick(
     }
 
     // After a failed scan keep the previous report; otherwise build a fresh one.
-    let report = match (scan_failed, last_report.clone()) {
+    let report = match (scan_failed, core.last_report.clone()) {
         (true, Some(previous)) => previous,
-        _ => build(state, prices, Local::now()),
+        _ => build(&core.state, &core.prices, Local::now()),
     };
-    *last_report = Some(report.clone());
+    core.last_report = Some(report.clone());
 
     // The report goes out first with the last known API figures; the network call (up to
     // 30 s per request) must not hold it back. A changed API status follows as a second snapshot.
     let mut snapshot = Snapshot::new(Some(report), files, files, error);
-    live.reload_settings(cfg.settings_path.as_deref());
-    live.fill(&mut snapshot);
+    snapshot.state_note = core.state_note.clone();
+    core.live.reload_settings(cfg.settings_path.as_deref());
+    core.live.fill(&mut snapshot);
     if !deliver(tx, notify, snapshot.clone()) {
         return false;
     }
-    if live.api.due(Instant::now()) {
+    if core.live.api.due(Instant::now()) {
         // Same protection as the scan: a panic in the poll path must not end the worker.
-        let changed = catch_unwind(AssertUnwindSafe(|| live.api.refresh(Instant::now(), Local::now())))
+        let changed = catch_unwind(AssertUnwindSafe(|| core.live.api.refresh(Instant::now(), Local::now())))
             .unwrap_or(false);
         if changed {
-            live.fill(&mut snapshot);
+            core.live.fill(&mut snapshot);
             return deliver(tx, notify, snapshot);
         }
     }
@@ -256,6 +320,7 @@ fn tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_scan::load_state;
     use crate::analytics::testing::{FakeHttp, FakeStore, ok};
     use crate::analytics::{Http, NetError};
     use chrono::Utc;
@@ -321,9 +386,21 @@ mod tests {
         fs::write(path, json).unwrap();
     }
 
-    const BASELINE_JSON: &str = r#"{"baseline":{"amount_nano":50000000000,"at":"2026-11-01T00:00:00Z"},
-        "topups":[{"amount_nano":10000000000,"at":"2026-11-02T00:00:00Z"}],
-        "monthly_budget_nano":1,"low_balance_nano":100000000000}"#;
+    /// Settings with a baseline relative to now (3 days ago, whole hours), so the tests do not age:
+    /// the poll uses the real clock and a fixed date would eventually need more than one chunk.
+    fn baseline_json() -> String {
+        let at = |days: i64| {
+            let t = Utc::now() - chrono::Duration::days(days);
+            t.format("%Y-%m-%dT%H:00:00Z").to_string()
+        };
+        format!(
+            r#"{{"baseline":{{"amount_nano":50000000000,"at":"{}"}},
+            "topups":[{{"amount_nano":10000000000,"at":"{}"}}],
+            "monthly_budget_nano":1,"low_balance_nano":100000000000}}"#,
+            at(3),
+            at(2)
+        )
+    }
 
     /// Config with an admin key and a scripted API; also returns the fake to inspect its requests.
     fn config_with_api(
@@ -558,7 +635,7 @@ mod tests {
     fn baseline_without_admin_key_shows_undeducted_estimate() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, http) = config_with_api(dir.path(), None, vec![]);
-        write_settings(&cfg, BASELINE_JSON);
+        write_settings(&cfg, &baseline_json());
         let rx = spawn_worker(cfg, noop());
         let (_, snap) = until_report(&rx);
         let balance = snap.balance.expect("balance missing");
@@ -578,7 +655,7 @@ mod tests {
             Some("sk-ant-admin01-NICHTECHT-1234"),
             vec![Ok((429, "{}".to_string()))],
         );
-        write_settings(&cfg, BASELINE_JSON);
+        write_settings(&cfg, &baseline_json());
         let rx = spawn_worker(cfg, noop());
         let (_, _first) = until_report(&rx);
         let second = next_with_api(&rx);
@@ -593,7 +670,7 @@ mod tests {
         let totals = r#"{"data":[],"has_more":false,"next_page":null}"#;
         let since = r#"{"data":[{"starting_at":"2026-11-01T00:00:00Z","ending_at":"2026-11-01T01:00:00Z","group":{"model":"m"},"cost":{"amount":"20000.000000"}}],"has_more":false,"next_page":null}"#;
         let (cfg, http) = config_with_api(dir.path(), Some("sk-ant-admin01-NICHTECHT-1234"), vec![ok(totals), ok(since)]);
-        write_settings(&cfg, BASELINE_JSON);
+        write_settings(&cfg, &baseline_json());
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
         assert!(!first.balance.unwrap().cost_deducted);
@@ -636,7 +713,7 @@ mod tests {
         let rx = spawn_worker(cfg.clone(), noop());
         let (_, first) = until_report(&rx);
         assert!(first.balance.is_none());
-        write_settings(&cfg, BASELINE_JSON);
+        write_settings(&cfg, &baseline_json());
         let deadline = Instant::now() + WAIT;
         loop {
             let snap = rx.recv_timeout(WAIT).expect("no snapshot in time");
@@ -655,7 +732,7 @@ mod tests {
             Some("sk-ant-admin01-NICHTECHT-1234"),
             vec![Ok((401, "{}".to_string()))],
         );
-        write_settings(&cfg, BASELINE_JSON);
+        write_settings(&cfg, &baseline_json());
         let rx = spawn_worker(cfg, noop());
         let (_, first) = until_report(&rx);
         let second = next_with_api(&rx);
@@ -664,6 +741,125 @@ mod tests {
             let shown = format!("{snap:?}");
             assert!(!shown.contains("NICHTECHT") && !shown.contains("1234"), "snapshot leaked key");
         }
+    }
+
+    /// A core plus config for driving `tick` directly with an injected clock.
+    fn core_for(cfg: &WorkerConfig) -> Core {
+        new_core(cfg)
+    }
+
+    fn drain(rx: &Receiver<Snapshot>) -> Vec<Snapshot> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn state_is_saved_only_when_something_changed_and_at_most_every_five_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), Duration::from_secs(60));
+        write_log(&cfg.logs_root, "p/a.jsonl", &["m1"]);
+        let (tx, rx) = mpsc::channel();
+        let mut core = core_for(&cfg);
+        let t0 = Instant::now();
+
+        // First scan changed things: saved at once.
+        assert!(tick(&cfg, &mut core, &tx, &|| {}, t0));
+        assert_eq!(load_state(&cfg.state_path).records.len(), 1);
+        assert!(!core.state.dirty);
+
+        // Nothing changed: the file is not written again (prove it by removing it).
+        fs::remove_file(&cfg.state_path).unwrap();
+        assert!(tick(&cfg, &mut core, &tx, &|| {}, t0 + Duration::from_secs(60)));
+        assert!(!cfg.state_path.exists(), "an unchanged scan must not write the state");
+        assert!(tick(&cfg, &mut core, &tx, &|| {}, t0 + Duration::from_secs(120)));
+        assert!(!cfg.state_path.exists());
+
+        // A change inside the 5-minute window waits...
+        write_log(&cfg.logs_root, "p/b.jsonl", &["m2"]);
+        assert!(tick(&cfg, &mut core, &tx, &|| {}, t0 + Duration::from_secs(180)));
+        assert!(core.state.dirty, "changed but saved too recently");
+        assert!(!cfg.state_path.exists());
+        // ...but not forever: the report already shows the new record.
+        let last = drain(&rx).into_iter().rev().find(|s| s.report.is_some()).unwrap();
+        assert_eq!(last.report.unwrap().last_5h.requests, 2);
+
+        // Once the gap is over, it is written (all records, not just the new one).
+        assert!(tick(&cfg, &mut core, &tx, &|| {}, t0 + SAVE_INTERVAL + Duration::from_secs(1)));
+        assert!(!core.state.dirty);
+        assert_eq!(load_state(&cfg.state_path).records.len(), 2);
+    }
+
+    #[test]
+    fn dirty_state_is_written_when_the_worker_ends_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), Duration::from_millis(20));
+        write_log(&cfg.logs_root, "p/a.jsonl", &["m1"]);
+        let rx = spawn_worker(cfg.clone(), noop());
+        let (_, _) = until_report(&rx);
+        // A change that the 5-minute gate holds back from the periodic save.
+        write_log(&cfg.logs_root, "p/b.jsonl", &["m2"]);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let snap = rx.recv_timeout(WAIT).expect("no snapshot");
+            if snap.report.is_some_and(|r| r.last_5h.requests == 2) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(load_state(&cfg.state_path).records.len(), 1, "gate holds the periodic save back");
+        drop(rx);
+        let deadline = Instant::now() + WAIT;
+        while load_state(&cfg.state_path).records.len() < 2 {
+            assert!(Instant::now() < deadline, "worker did not save on its clean end");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn unreadable_state_file_is_set_aside_and_the_ui_gets_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), Duration::from_secs(60));
+        fs::create_dir_all(cfg.state_path.parent().unwrap()).unwrap();
+        fs::write(&cfg.state_path, "{ broken").unwrap();
+        write_log(&cfg.logs_root, "p/a.jsonl", &["m1"]);
+        let rx = spawn_worker(cfg.clone(), noop());
+        let (_, snap) = until_report(&rx);
+        assert!(snap.state_note.as_deref().is_some_and(|n| n.contains("nicht lesbar")), "{:?}", snap.state_note);
+        assert_eq!(snap.report.unwrap().last_5h.requests, 1, "rebuilt from the logs");
+        let mut bad = cfg.state_path.as_os_str().to_owned();
+        bad.push(".bad");
+        assert_eq!(fs::read_to_string(PathBuf::from(bad)).unwrap(), "{ broken");
+    }
+
+    #[test]
+    fn panic_anywhere_in_a_tick_becomes_an_error_snapshot_and_the_worker_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), Duration::from_millis(30));
+        write_log(&cfg.logs_root, "p/a.jsonl", &["m1"]);
+        // notify() panics once, on the delivery of the very first report (outside the scan's own guard).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let rx = spawn_worker(
+            cfg,
+            Box::new(move || {
+                // Call 1 is the progress poke inside the scan guard, call 2 the report delivery.
+                if counter.fetch_add(1, Ordering::SeqCst) == 1 {
+                    panic!("simulated crash outside the scan guard");
+                }
+            }),
+        );
+        let deadline = Instant::now() + WAIT;
+        let mut saw_error = false;
+        let mut later_report = false;
+        while Instant::now() < deadline && !(saw_error && later_report) {
+            let Ok(snap) = rx.recv_timeout(Duration::from_secs(2)) else { break };
+            if snap.scan_error.as_deref().is_some_and(|e| e.contains("Hintergrunddienst")) {
+                saw_error = true;
+            } else if saw_error && snap.report.is_some() && snap.scan_error.is_none() {
+                later_report = true;
+            }
+        }
+        assert!(saw_error, "the panic must be reported");
+        assert!(later_report, "the worker must keep delivering afterwards");
     }
 
     /// An `Http` that always panics, to prove the worker survives a crash in the poll path.
