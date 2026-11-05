@@ -28,7 +28,7 @@ use crate::settings::Settings;
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
-    DetailKind, EscTarget, GrowAction, GrowState, differs_from_request, esc_target, grow_cap, growth_for,
+    DetailKind, EscTarget, GrowAction, GrowState, differs_from_request, esc_may_close, esc_target, grow_cap, growth_for,
     mode_card_with_routing, shrink_to, toggle_detail,
 };
 use banners::{BannerInput, banner_items, banner_strip};
@@ -405,6 +405,8 @@ pub struct CerberusApp {
     drawer_open: bool,
     /// Section the drawer should scroll to once drawn.
     drawer_scroll: Option<Section>,
+    /// A text field had the focus at the end of the previous frame (see `esc_may_close`).
+    text_focused_last_frame: bool,
     /// Result messages shown directly under the settings field they belong to.
     notes: Notes,
     /// Height the app added to the window for an open detail.
@@ -489,6 +491,7 @@ impl CerberusApp {
             detail_openness: 0.0,
             drawer_open: false,
             drawer_scroll: None,
+            text_focused_last_frame: false,
             notes: Notes::new(),
             grown_by: 0.0,
             user_resized: false,
@@ -637,6 +640,7 @@ impl eframe::App for CerberusApp {
         );
         self.draw_drawer(&ctx, body);
         self.draw_confirm(&ctx);
+        self.text_focused_last_frame = ctx.egui_wants_keyboard_input();
     }
 }
 
@@ -682,7 +686,8 @@ impl CerberusApp {
 
     /// Esc closes the topmost layer: confirm dialog, drawer, detail. A focused text field keeps its Esc.
     fn handle_escape(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) || ctx.egui_wants_keyboard_input() {
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if !esc_may_close(esc, self.text_focused_last_frame, ctx.egui_wants_keyboard_input()) {
             return;
         }
         match esc_target(self.state.confirm.is_some(), self.drawer_open, self.detail.is_some()) {

@@ -141,6 +141,13 @@ pub fn esc_target(confirm_open: bool, drawer_open: bool, detail_open: bool) -> E
     }
 }
 
+/// Whether an Esc press may close a layer. egui drops the focus of a text field *before* the app runs
+/// the frame in which Esc arrives, so `wants_now` alone would let that first Esc through: the field's
+/// focus in the frame before counts too. The first Esc only leaves the field, a second one closes.
+pub fn esc_may_close(esc_pressed: bool, text_focused_last_frame: bool, wants_keyboard_now: bool) -> bool {
+    esc_pressed && !text_focused_last_frame && !wants_keyboard_now
+}
+
 /// 360 px, or the full window width when narrower than 560 px.
 pub fn drawer_width(window_width: f32) -> f32 {
     if window_width >= 560.0 { 360.0 } else { window_width }
@@ -518,5 +525,15 @@ mod tests {
         g.content_closing();
         g.content_grew();
         assert_eq!(frames(&mut g, &[0.0, 0.5, 1.0]), [None, None, Grow], "reopen cancels the shrink");
+    }
+
+    #[test]
+    fn first_esc_only_leaves_a_focused_text_field() {
+        // Field focused in the last frame: egui already dropped the focus, the Esc is still the field's.
+        assert!(!esc_may_close(true, true, false));
+        assert!(!esc_may_close(true, false, true));
+        // Second Esc, nothing focused: closes.
+        assert!(esc_may_close(true, false, false));
+        assert!(!esc_may_close(false, false, false));
     }
 }

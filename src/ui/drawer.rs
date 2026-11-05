@@ -312,6 +312,7 @@ impl CerberusApp {
                         }
                     });
                 });
+                ui.add_space(2.0);
                 egui::ScrollArea::vertical().id_salt("drawer-scroll").auto_shrink([false, false]).show(ui, |ui| {
                     // Leave room for the scrollbar so no row runs under it.
                     ui.set_width(ui.available_width() - 10.0);
