@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::paths::{DEFAULT_IMAGE_NAME, PathError, image_name, real_env, resolve_obsidian};
+use crate::paths::{DEFAULT_IMAGE_NAME, PathError, checked_image_name, is_safe_image, real_env, resolve_obsidian};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -62,7 +62,10 @@ pub fn launch(
         Ok(exe) => exe,
         Err(e) => return LaunchOutcome::ObsidianUnavailable(e),
     };
-    let image = image_name(&exe);
+    let image = match checked_image_name(&exe) {
+        Ok(n) => n,
+        Err(e) => return LaunchOutcome::ObsidianUnavailable(e),
+    };
     // Resolve the key first so a missing key never leads to closing Obsidian.
     let api_key = match mode {
         Mode::Max => None,
@@ -114,25 +117,27 @@ impl WindowsSystem {
         root.join("System32").join(name)
     }
 
-    fn configured_path(&self) -> Option<PathBuf> {
-        let path = self.settings_path.as_ref()?;
-        // A broken settings file yields defaults here (automatic search); the window reports the problem.
-        crate::settings::load(path).0.obsidian_path
-    }
-
-    /// Image name for process checks: from the resolved exe, else the default name.
-    pub fn current_image_name(&self) -> String {
-        self.resolve_obsidian().map(|p| image_name(&p)).unwrap_or_else(|_| DEFAULT_IMAGE_NAME.to_string())
+    /// Image name for process checks: from the resolved exe, else the default name. `None` when the
+    /// answer is unknown (unreadable settings file, unusable file name): the caller keeps its last state.
+    pub fn current_image_name(&self) -> Option<String> {
+        match self.resolve_obsidian() {
+            Ok(p) => checked_image_name(&p).ok(),
+            Err(PathError::SettingsUnreadable(_)) => None,
+            Err(_) => Some(DEFAULT_IMAGE_NAME.to_string()),
+        }
     }
 }
 
-/// True if a `tasklist /nh` line starts with exactly this image name (case-insensitive), so
-/// `Obsidian.exe` does not match `NotObsidian.exe`.
+/// True if a `tasklist /fo csv /nh` line has exactly this image name as its first quoted field
+/// (case-insensitive, whole name). `Obsidian.exe` does not match `NotObsidian.exe`, and names
+/// longer than 25 characters are compared in full.
 fn lists_image(tasklist_stdout: &str, image: &str) -> bool {
     let image = image.to_lowercase();
     tasklist_stdout.lines().any(|line| {
-        let line = line.trim_start().to_lowercase();
-        line.strip_prefix(&image).is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        line.trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())
+            .is_some_and(|first| first.to_lowercase() == image)
     })
 }
 
@@ -140,8 +145,11 @@ fn lists_image(tasklist_stdout: &str, image: &str) -> bool {
 impl System for WindowsSystem {
     fn obsidian_running(&self, image: &str) -> bool {
         use std::os::windows::process::CommandExt;
+        if !is_safe_image(image) {
+            return false;
+        }
         Command::new(Self::system32_tool("tasklist.exe"))
-            .args(["/fi", &format!("imagename eq {image}"), "/nh"])
+            .args(["/fi", &format!("imagename eq {image}"), "/fo", "csv", "/nh"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -152,6 +160,9 @@ impl System for WindowsSystem {
 
     fn request_close(&self, image: &str) {
         use std::os::windows::process::CommandExt;
+        if !is_safe_image(image) {
+            return;
+        }
         // No /f: Obsidian gets the chance to save and exit on its own.
         let _ = Command::new(Self::system32_tool("taskkill.exe"))
             .args(["/im", image])
@@ -183,7 +194,16 @@ impl System for WindowsSystem {
     }
 
     fn resolve_obsidian(&self) -> Result<PathBuf, PathError> {
-        resolve_obsidian(self.configured_path().as_deref(), &real_env, &|p| p.is_file())
+        let mut configured = None;
+        if let Some(path) = &self.settings_path {
+            // A missing file is normal (defaults); a broken one must not silently mean "search".
+            let (settings, error) = crate::settings::load(path);
+            if error.is_some() {
+                return Err(PathError::SettingsUnreadable(path.clone()));
+            }
+            configured = settings.obsidian_path;
+        }
+        resolve_obsidian(configured.as_deref(), &real_env, &|p| p.is_file())
     }
 
     fn sleep(&self, d: Duration) {
@@ -349,6 +369,40 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_settings_and_unsafe_names_never_close_or_spawn() {
+        let mut sys = FakeSystem::new(true, u32::MAX);
+        sys.resolve = Err(PathError::SettingsUnreadable(PathBuf::from(r"C:\d\settings.json")));
+        let out = launch(&sys, Mode::Max, None, true);
+        assert!(matches!(out, LaunchOutcome::ObsidianUnavailable(PathError::SettingsUnreadable(_))));
+        assert!(sys.calls().is_empty() && sys.images.borrow().is_empty());
+
+        // A resolved path whose file name is a wildcard never reaches tasklist/taskkill.
+        let mut sys = FakeSystem::new(true, u32::MAX);
+        sys.resolve = Ok(PathBuf::from(r"C:\Tools\*.exe"));
+        let out = launch(&sys, Mode::Max, None, true);
+        assert!(matches!(out, LaunchOutcome::ObsidianUnavailable(PathError::UnsafeImageName(_))));
+        assert!(sys.calls().is_empty() && sys.images.borrow().is_empty() && sys.spawned.borrow().is_empty());
+    }
+
+    #[test]
+    fn real_system_refuses_a_broken_settings_file_but_accepts_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sys = WindowsSystem { settings_path: Some(path.clone()) };
+        // Missing file: normal automatic search (the result depends on this machine, but is no settings error).
+        assert!(!matches!(sys.resolve_obsidian(), Err(PathError::SettingsUnreadable(_))));
+        assert!(sys.current_image_name().is_some());
+
+        std::fs::write(&path, "{ broken").unwrap();
+        assert_eq!(sys.resolve_obsidian(), Err(PathError::SettingsUnreadable(path.clone())));
+        assert_eq!(sys.current_image_name(), None, "poller keeps its last state");
+
+        // A relative path from a hand-edited file is refused as well.
+        std::fs::write(&path, r#"{"obsidian_path": "Obsidian.exe"}"#).unwrap();
+        assert!(matches!(sys.resolve_obsidian(), Err(PathError::NotAbsolute(_))));
+    }
+
+    #[test]
     fn renamed_exe_is_used_for_close_and_detection() {
         let mut sys = FakeSystem::new(true, 2);
         sys.resolve = Ok(PathBuf::from(r"C:\Tools\MyObs.exe"));
@@ -361,16 +415,22 @@ mod tests {
     #[test]
     fn tasklist_output_matching_is_case_insensitive() {
         let o = |s: &str| lists_image(s, "Obsidian.exe");
-        assert!(o("Obsidian.exe                  1234 Console   1   150.000 K"));
-        assert!(o("OBSIDIAN.EXE 1"));
-        assert!(o("\r\nobsidian.exe 1\r\n"));
+        let row = |n: &str| format!("\"{n}\",\"1234\",\"Console\",\"1\",\"150.000 K\"");
+        assert!(o(&row("Obsidian.exe")));
+        assert!(o(&row("OBSIDIAN.EXE")));
+        assert!(o(&format!("\r\n{}\r\n", row("obsidian.exe"))));
         assert!(!o("INFO: No tasks are running which match the specified criteria."));
         assert!(!o("INFO: Es werden keine Aufgaben ausgeführt, die den angegebenen Kriterien entsprechen."));
         assert!(!o(""));
         // Only the exact image name counts, in either direction.
-        assert!(!o("NotObsidian.exe 12 Console 1 10 K"));
-        assert!(!o("Obsidian.exe.bak 12 Console 1 10 K"));
-        assert!(lists_image("MyObs.exe 5 Console 1 10 K", "myobs.exe"));
+        assert!(!o(&row("NotObsidian.exe")));
+        assert!(!o(&row("Obsidian.exe.bak")));
+        // Names longer than 25 characters are compared in full.
+        let long = "MyVeryLongRenamedObsidian123.exe";
+        assert!(long.len() > 25);
+        assert!(lists_image(&row(long), long));
+        assert!(lists_image(&row(long), &long.to_uppercase()));
+        assert!(!lists_image(&row(&long[..25]), long));
     }
 
     #[test]

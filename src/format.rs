@@ -125,8 +125,8 @@ mod tests {
                 .unwrap()
                 .contains("konnte nicht gestartet werden")
         );
-        let missing = crate::paths::PathError::ConfiguredMissing(r"D:pps\Obsidian.exe".into());
+        let missing = crate::paths::PathError::ConfiguredMissing(r"D:\Apps\Obsidian.exe".into());
         let text = outcome_message(Mode::Max, LaunchOutcome::ObsidianUnavailable(missing)).unwrap();
-        assert!(text.contains(r"D:pps\Obsidian.exe") && text.contains("Einstellungen"), "{text}");
+        assert!(text.contains(r"D:\Apps\Obsidian.exe") && text.contains("Einstellungen"), "{text}");
     }
 }

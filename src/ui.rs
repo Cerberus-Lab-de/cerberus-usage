@@ -283,11 +283,14 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
         let mut last: Option<bool> = None;
         loop {
             // The image name follows the Obsidian path from the settings.
-            let now_running = sys.obsidian_running(&sys.current_image_name());
-            shared.store(now_running, Ordering::Relaxed);
-            if last != Some(now_running) {
-                last = Some(now_running);
-                ctx.request_repaint();
+            // Unknown image name (unreadable settings): keep the last answer.
+            if let Some(image) = sys.current_image_name() {
+                let now_running = sys.obsidian_running(&image);
+                shared.store(now_running, Ordering::Relaxed);
+                if last != Some(now_running) {
+                    last = Some(now_running);
+                    ctx.request_repaint();
+                }
             }
             std::thread::sleep(MODE_POLL_INTERVAL);
         }

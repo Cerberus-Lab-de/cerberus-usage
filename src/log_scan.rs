@@ -251,10 +251,13 @@ pub fn scan(
 ) -> io::Result<ScanStats> {
     // Numbers of two folders must not mix: a different root rebuilds the state. A state without a
     // root (old file) is kept and adopts this one.
-    if state.root.as_deref().is_some_and(|old| !same_root(old, root)) {
-        *state = ScanState::default();
+    // While the new folder does not exist (typo, unplugged drive) the state and the old root stay.
+    if root.is_dir() {
+        if state.root.as_deref().is_some_and(|old| !same_root(old, root)) {
+            *state = ScanState::default();
+        }
+        state.root = Some(root.to_path_buf());
     }
-    state.root = Some(root.to_path_buf());
     let mut files = Vec::new();
     match collect_jsonl(root, &mut files, true) {
         Ok(()) => {}
@@ -750,6 +753,25 @@ mod tests {
         assert_eq!(state.records.len(), 1);
         assert!(state.records.contains_key("b1"));
         assert_eq!(state.root.as_deref(), Some(b.path()));
+    }
+
+    #[test]
+    fn missing_new_root_keeps_the_state_until_it_exists() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write_lines(&a.path().join("p/a.jsonl"), &[usage_line("a1", "m", 5)]);
+        let mut state = ScanState::default();
+        run(a.path(), &mut state);
+
+        let gone = b.path().join("not-there");
+        run(&gone, &mut state);
+        assert_eq!(state.records.len(), 1, "typo or unplugged drive must not wipe the history");
+        assert_eq!(state.root.as_deref(), Some(a.path()));
+
+        std::fs::create_dir_all(&gone).unwrap();
+        run(&gone, &mut state);
+        assert!(state.records.is_empty());
+        assert_eq!(state.root.as_deref(), Some(gone.as_path()));
     }
 
     #[test]

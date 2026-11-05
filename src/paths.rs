@@ -14,6 +14,12 @@ pub enum PathError {
     /// A path from the settings that does not exist. Never falls back to the automatic search.
     ConfiguredMissing(PathBuf),
     NotAnExe(PathBuf),
+    /// A relative path could be resolved by the Windows search order to a different program.
+    NotAbsolute(PathBuf),
+    /// `settings.json` exists but cannot be read; launching must not silently use the automatic search.
+    SettingsUnreadable(PathBuf),
+    /// The executable's file name would be unsafe as a `tasklist`/`taskkill` image name.
+    UnsafeImageName(String),
     /// Neither `CLAUDE_CONFIG_DIR` nor `USERPROFILE` is usable.
     NoHome,
 }
@@ -33,6 +39,18 @@ impl fmt::Display for PathError {
             PathError::NotAnExe(p) => {
                 write!(f, "Der eingestellte Obsidian-Pfad ist keine .exe-Datei: {}. {SETTINGS_HINT}", p.display())
             }
+            PathError::NotAbsolute(p) => {
+                write!(f, "Der eingestellte Obsidian-Pfad ist kein vollständiger Pfad: {}. {SETTINGS_HINT}", p.display())
+            }
+            PathError::SettingsUnreadable(p) => write!(
+                f,
+                "Die Einstellungsdatei ist nicht lesbar: {}. Es wurde nichts geschlossen oder gestartet. Bitte die Datei prüfen oder löschen.",
+                p.display()
+            ),
+            PathError::UnsafeImageName(n) => write!(
+                f,
+                "Der Dateiname der Obsidian-Datei ist nicht zulässig: {n}. Es wurde nichts geschlossen oder gestartet. {SETTINGS_HINT}"
+            ),
             PathError::NoHome => write!(
                 f,
                 "Der Protokollordner lässt sich nicht bestimmen (weder CLAUDE_CONFIG_DIR noch USERPROFILE gesetzt). {SETTINGS_HINT}"
@@ -69,6 +87,11 @@ pub fn resolve_obsidian(
     exists: &dyn Fn(&Path) -> bool,
 ) -> Result<PathBuf, PathError> {
     if let Some(path) = configured {
+        // Checked here (not only when typing): a hand-edited file must never reach `Command::new`
+        // with a name the Windows search order could resolve to another program.
+        if !path.is_absolute() {
+            return Err(PathError::NotAbsolute(path.to_path_buf()));
+        }
         if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
             return Err(PathError::NotAnExe(path.to_path_buf()));
         }
@@ -99,6 +122,18 @@ pub fn image_name(exe: &Path) -> String {
     exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| DEFAULT_IMAGE_NAME.to_string())
 }
 
+/// Like [`image_name`], but refuses names with wildcards, quotes, redirection characters or path
+/// separators: `taskkill /im *.exe` must never be possible.
+pub fn checked_image_name(exe: &Path) -> Result<String, PathError> {
+    let name = image_name(exe);
+    if is_safe_image(&name) { Ok(name) } else { Err(PathError::UnsafeImageName(name)) }
+}
+
+pub fn is_safe_image(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|' | '/' | '\\' | ':') || c.is_control())
+}
+
 /// Default image name when no executable could be resolved.
 pub const DEFAULT_IMAGE_NAME: &str = "Obsidian.exe";
 
@@ -111,6 +146,11 @@ fn typed_path(input: &str) -> Option<PathBuf> {
 /// Settings with the Obsidian path from the text field. Empty resets to automatic.
 pub fn with_obsidian_path(s: &Settings, input: &str) -> Result<Settings, String> {
     let path = typed_path(input);
+    if let Some(p) = &path
+        && !p.is_absolute()
+    {
+        return Err("Der Obsidian-Pfad muss ein vollständiger Pfad sein. Es wurde nichts geändert.".to_string());
+    }
     if let Some(p) = &path
         && !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
     {
@@ -184,6 +224,34 @@ mod tests {
     }
 
     #[test]
+    fn relative_configured_paths_are_rejected() {
+        for rel in ["Obsidian.exe", r"..\x\Obsidian.exe", r"C:Obsidian.exe", r"\Obsidian.exe"] {
+            let p = PathBuf::from(rel);
+            // Even if "it exists", a relative path is refused.
+            let err = resolve_obsidian(Some(&p), &full_env(), &|_| true).unwrap_err();
+            assert_eq!(err, PathError::NotAbsolute(p), "{rel}");
+        }
+        let base = Settings::default();
+        assert!(with_obsidian_path(&base, "Obsidian.exe").is_err());
+        assert!(with_obsidian_path(&base, r"..\x\Obsidian.exe").is_err());
+        // Automatic candidates stay absolute: relative env values are skipped.
+        let env = env_of(&[("LOCALAPPDATA", "rel"), ("ProgramFiles", "")]);
+        let PathError::ObsidianNotFound { searched } = resolve_obsidian(None, &env, &|_| true).unwrap_err() else {
+            panic!()
+        };
+        assert!(searched.is_empty());
+    }
+
+    #[test]
+    fn image_names_with_wildcards_or_separators_are_refused() {
+        for bad in [r"C:\Tools\*.exe", r"C:\Tools\a?.exe", r"C:\Tools\a|b.exe", r"C:\Tools\a<b.exe", "C:\\Tools\\a\"b.exe"] {
+            assert!(matches!(checked_image_name(Path::new(bad)), Err(PathError::UnsafeImageName(_))), "{bad}");
+        }
+        assert_eq!(checked_image_name(Path::new(r"C:\Tools\My Obs (1).exe")).unwrap(), "My Obs (1).exe");
+        assert!(!is_safe_image("") && !is_safe_image("a/b.exe") && !is_safe_image("a:b.exe"));
+    }
+
+    #[test]
     fn configured_path_must_be_an_exe() {
         let cfg = PathBuf::from(r"D:\Apps\Obsidian\readme.txt");
         let err = resolve_obsidian(Some(&cfg), &full_env(), &exists_in(&[r"D:\Apps\Obsidian\readme.txt"])).unwrap_err();
@@ -233,8 +301,7 @@ mod tests {
         let s = with_obsidian_path(&base, r#"  "D:\Apps\Obsidian.exe"  "#).unwrap();
         assert_eq!(s.obsidian_path, Some(PathBuf::from(r"D:\Apps\Obsidian.exe")));
         assert_eq!(s.monthly_budget_nano, Some(5), "other settings stay");
-        assert!(with_obsidian_path(&s, r"D:\Apps
-otes.txt").is_err());
+        assert!(with_obsidian_path(&s, r"D:\Apps\notes.txt").is_err());
         assert_eq!(with_obsidian_path(&s, "  ").unwrap().obsidian_path, None);
 
         let s = with_logs_root(&base, r"E:\logs").unwrap();

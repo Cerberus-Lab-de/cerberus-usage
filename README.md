@@ -60,7 +60,7 @@ Suchreihenfolge Obsidian:
 3. `%ProgramFiles%\Obsidian\Obsidian.exe`
 4. `%ProgramFiles(x86)%\Obsidian\Obsidian.exe`
 
-Der Prozessname zum Erkennen und Schließen kommt aus dem Dateinamen der gefundenen `.exe`. Eine Änderung gilt beim nächsten Start von Obsidian.
+Der Prozessname zum Erkennen und Schließen kommt aus dem Dateinamen der gefundenen `.exe`. Eine Änderung gilt beim nächsten Start von Obsidian. Wer den Pfad ändert, während Obsidian läuft, schließt Obsidian vorher; der neue Pfad greift erst beim nächsten Start.
 
 Suchreihenfolge Protokolle:
 
