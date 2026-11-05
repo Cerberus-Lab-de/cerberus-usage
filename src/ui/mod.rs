@@ -1,5 +1,7 @@
 //! The single egui window: mode display, launcher buttons, usage cards and tables, key settings.
 
+pub mod theme;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -388,6 +390,7 @@ pub struct CerberusApp {
 impl CerberusApp {
     fn new(cc: &eframe::CreationContext<'_>, icon: &egui::IconData) -> Self {
         let ctx = cc.egui_ctx.clone();
+        theme::apply(&ctx);
         let control = WindowControl::new();
         let tray = match Tray::new(&ctx, &control, icon) {
             Ok(t) => Some(t),
@@ -1131,7 +1134,7 @@ fn data_dir() -> PathBuf {
 
 /// Opens the window and the tray icon and runs until "Beenden".
 pub fn run() -> eframe::Result {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
         .expect("embedded icon is a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
