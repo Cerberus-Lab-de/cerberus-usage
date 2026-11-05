@@ -62,6 +62,10 @@ pub struct Report {
     pub by_project: Vec<(String, Bucket)>,
     /// Current local calendar month (same scope as `month`). Sorted by cost descending, ties by name ascending.
     pub by_model: Vec<(String, Bucket)>,
+    /// Local today only. Sorted like `by_project`.
+    pub today_by_project: Vec<(String, Bucket)>,
+    /// Local today only. Sorted like `by_model`.
+    pub today_by_model: Vec<(String, Bucket)>,
     /// Last 31 local days including today, only days with usage, newest day first.
     pub by_day: Vec<(NaiveDate, Bucket)>,
     pub pause: Option<Pause>,
@@ -85,6 +89,8 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
     let mut by_project: HashMap<String, Bucket> = HashMap::new();
     let mut by_model: HashMap<String, Bucket> = HashMap::new();
     let mut by_day: HashMap<NaiveDate, Bucket> = HashMap::new();
+    let mut today_by_project: HashMap<String, Bucket> = HashMap::new();
+    let mut today_by_model: HashMap<String, Bucket> = HashMap::new();
 
     for r in state.records.values() {
         let cost = prices.cost_nanousd(r);
@@ -92,6 +98,8 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
 
         if day == today {
             report.today.add(r, cost);
+            today_by_project.entry(r.project.clone()).or_default().add(r, cost);
+            today_by_model.entry(r.model.clone()).or_default().add(r, cost);
         }
         if day.year() == today.year() && day.month() == today.month() {
             report.month.add(r, cost);
@@ -108,6 +116,8 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
 
     report.by_project = sorted_by_cost(by_project);
     report.by_model = sorted_by_cost(by_model);
+    report.today_by_project = sorted_by_cost(today_by_project);
+    report.today_by_model = sorted_by_cost(today_by_model);
     let mut days: Vec<_> = by_day.into_iter().collect();
     days.sort_by(|a, b| b.0.cmp(&a.0));
     report.by_day = days;
@@ -349,5 +359,23 @@ mod tests {
         let rep = build(&st, &PriceTable::embedded(), cet("2026-11-04T12:00:00Z"));
         let days: Vec<_> = rep.by_day.iter().map(|(d, _)| d.to_string()).collect();
         assert_eq!(days, ["2026-11-04", "2026-10-05"]);
+    }
+
+    #[test]
+    fn today_breakdown_counts_only_today_by_project_and_model() {
+        let mut a = rec("a", "2026-11-04T10:00:00Z", "claude-opus-5-5", "alpha");
+        a.output = 1_000;
+        let mut b = rec("b", "2026-11-04T10:01:00Z", "claude-sonnet-5-5", "beta");
+        b.output = 100_000;
+        let c = rec("c", "2026-11-04T10:02:00Z", "claude-opus-5-5", "alpha");
+        let earlier = rec("d", "2026-11-03T10:00:00Z", "old-model", "old-project");
+        let st = state(vec![a, b, c, earlier], vec![]);
+        let rep = build(&st, &PriceTable::embedded(), cet("2026-11-04T12:00:00Z"));
+        let projects: Vec<_> = rep.today_by_project.iter().map(|(n, b)| (n.as_str(), b.requests)).collect();
+        assert_eq!(projects, [("beta", 1), ("alpha", 2)]);
+        let models: Vec<_> = rep.today_by_model.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(models, ["claude-sonnet-5-5", "claude-opus-5-5"]);
+        // The month lists still include the earlier day.
+        assert_eq!(rep.by_project.len(), 3);
     }
 }

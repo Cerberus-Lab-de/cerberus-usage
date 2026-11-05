@@ -1,0 +1,292 @@
+//! Pure, egui-free decisions behind the cockpit: mode card, detail toggling, day bars,
+//! drawer width, Esc order and window growth.
+
+use chrono::{Duration, NaiveDate};
+
+use crate::report::Bucket;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeDisplay {
+    Max,
+    ApiKey,
+    /// Obsidian runs, but not (or no longer verifiably) started by this app.
+    Unknown,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Only for "Max, started by the app".
+    Green,
+    Amber,
+    AmberOutline,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeCard {
+    pub tone: Tone,
+    pub title: &'static str,
+    pub hint: &'static str,
+}
+
+pub fn mode_card(m: ModeDisplay) -> ModeCard {
+    match m {
+        ModeDisplay::Max => ModeCard {
+            tone: Tone::Green,
+            title: "Max",
+            hint: "Keine API-Kosten, sofern in Claude keine andere Anmeldung eingerichtet ist.",
+        },
+        ModeDisplay::ApiKey => ModeCard { tone: Tone::Amber, title: "API-Key", hint: "Kosten nach Verbrauch." },
+        ModeDisplay::Unknown => ModeCard {
+            tone: Tone::AmberOutline,
+            title: "Modus unbekannt",
+            hint: "Kosten möglich. Über die App neu starten.",
+        },
+        ModeDisplay::Closed => ModeCard {
+            tone: Tone::Neutral,
+            title: "Obsidian geschlossen",
+            hint: "Starte Obsidian mit Max oder API-Key.",
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailKind {
+    Today,
+    Month,
+    Balance,
+    Max,
+}
+
+/// Clicking the open detail closes it; clicking another one switches to it.
+pub fn toggle_detail(open: Option<DetailKind>, clicked: DetailKind) -> Option<DetailKind> {
+    if open == Some(clicked) { None } else { Some(clicked) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayBar {
+    pub date: NaiveDate,
+    pub cost_nano: u64,
+    /// Requests happened, but none could be priced.
+    pub unpriced_only: bool,
+    pub is_today: bool,
+}
+
+/// Exactly `days` bars, oldest first, ending with `today`. Missing days are zero.
+pub fn day_bars(by_day: &[(NaiveDate, Bucket)], today: NaiveDate, days: usize) -> Vec<DayBar> {
+    (0..days)
+        .map(|i| {
+            let date = today - Duration::days((days - 1 - i) as i64);
+            let b = by_day.iter().find(|(d, _)| *d == date).map(|(_, b)| *b).unwrap_or_default();
+            DayBar {
+                date,
+                cost_nano: b.cost_nano,
+                unpriced_only: b.requests > 0 && b.unpriced_requests == b.requests,
+                is_today: date == today,
+            }
+        })
+        .collect()
+}
+
+/// Pixel fraction in [0, 1]; the only place money meets `f32`.
+pub fn bar_fraction(cost_nano: u64, max_nano: u64) -> f32 {
+    if max_nano == 0 {
+        return 0.0;
+    }
+    ((cost_nano as f64 / max_nano as f64) as f32).clamp(0.0, 1.0)
+}
+
+/// Shortens to `max_chars` characters (chars, not bytes) with a trailing `…`.
+pub fn truncate_name(name: &str, max_chars: usize) -> (String, bool) {
+    if name.chars().count() <= max_chars {
+        return (name.to_string(), false);
+    }
+    let mut s: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+    s.push('…');
+    (s, true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscTarget {
+    Confirm,
+    Drawer,
+    Detail,
+    Nothing,
+}
+
+/// Esc closes the topmost layer first: confirm, then drawer, then detail.
+pub fn esc_target(confirm_open: bool, drawer_open: bool, detail_open: bool) -> EscTarget {
+    if confirm_open {
+        EscTarget::Confirm
+    } else if drawer_open {
+        EscTarget::Drawer
+    } else if detail_open {
+        EscTarget::Detail
+    } else {
+        EscTarget::Nothing
+    }
+}
+
+/// 360 px, or the full window width when narrower than 560 px.
+pub fn drawer_width(window_width: f32) -> f32 {
+    if window_width >= 560.0 { 360.0 } else { window_width }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Growth {
+    pub target_height: f32,
+    pub added: f32,
+}
+
+/// Height to grow to when content needs more room; never beyond the work area, never when the
+/// user resized the window.
+pub fn grow_for_content(current: f32, needed: f32, work_area: f32, user_resized: bool) -> Option<Growth> {
+    if user_resized || needed <= current {
+        return None;
+    }
+    let target_height = needed.min(work_area);
+    let added = target_height - current;
+    if added <= 0.0 {
+        return None;
+    }
+    Some(Growth { target_height, added })
+}
+
+/// Returns only the height the app added; nothing when the user resized.
+pub fn shrink_after_collapse(current: f32, added: f32, user_resized: bool) -> Option<f32> {
+    if user_resized || added <= 0.0 {
+        return None;
+    }
+    Some(current - added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn mode_card_green_only_for_max() {
+        assert_eq!(mode_card(ModeDisplay::Max).tone, Tone::Green);
+        assert_eq!(mode_card(ModeDisplay::ApiKey).tone, Tone::Amber);
+        assert_eq!(mode_card(ModeDisplay::Unknown).tone, Tone::AmberOutline);
+        assert_eq!(mode_card(ModeDisplay::Closed).tone, Tone::Neutral);
+        for m in [ModeDisplay::ApiKey, ModeDisplay::Unknown, ModeDisplay::Closed] {
+            assert_ne!(mode_card(m).tone, Tone::Green);
+        }
+    }
+
+    #[test]
+    fn mode_card_texts_match_spec() {
+        assert!(mode_card(ModeDisplay::Max).hint.contains("sofern in Claude keine andere Anmeldung"));
+        assert_eq!(mode_card(ModeDisplay::Max).title, "Max");
+        assert_eq!(mode_card(ModeDisplay::ApiKey).title, "API-Key");
+        assert_eq!(mode_card(ModeDisplay::Unknown).title, "Modus unbekannt");
+        assert_eq!(mode_card(ModeDisplay::Closed).title, "Obsidian geschlossen");
+        assert_eq!(mode_card(ModeDisplay::Closed).hint, "Starte Obsidian mit Max oder API-Key.");
+    }
+
+    #[test]
+    fn toggle_opens_switches_and_closes() {
+        assert_eq!(toggle_detail(None, DetailKind::Month), Some(DetailKind::Month));
+        assert_eq!(toggle_detail(Some(DetailKind::Month), DetailKind::Month), None);
+        assert_eq!(toggle_detail(Some(DetailKind::Today), DetailKind::Month), Some(DetailKind::Month));
+    }
+
+    #[test]
+    fn day_bars_fill_missing_days_and_mark_today() {
+        let today = d(2026, 11, 5);
+        let b = Bucket { requests: 2, cost_nano: 5, ..Default::default() };
+        let by_day = vec![(today, b), (d(2026, 11, 1), b)];
+        let bars = day_bars(&by_day, today, 30);
+        assert_eq!(bars.len(), 30);
+        assert_eq!(bars[0].date, d(2026, 10, 7));
+        assert_eq!(bars[29].date, today);
+        assert!(bars[29].is_today);
+        assert!(bars[..29].iter().all(|x| !x.is_today));
+        assert_eq!(bars[29].cost_nano, 5);
+        assert_eq!(bars[25].date, d(2026, 11, 1));
+        assert_eq!(bars[25].cost_nano, 5);
+        assert_eq!(bars[28].cost_nano, 0);
+        assert!(!bars[28].unpriced_only);
+    }
+
+    #[test]
+    fn day_bars_mark_unpriced_only_days() {
+        let today = d(2026, 11, 5);
+        let only = Bucket { requests: 3, unpriced_requests: 3, ..Default::default() };
+        let mixed = Bucket { requests: 3, unpriced_requests: 1, cost_nano: 9, ..Default::default() };
+        let by_day = vec![(today, only), (d(2026, 11, 4), mixed)];
+        let bars = day_bars(&by_day, today, 3);
+        assert!(bars[2].unpriced_only);
+        assert_eq!(bars[2].cost_nano, 0);
+        assert!(!bars[1].unpriced_only);
+        assert!(!bars[0].unpriced_only);
+    }
+
+    #[test]
+    fn bar_fraction_is_clamped_and_zero_safe() {
+        assert_eq!(bar_fraction(5, 0), 0.0);
+        assert_eq!(bar_fraction(0, 0), 0.0);
+        assert_eq!(bar_fraction(20, 10), 1.0);
+        assert_eq!(bar_fraction(5, 10), 0.5);
+        assert_eq!(bar_fraction(0, 10), 0.0);
+    }
+
+    #[test]
+    fn truncate_name_keeps_short_and_marks_cut() {
+        assert_eq!(truncate_name("abc", 10), ("abc".to_string(), false));
+        assert_eq!(truncate_name("abcde", 5), ("abcde".to_string(), false));
+        let (s, cut) = truncate_name("Überlängenprojekt", 6);
+        assert!(cut);
+        assert_eq!(s, "Überl…");
+        assert_eq!(s.chars().count(), 6);
+    }
+
+    #[test]
+    fn esc_closes_topmost_layer_first() {
+        assert_eq!(esc_target(true, true, true), EscTarget::Confirm);
+        assert_eq!(esc_target(false, true, true), EscTarget::Drawer);
+        assert_eq!(esc_target(false, false, true), EscTarget::Detail);
+        assert_eq!(esc_target(false, false, false), EscTarget::Nothing);
+    }
+
+    #[test]
+    fn drawer_is_360_or_full_width_below_560() {
+        assert_eq!(drawer_width(800.0), 360.0);
+        assert_eq!(drawer_width(560.0), 360.0);
+        assert_eq!(drawer_width(559.0), 559.0);
+        assert_eq!(drawer_width(420.0), 420.0);
+    }
+
+    #[test]
+    fn window_growth_never_exceeds_work_area() {
+        let g = grow_for_content(640.0, 900.0, 800.0, false).unwrap();
+        assert_eq!(g.target_height, 800.0);
+        assert_eq!(g.added, 160.0);
+        let g = grow_for_content(640.0, 700.0, 800.0, false).unwrap();
+        assert_eq!((g.target_height, g.added), (700.0, 60.0));
+        assert!(grow_for_content(640.0, 600.0, 800.0, false).is_none());
+        assert!(grow_for_content(640.0, 640.0, 800.0, false).is_none());
+        // Already at or above the work area: nothing to add.
+        assert!(grow_for_content(800.0, 900.0, 800.0, false).is_none());
+        assert!(grow_for_content(820.0, 900.0, 800.0, false).is_none());
+    }
+
+    #[test]
+    fn window_growth_respects_user_resize() {
+        assert!(grow_for_content(640.0, 900.0, 800.0, true).is_none());
+        assert!(shrink_after_collapse(800.0, 160.0, true).is_none());
+    }
+
+    #[test]
+    fn window_shrinks_only_by_what_it_added() {
+        assert_eq!(shrink_after_collapse(800.0, 160.0, false), Some(640.0));
+        assert_eq!(shrink_after_collapse(800.0, 0.0, false), None);
+        assert_eq!(shrink_after_collapse(800.0, -5.0, false), None);
+    }
+}

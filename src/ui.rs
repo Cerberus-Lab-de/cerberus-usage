@@ -32,14 +32,7 @@ const MODE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// After a successful start, "not running" polls are ignored for this long (the process may not show up yet).
 const START_GRACE: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModeDisplay {
-    Max,
-    ApiKey,
-    /// Obsidian runs, but not (or no longer verifiably) started by this app.
-    Unknown,
-    Closed,
-}
+pub use crate::view::ModeDisplay;
 
 /// What to show as the current mode. `started_by_app` is the mode of the last start by this app.
 pub fn mode_display(started_by_app: Option<Mode>, running: bool) -> ModeDisplay {

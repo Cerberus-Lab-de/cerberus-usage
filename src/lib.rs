@@ -17,3 +17,4 @@ pub mod crash;
 pub mod tray;
 pub mod cards;
 pub mod ui;
+pub mod view;
