@@ -4,7 +4,8 @@ Kleine Windows-App im Infobereich (Tray). Sie startet Obsidian wahlweise mit dem
 
 ## Was die App kann
 
-- **Obsidian starten** im Max-Modus (ohne `ANTHROPIC_API_KEY`) oder im API-Key-Modus. Der Key wird nur an den Obsidian-Prozess übergeben, nie dauerhaft gesetzt.
+- **Obsidian starten** im Max-Modus (ohne `ANTHROPIC_API_KEY`) oder im API-Key-Modus. Der Key wird nur an den Obsidian-Prozess übergeben, nie dauerhaft gesetzt. Beide Modi entfernen auch `ANTHROPIC_AUTH_TOKEN` für den Obsidian-Prozess, weil er sonst jede andere Anmeldung übersteuert. Ist `ANTHROPIC_BASE_URL` oder `CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY` gesetzt, bleibt es unverändert, aber das Fenster warnt und nennt den Namen (nie den Wert). Die Anzeige „Max“ bzw. „API-Key“ gilt nur, sofern in Claude selbst (`apiKeyHelper`, `env`-Block in den Claude-Einstellungen) keine andere Anmeldung eingerichtet ist; das kann die App nicht sehen.
+- **Prüfung, ob Obsidian läuft**: schlägt sie fehl (z. B. `tasklist` gesperrt), schließt und startet die App nichts und sagt es. Die Modusanzeige behält dann ihren letzten Stand.
 - **Lokal geschätzte Kosten** aus den Claude-Protokollen unter `%USERPROFILE%\.claude\projects` (heute, Monat, letzte 5 Std., nach Projekt und Modell). Es werden nur Metadaten gelesen, nie Inhalte. Das ist eine Rechnung nach Listenpreis, nicht die Rechnung von Anthropic.
 - **API-Kosten laut Anthropic** über die Kosten-API, wenn ein Admin-Key gespeichert ist.
 - **Guthaben (geschätzt)**: Startwert aus der Console, plus Aufladungen, minus die API-Kosten seit dem Startwert.
@@ -44,7 +45,8 @@ Im Windows-Anmeldeinformationsspeicher (Credential Manager), Dienst `cerberus-us
 Unter `%LOCALAPPDATA%\CerberusUsage\`:
 
 - `settings.json`: Startwert, Aufladungen, Monatsbudget, Warngrenze (Beträge in Nano-USD)
-- `scan_state.json`: Lesestand der Claude-Protokolle
+- `scan_state.json`: Lesestand der Claude-Protokolle und die gelesenen Verbrauchsdaten. Wird nur bei Änderungen und höchstens alle 5 Minuten geschrieben (und beim sauberen Ende). Wiederholte Protokollzeilen einer Nachricht zählen mit dem jeweils höchsten Wert je Feld. Nach einem Update dieser Zählweise liest die App alle vorhandenen Protokolle einmal neu (einige Sekunden), die Daten schon gelöschter Protokolle bleiben erhalten. Ist die Datei nicht lesbar, wird sie als `scan_state.json.bad` zur Seite gelegt (nur die neueste Kopie) und das Fenster sagt es einmal.
+- `crash.log`: kleine Textdatei mit Zeit, Ort und Meldung bei Abstürzen. Kann das Fenster gar nicht starten, zeigt die App eine Fehlermeldung.
 - `prices.json` (optional): eigene Preisliste, überschreibt die eingebaute
 
 Ist `settings.json` kaputt, zeigt die App eine Meldung mit dem Pfad und sperrt das Speichern, damit die Datei nicht überschrieben wird.
@@ -72,8 +74,12 @@ Ohne `USERPROFILE` zeigt das Fenster einen Hinweis und liest nichts. Eine Änder
 
 ## Einschränkung: Einzelkonto
 
-Die Kosten-API gibt es nur für Organisations-Konten. Bei einem Einzelkonto antwortet Anthropic mit „nicht verfügbar“. Die Karte „API-Kosten laut Anthropic“ sagt das dann offen, und das Guthaben wird ohne Kostenabzug gezeigt: Startwert plus Aufladungen. Wer den Betrag aus der Console neu einträgt, hat wieder einen frischen Stand. Mit einer Organisation und einem Admin-Key werden die Kosten seit dem Startwert automatisch abgezogen.
+Die Kosten-API gibt es nur für Organisations-Konten. Bei einem Einzelkonto antwortet Anthropic mit „nicht verfügbar“. Die Karte „API-Kosten laut Anthropic“ sagt das dann offen, und das Guthaben wird ohne Kostenabzug gezeigt: Startwert plus Aufladungen. Wer den Betrag aus der Console neu einträgt, hat wieder einen frischen Stand. Mit einer Organisation und einem Admin-Key werden die Kosten seit dem Startwert automatisch abgezogen. Ohne Kosten-API wird die Budget-Warnung nie ausgelöst (sie vergleicht die API-Kosten des Monats mit der Grenze), die Guthaben-Warnung sieht nur Startwert und Aufladungen; die Einstellungen sagen das neben den Grenzen. Scheitert nur die Abfrage „seit Startwert“, bleiben Heute und Monat aktuell und nur das Guthaben zeigt den Fehler. Ein Startwert älter als 365 Tage wird nicht abgefragt („Startwert zu alt, bitte neu eintragen“).
 
 ## Alle Kosten sind Schätzungen
 
 Lokale Kosten sind nach Listenpreis berechnet. Die Werte der Kosten-API können laut Anthropic mehrere Stunden hinterherhinken (etwa 4 Std., bis zu 24 Std.). Das Guthaben ist eine Rechnung aus Startwert, Aufladungen und Kosten, nicht der Kontostand der Console.
+
+## Fenster und Beenden
+
+Das X-Symbol versteckt das Fenster im Tray (auch wenn es minimiert ist). Ein Klick auf das Tray-Symbol holt ein minimiertes Fenster zurück. „Beenden“ im Tray-Menü wartet, falls gerade ein Start läuft, bis dieser fertig ist, und beendet die App dann.

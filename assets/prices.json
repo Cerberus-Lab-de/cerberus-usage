@@ -1,11 +1,12 @@
 {
-  "as_of": "2026-11-04",
+  "as_of": "2026-11-05",
   "unit": "milli-USD per MTok (tokens x rate = nano-USD)",
-  "source": "Anthropic pricing documentation, checked 2026-11-04",
+  "source": "Anthropic pricing documentation, checked 2026-11-05",
   "notes": [
     "Footnote 3: Sonnet 5 at $2/$10 per MTok is now the standard price; the announced increase did not happen.",
     "Footnote 2: Opus 5.5 and Sonnet 5.5 cache hits are 0.05x base input ($0.20 and $0.10 per MTok).",
     "Haiku 5.5 is tiered by prompt length (input + cache_read + cache_5m + cache_1h): up to 100000 tokens low tier, above that high tier.",
+    "Fable 5.1 / Mythos 5.1 (cache hits $0.25) are not listed: their API ids are not confirmed, so no price is guessed.",
     "Fast speed and US-only inference (inference_geo us) are priced differently and are not estimated."
   ],
   "models": [
@@ -15,6 +16,16 @@
     { "id": "claude-opus-4-8",   "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
     { "id": "claude-sonnet-5-5", "input": 2000,  "cache_5m": 2500,  "cache_1h": 4000,  "cache_read": 100,  "output": 10000 },
     { "id": "claude-sonnet-5",   "input": 2000,  "cache_5m": 2500,  "cache_1h": 4000,  "cache_read": 200,  "output": 10000 },
+    { "id": "claude-opus-4-7",   "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
+    { "id": "claude-opus-4-6",   "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
+    { "id": "claude-opus-4-5",   "input": 5000,  "cache_5m": 6250,  "cache_1h": 10000, "cache_read": 500,  "output": 25000 },
+    { "id": "claude-opus-4-1",   "input": 15000, "cache_5m": 18750, "cache_1h": 30000, "cache_read": 1500, "output": 75000 },
+    { "id": "claude-opus-4",     "input": 15000, "cache_5m": 18750, "cache_1h": 30000, "cache_read": 1500, "output": 75000 },
+    { "id": "claude-sonnet-4-6", "input": 3000,  "cache_5m": 3750,  "cache_1h": 6000,  "cache_read": 300,  "output": 15000 },
+    { "id": "claude-sonnet-4-5", "input": 3000,  "cache_5m": 3750,  "cache_1h": 6000,  "cache_read": 300,  "output": 15000 },
+    { "id": "claude-sonnet-4",   "input": 3000,  "cache_5m": 3750,  "cache_1h": 6000,  "cache_read": 300,  "output": 15000 },
+    { "id": "claude-haiku-4-5",  "input": 1000,  "cache_5m": 1250,  "cache_1h": 2000,  "cache_read": 100,  "output": 5000 },
+    { "id": "claude-haiku-3-5",  "input": 800,   "cache_5m": 1000,  "cache_1h": 1600,  "cache_read": 80,   "output": 4000 },
     { "id": "claude-haiku-5-5",  "max_prompt_tokens": 100000, "input": 100, "cache_5m": 125, "cache_1h": 200, "cache_read": 10, "output": 500 },
     { "id": "claude-haiku-5-5",  "input": 500, "cache_5m": 625, "cache_1h": 1000, "cache_read": 50, "output": 2500 }
   ]

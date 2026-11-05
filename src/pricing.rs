@@ -225,7 +225,7 @@ mod tests {
         let t = PriceTable::load(&p);
         assert_eq!(t.as_of(), PriceTable::embedded().as_of());
         let missing = PriceTable::load(&dir.path().join("nope.json"));
-        assert_eq!(missing.as_of(), "2026-11-04");
+        assert_eq!(missing.as_of(), "2026-11-05");
         let mut r = rec("claude-opus-5-5");
         r.output = 15_000;
         assert_eq!(t.cost_nanousd(&r), Some(300_000_000));
@@ -257,5 +257,24 @@ mod tests {
         let mut r = rec("claude-fable-5");
         r.output = u64::MAX;
         assert_eq!(PriceTable::embedded().cost_nanousd(&r), Some(u64::MAX));
+    }
+
+    #[test]
+    fn haiku_45_with_date_suffix_and_older_models_are_priced() {
+        let t = PriceTable::embedded();
+        // 1M input + 1M output of Haiku 4.5 = $1 + $5.
+        let mut r = rec("claude-haiku-4-5-20251001");
+        r.input = 1_000_000;
+        r.output = 1_000_000;
+        assert_eq!(t.cost_nanousd(&r), Some(6_000_000_000));
+        for id in ["claude-opus-4-7", "claude-opus-4-1-20250805", "claude-opus-4-20250514", "claude-sonnet-4-5-20250929", "claude-haiku-3-5-20241022"] {
+            let mut r = rec(id);
+            r.input = 1;
+            assert!(t.cost_nanousd(&r).is_some(), "{id} unpriced");
+        }
+        // Opus 4 ($15) must not be confused with Opus 4.1 or 4.5.
+        let mut r = rec("claude-opus-4-5");
+        r.input = 1_000_000;
+        assert_eq!(t.cost_nanousd(&r), Some(5_000_000_000));
     }
 }
