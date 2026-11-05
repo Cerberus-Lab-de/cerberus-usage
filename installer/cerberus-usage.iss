@@ -96,7 +96,11 @@ begin
   if not IsAppRunning then
     Exit;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/im {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  for I := 1 to 10 do
+  // The app hides to the tray on window close, so the polite request usually does nothing and the
+  // forced end below is the normal path. That is safe for our own exe: settings.json and
+  // scan_state.json are written atomically (temp file + rename), so a forced end never leaves a
+  // half-written file.
+  for I := 1 to 4 do
   begin
     if not IsAppRunning then
       Exit;

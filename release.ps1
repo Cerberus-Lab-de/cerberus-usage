@@ -7,6 +7,8 @@
   (Inno Setup), signature (cargo run --bin sign-release), summary, confirmation, gh release create.
   It never pushes commits and never prints secrets. The signing key stays in the Windows
   credential store (service cerberus-usage-release).
+  Note: a running copy of the app started from target\release locks the exe and blocks the build.
+  Quit it first.
 
 .PARAMETER DryRun
   Runs everything up to and including the installer and prints the summary, but does not sign
@@ -51,12 +53,22 @@ function Get-LatestReleaseVersion([string]$ghExe, [string]$repo) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $ghExe api "repos/$repo/releases/latest" --jq .tag_name 2>$errFile
-        $code = $LASTEXITCODE
-        $err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        # GitHub also answers 404 for a mistyped or inaccessible repo, so check the repo first.
+        $null = & $ghExe api "repos/$repo" --silent 2>$errFile
+        if ($LASTEXITCODE -ne 0) {
+            $repoMissing = $true
+        } else {
+            $repoMissing = $false
+            $out = & $ghExe api "repos/$repo/releases/latest" --jq .tag_name 2>$errFile
+            $code = $LASTEXITCODE
+            $err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        }
     } finally {
         $ErrorActionPreference = $previous
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($repoMissing) {
+        throw "Repo nicht gefunden oder kein Zugriff: $repo. Erst das Repo anlegen und pushen."
     }
     if ($code -eq 0) {
         $tag = ("$out").Trim() -replace '^v', ''
@@ -96,7 +108,14 @@ if (-not $gh) {
     if ($DryRun) { Write-Warning 'gh nicht gefunden: Versionsvergleich mit dem letzten Release übersprungen (Probelauf).' }
     else { throw 'gh (GitHub CLI) nicht gefunden.' }
 } else {
-    $latest = Get-LatestReleaseVersion $gh.Source $Repo
+    try {
+        $latest = Get-LatestReleaseVersion $gh.Source $Repo
+    } catch {
+        # A dry run must work before the repo exists; a real release must not.
+        if (-not $DryRun) { throw }
+        Write-Warning "$($_.Exception.Message) (Probelauf: Versionsvergleich übersprungen)"
+        $latest = $null
+    }
     if ($null -eq $latest) {
         Write-Host "Noch kein Release vorhanden: $version wäre das erste."
     } else {
@@ -121,6 +140,7 @@ $notes = $nm.Groups['body'].Value.Trim()
 Step 'Tests'
 Invoke-Native $cargo @('test', '--locked')
 Step 'Release-Build'
+# A running copy from target\release locks the exe and makes this step fail: quit it first.
 Invoke-Native $cargo @('build', '--release', '--locked')
 $exe = Join-Path $root 'target\release\cerberus-usage.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Build-Ergebnis fehlt: $exe" }
