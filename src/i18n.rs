@@ -46,8 +46,11 @@ struct State {
     builtin: HashMap<String, Lang>,
     /// Languages loaded from the folder, keyed by lowercase code.
     folder: HashMap<String, Lang>,
-    /// Code of the chosen language, spelled as in its file.
+    /// Code of the language in use, spelled as in its file.
     chosen: String,
+    /// What the user asked for; resolved again after every scan, because the
+    /// file may appear, break or be repaired later.
+    requested: Option<String>,
 }
 
 impl State {
@@ -58,7 +61,7 @@ impl State {
                 builtin.insert(lang.code.to_ascii_lowercase(), lang);
             }
         }
-        let mut state = State { builtin, folder: HashMap::new(), chosen: ENGLISH.to_string() };
+        let mut state = State { builtin, folder: HashMap::new(), chosen: ENGLISH.to_string(), requested: None };
         // Existing tests assert German texts, so tests start on built-in German.
         state.chosen = if cfg!(test) { "de".to_string() } else { default_language(&state) };
         state
@@ -228,10 +231,7 @@ pub fn scan_folder(dir: &Path) -> Vec<LangProblem> {
 
     write(|state| {
         state.folder = loaded.into_iter().map(|(k, (_, lang))| (k, lang)).collect();
-        // A language that vanished with its file must not stay selected.
-        if !list(state).iter().any(|l| l.code.eq_ignore_ascii_case(&state.chosen)) {
-            state.chosen = default_language(state);
-        }
+        state.chosen = resolve_choice(state);
     });
     problems
 }
@@ -300,14 +300,20 @@ fn default_language(state: &State) -> String {
     ENGLISH.to_string()
 }
 
+/// The requested language if it exists, else the default language.
+fn resolve_choice(state: &State) -> String {
+    let wanted = state.requested.as_deref().and_then(|c| {
+        list(state).into_iter().find(|l| l.code.eq_ignore_ascii_case(c)).map(|l| l.code)
+    });
+    wanted.unwrap_or_else(|| default_language(state))
+}
+
 /// Chooses the language. `None` or an unknown code means: Windows UI language
 /// if available, else English.
 pub fn set_language(code: Option<&str>) {
     write(|state| {
-        let wanted = code.and_then(|c| {
-            list(state).into_iter().find(|l| l.code.eq_ignore_ascii_case(c)).map(|l| l.code)
-        });
-        state.chosen = wanted.unwrap_or_else(|| default_language(state));
+        state.requested = code.map(str::to_string);
+        state.chosen = resolve_choice(state);
     });
 }
 
@@ -490,11 +496,11 @@ mod tests {
         write_file(
             dir.path(),
             "c_format.json",
-            lang_json("c1", "C", "").replace("\"format\":1", "\"format\":2").as_bytes(),
+            lang_json("cc", "C", "").replace("\"format\":1", "\"format\":2").as_bytes(),
         );
         write_file(dir.path(), "d_code.json", lang_json("d_d", "D", "").as_bytes());
-        write_file(dir.path(), "e_values.json", lang_json("e1", "E", "\"k\":5").as_bytes());
-        let mut big = lang_json("f1", "F", "").into_bytes();
+        write_file(dir.path(), "e_values.json", lang_json("ee", "E", "\"k\":5").as_bytes());
+        let mut big = lang_json("ff", "F", "").into_bytes();
         big.resize(1_048_577, b' ');
         write_file(dir.path(), "f_big.json", &big);
         let problems = scan_folder(dir.path());
@@ -503,7 +509,17 @@ mod tests {
             names,
             ["a_invalid.json", "b_nometa.json", "c_format.json", "d_code.json", "e_values.json", "f_big.json"]
         );
-        assert!(problems.iter().all(|p| !p.reason.is_empty()));
+        let expected = [
+            "invalid JSON",
+            "missing _meta",
+            "_meta.format",
+            "valid language code",
+            "not a string",
+            "larger than 1 MB",
+        ];
+        for (problem, part) in problems.iter().zip(expected) {
+            assert!(problem.reason.contains(part), "{}: {}", problem.file, problem.reason);
+        }
         let codes: Vec<String> = available().into_iter().map(|l| l.code).collect();
         assert_eq!(codes.len(), 2, "only the built-ins remain: {codes:?}");
     }
@@ -560,6 +576,23 @@ mod tests {
         assert!(available().iter().any(|l| l.code == current_code()));
         set_language(Some("EN"));
         assert_eq!(current_code(), "en");
+    }
+
+    #[test]
+    fn requested_language_is_resolved_again_on_every_scan() {
+        isolate();
+        set_language(Some("fr"));
+        assert_ne!(current_code(), "fr", "not scanned yet");
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "fr.json", lang_json("fr", "Francais", "").as_bytes());
+        assert!(scan_folder(dir.path()).is_empty());
+        assert_eq!(current_code(), "fr");
+        write_file(dir.path(), "fr.json", b"{ broken");
+        assert_eq!(scan_folder(dir.path()).len(), 1);
+        assert_ne!(current_code(), "fr");
+        write_file(dir.path(), "fr.json", lang_json("fr", "Francais", "").as_bytes());
+        assert!(scan_folder(dir.path()).is_empty());
+        assert_eq!(current_code(), "fr");
     }
 
     #[test]
