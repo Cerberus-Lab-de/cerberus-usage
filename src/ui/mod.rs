@@ -792,7 +792,13 @@ impl CerberusApp {
         if !esc_may_close(esc, self.text_focused_last_frame, ctx.egui_wants_keyboard_input()) {
             return;
         }
-        match esc_target(self.state.confirm.is_some(), self.drawer_open, self.detail.is_some()) {
+        match esc_target(
+            self.update.confirm_is_open(),
+            self.state.confirm.is_some(),
+            self.drawer_open,
+            self.detail.is_some(),
+        ) {
+            EscTarget::UpdateConfirm => self.update.cancel_confirm(),
             EscTarget::Confirm => self.state.confirm = None,
             EscTarget::Drawer => self.drawer_open = false,
             EscTarget::Detail => self.set_detail(None),

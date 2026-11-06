@@ -122,15 +122,19 @@ pub fn truncate_name(name: &str, max_chars: usize) -> (String, bool) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscTarget {
+    UpdateConfirm,
     Confirm,
     Drawer,
     Detail,
     Nothing,
 }
 
-/// Esc closes the topmost layer first: confirm, then drawer, then detail.
-pub fn esc_target(confirm_open: bool, drawer_open: bool, detail_open: bool) -> EscTarget {
-    if confirm_open {
+/// Esc closes the topmost layer first: the update dialog, the start confirmation, then drawer,
+/// then detail.
+pub fn esc_target(update_confirm_open: bool, confirm_open: bool, drawer_open: bool, detail_open: bool) -> EscTarget {
+    if update_confirm_open {
+        EscTarget::UpdateConfirm
+    } else if confirm_open {
         EscTarget::Confirm
     } else if drawer_open {
         EscTarget::Drawer
@@ -372,10 +376,12 @@ mod tests {
 
     #[test]
     fn esc_closes_topmost_layer_first() {
-        assert_eq!(esc_target(true, true, true), EscTarget::Confirm);
-        assert_eq!(esc_target(false, true, true), EscTarget::Drawer);
-        assert_eq!(esc_target(false, false, true), EscTarget::Detail);
-        assert_eq!(esc_target(false, false, false), EscTarget::Nothing);
+        assert_eq!(esc_target(true, true, true, true), EscTarget::UpdateConfirm);
+        assert_eq!(esc_target(true, false, true, true), EscTarget::UpdateConfirm);
+        assert_eq!(esc_target(false, true, true, true), EscTarget::Confirm);
+        assert_eq!(esc_target(false, false, true, true), EscTarget::Drawer);
+        assert_eq!(esc_target(false, false, false, true), EscTarget::Detail);
+        assert_eq!(esc_target(false, false, false, false), EscTarget::Nothing);
     }
 
     #[test]

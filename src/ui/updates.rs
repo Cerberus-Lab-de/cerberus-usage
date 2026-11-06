@@ -313,6 +313,16 @@ impl UpdateUi {
         toggled
     }
 
+    /// The update confirmation is open (Esc closes it before anything behind it).
+    pub fn confirm_is_open(&self) -> bool {
+        self.confirm_open
+    }
+
+    /// Closes the confirmation without installing.
+    pub fn cancel_confirm(&mut self) {
+        self.confirm_open = false;
+    }
+
     /// The confirmation before anything is downloaded.
     pub fn draw_confirm(&mut self, ctx: &egui::Context, launch_running: bool) {
         if !self.confirm_open {
