@@ -126,6 +126,22 @@ if (-not $gh) {
     }
 }
 
+# --- 2b. Third-party licenses match Cargo.lock ----------------------------------------------------
+Step 'Lizenzdatei prüfen'
+# Line endings are normalised to LF before hashing, so a CRLF checkout gives the same hash.
+$lockBytes = [System.IO.File]::ReadAllBytes((Join-Path $root 'Cargo.lock')) | Where-Object { $_ -ne 13 }
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$lockHash = ([System.BitConverter]::ToString($sha.ComputeHash([byte[]]$lockBytes)) -replace '-', '').ToLower()
+$licensePath = Join-Path $root 'installer\THIRD-PARTY-LICENSES.txt'
+if (-not (Test-Path -LiteralPath $licensePath)) {
+    throw "installer\THIRD-PARTY-LICENSES.txt fehlt. Erzeugen mit: python tools\third_party_licenses.py (dann committen)."
+}
+$licenseFirst = (Get-Content -LiteralPath $licensePath -TotalCount 1 -Encoding UTF8)
+if ($licenseFirst -ne "Cargo.lock SHA-256: $lockHash") {
+    throw "installer\THIRD-PARTY-LICENSES.txt passt nicht mehr zu Cargo.lock. Neu erzeugen mit: python tools\third_party_licenses.py (dann committen)."
+}
+Write-Host 'Lizenzdatei passt zu Cargo.lock.'
+
 # --- 3. Release notes --------------------------------------------------------------------------
 Step 'Änderungsnotizen lesen'
 $changelog = Get-Content -LiteralPath (Join-Path $root 'CHANGELOG.md') -Raw -Encoding UTF8
@@ -140,10 +156,70 @@ $notes = $nm.Groups['body'].Value.Trim()
 Step 'Tests'
 Invoke-Native $cargo @('test', '--locked')
 Step 'Release-Build'
-# A running copy from target\release locks the exe and makes this step fail: quit it first.
-Invoke-Native $cargo @('build', '--release', '--locked')
-$exe = Join-Path $root 'target\release\cerberus-usage.exe'
+# Local paths must not end up in the exe: remap the repo, cargo home, rustup home and target dir.
+# The target dir comes last because it may lie inside the repo (the last matching rule wins).
+if ($env:CARGO_TARGET_DIR) { $targetDir = $env:CARGO_TARGET_DIR } else { $targetDir = Join-Path $root 'target' }
+$cargoHome = $env:CARGO_HOME
+if (-not $cargoHome) { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
+$rustupHome = $env:RUSTUP_HOME
+if (-not $rustupHome) { $rustupHome = Join-Path $env:USERPROFILE '.rustup' }
+$remap = @(
+    "--remap-path-prefix=$root=/cerberus-usage",
+    "--remap-path-prefix=$cargoHome=/cargo",
+    "--remap-path-prefix=$rustupHome=/rustup",
+    "--remap-path-prefix=$targetDir=/target"
+)
+# CARGO_ENCODED_RUSTFLAGS separates flags with 0x1f, so paths with spaces survive.
+$baseFlags = @()
+if ($env:CARGO_ENCODED_RUSTFLAGS) { $baseFlags += ($env:CARGO_ENCODED_RUSTFLAGS -split [char]0x1f) }
+elseif ($env:RUSTFLAGS) { $baseFlags += ($env:RUSTFLAGS -split ' ' | Where-Object { $_ }) }
+$remappedFlags = ($baseFlags + $remap) -join [string][char]0x1f
+# Runs cargo with the remap flags and restores the environment afterwards.
+function Invoke-RemappedCargo([string[]]$cargoArgs) {
+    $saved = $env:CARGO_ENCODED_RUSTFLAGS
+    try {
+        $env:CARGO_ENCODED_RUSTFLAGS = $remappedFlags
+        Invoke-Native $cargo $cargoArgs
+    } finally {
+        if ($null -eq $saved) { Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue }
+        else { $env:CARGO_ENCODED_RUSTFLAGS = $saved }
+    }
+}
+# A running copy from target
+elease locks the exe and makes this step fail: quit it first.
+Invoke-RemappedCargo @('build', '--release', '--locked')
+$exe = Join-Path $targetDir 'release\cerberus-usage.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Build-Ergebnis fehlt: $exe" }
+
+Step 'Exe auf lokale Pfade prüfen'
+# The exe must not contain the user profile folder or the repo path, as ASCII or UTF-16.
+$latin1 = [System.Text.Encoding]::GetEncoding(28591)
+$exeText = $latin1.GetString([System.IO.File]::ReadAllBytes($exe))
+function Count-Hits([string]$haystack, [string]$needle) {
+    $count = 0
+    $at = 0
+    while (($at = $haystack.IndexOf($needle, $at, [System.StringComparison]::OrdinalIgnoreCase)) -ge 0) { $count++; $at += $needle.Length }
+    return $count
+}
+$needles = [ordered]@{
+    'C:\Users\'  = 'C:\Users\'
+    'C:/Users/'  = 'C:/Users/'
+    'Repo-Pfad'  = $root
+    'Repo-Pfad (/)' = ($root -replace '\\', '/')
+}
+$totalHits = 0
+foreach ($label in $needles.Keys) {
+    $ascii = $needles[$label]
+    $wide = $latin1.GetString([System.Text.Encoding]::Unicode.GetBytes($ascii))
+    $a = Count-Hits $exeText $ascii
+    $w = Count-Hits $exeText $wide
+    Write-Host ("  {0,-14} ASCII: {1,5}  UTF-16: {2,5}" -f $label, $a, $w)
+    $totalHits += $a + $w
+}
+if ($totalHits -gt 0) {
+    throw "Die Exe enthält lokale Pfade ($totalHits Treffer, siehe oben). Nicht veröffentlichen."
+}
+Write-Host 'Keine lokalen Pfade in der Exe.'
 
 # --- 5. Installer --------------------------------------------------------------------------------
 Step 'Installer bauen'
@@ -159,13 +235,13 @@ $installer = Join-Path $dist "CerberusUsage-Setup-$version.exe"
 $manifest = "$installer.manifest.json"
 if (Test-Path -LiteralPath $installer) { Remove-Item -LiteralPath $installer -Force }
 if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force }
-Invoke-Native $iscc @("/DAppVersion=$version", $issPath)
+Invoke-Native $iscc @("/DAppVersion=$version", "/DExeDir=$(Join-Path $targetDir 'release')", $issPath)
 if (-not (Test-Path -LiteralPath $installer)) { throw "Installer fehlt: $installer" }
 
 # --- 6. Sign ----------------------------------------------------------------------------------------
 if (-not $DryRun) {
     Step 'Manifest signieren'
-    Invoke-Native $cargo @('run', '--release', '--locked', '--bin', 'sign-release', '--', 'sign', $installer, $version)
+    Invoke-RemappedCargo @('run', '--release', '--locked', '--bin', 'sign-release', '--', 'sign', $installer, $version)
     if (-not (Test-Path -LiteralPath $manifest)) { throw "Manifest fehlt: $manifest" }
 }
 

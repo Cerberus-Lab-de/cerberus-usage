@@ -57,8 +57,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Only the app. The signing tool (sign-release.exe) is never shipped.
+; The app and the license texts. The signing tool (sign-release.exe) is never shipped.
 Source: "{#ExeDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Cerberus Usage"; Filename: "{app}\{#AppExe}"
