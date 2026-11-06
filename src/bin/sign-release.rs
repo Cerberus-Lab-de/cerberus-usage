@@ -13,7 +13,8 @@ use std::process::ExitCode;
 use zeroize::Zeroizing;
 
 use cerberus_usage::release_sign::{
-    generate_keypair, private_key_hex, public_key_hex, sign_checked, signing_key_from_hex,
+    check_compiled_key, generate_keypair, private_key_hex, public_key_hex, sign_checked,
+    signing_key_from_hex,
 };
 
 const SERVICE: &str = "cerberus-usage-release";
@@ -86,6 +87,10 @@ fn keygen(flags: &[String]) -> Result<(), String> {
     );
     if print_private {
         println!("Privater Schlüssel (hex, einmalig): {}", private_key_hex(&key).as_str());
+    } else {
+        println!(
+            "Der private Schlüssel wurde NICHT ausgegeben und lässt sich später nicht mehr auslesen. Für ein Backup `keygen --print-private-once` verwenden. Das Flag wirkt nur beim Erzeugen des Schlüssels (mit --force entsteht ein neuer Schlüssel, der alle ausgelieferten Apps ungültig macht)."
+        );
     }
     Ok(())
 }
@@ -121,6 +126,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         }
         Err(_) => return Err("Credential-Store konnte nicht gelesen werden".to_string()),
     };
+    check_compiled_key(cerberus_usage::update_key::RELEASE_PUBLIC_KEY, &key)?;
     let manifest = sign_checked(&key, &version, &bytes, &file_name)?;
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|_| "Manifest nicht serialisierbar".to_string())?;

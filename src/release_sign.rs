@@ -64,6 +64,27 @@ pub fn sign_checked(
     Ok(manifest)
 }
 
+/// Refuses to sign unless the public key compiled into the app is set and is the public half
+/// of `signing_key`. A mismatch would ship a release that no installed app can ever verify.
+pub fn check_compiled_key(
+    compiled: Option<[u8; 32]>,
+    signing_key: &SigningKey,
+) -> Result<(), String> {
+    let signing_public = signing_key.verifying_key().to_bytes();
+    match compiled {
+        None => Err(format!(
+            "In src/update_key.rs ist kein öffentlicher Schlüssel eingetragen (RELEASE_PUBLIC_KEY ist None). Signaturschlüssel (öffentlich, hex): {}. Eintragen, neu bauen, dann erneut signieren.",
+            hex_encode(&signing_public)
+        )),
+        Some(compiled) if compiled != signing_public => Err(format!(
+            "Der in die App eingebaute öffentliche Schlüssel ({}) passt nicht zum Signaturschlüssel ({}). Ein so signiertes Release könnte keine installierte App verifizieren.",
+            hex_encode(&compiled),
+            hex_encode(&signing_public)
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 pub fn public_key_hex(signing_key: &SigningKey) -> String {
     hex_encode(&signing_key.verifying_key().to_bytes())
 }
@@ -107,6 +128,28 @@ mod tests {
         assert!(sign_checked(&key(), &v, b"x", "NUL.exe").is_err());
         let rc = semver::Version::parse("1.1.0-rc.1").unwrap();
         assert!(sign_checked(&key(), &rc, b"x", "a.exe").is_err());
+    }
+
+    #[test]
+    fn compiled_key_none_is_refused_and_names_signing_key() {
+        let k = key();
+        let err = check_compiled_key(None, &k).unwrap_err();
+        assert!(err.contains(&public_key_hex(&k)), "{err}");
+    }
+
+    #[test]
+    fn compiled_key_mismatch_is_refused_and_names_both_keys() {
+        let k = key();
+        let other = keypair_from_seed([9; 32]);
+        let err = check_compiled_key(Some(other.verifying_key().to_bytes()), &k).unwrap_err();
+        assert!(err.contains(&public_key_hex(&k)), "{err}");
+        assert!(err.contains(&public_key_hex(&other)), "{err}");
+    }
+
+    #[test]
+    fn compiled_key_match_is_accepted() {
+        let k = key();
+        assert!(check_compiled_key(Some(k.verifying_key().to_bytes()), &k).is_ok());
     }
 
     #[test]
