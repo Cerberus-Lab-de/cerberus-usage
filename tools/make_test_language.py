@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Writes a test language "zz" from lang/en.json.
 
-Every text is wrapped as [[...]] with its {placeholders} untouched, so a text that is still
-hard-coded (and therefore not wrapped) stands out in the window, and a text that gets too long
+Every text is wrapped as [[...]] with its {placeholders} untouched, except the `format.*`
+values: those are date patterns and separators, not texts, and wrapping them would break the
+formatting. So a text that is still hard-coded (and therefore not wrapped) stands out in the window, and a text that gets too long
 shows where the layout breaks. One text (button.browse) is Cyrillic, to check that the font
 can draw it.
 
@@ -24,6 +25,9 @@ def build(source: Path) -> dict:
     out = {"_meta": {"code": "zz", "name": "Test (zz)", "format": 1}}
     for key, value in en.items():
         if key == "_meta":
+            continue
+        if key.startswith("format."):
+            out[key] = value
             continue
         out[key] = "[[" + (CYRILLIC_TEXT if key == CYRILLIC_KEY else value) + "]]"
     if CYRILLIC_KEY not in out:

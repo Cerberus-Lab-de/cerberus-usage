@@ -61,6 +61,9 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Add
 Source: "{#ExeDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Language files. Updates overwrite these two; a custom language lives in its own file with its own code.
+Source: "..\lang\de.json"; DestDir: "{app}\lang"; Flags: ignoreversion
+Source: "..\lang\en.json"; DestDir: "{app}\lang"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Cerberus Usage"; Filename: "{app}\{#AppExe}"
@@ -138,6 +141,8 @@ begin
         if not (Exec(ExpandConstant('{app}\{#AppExe}'), '--uninstall-cleanup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
                 and (ResultCode = 0)) then
           MsgBox(ExpandConstant('{cm:CleanupFailed}'), mbError, MB_OK);
+        // Language files (the shipped ones and any the user added).
+        DelTree(ExpandConstant('{app}\lang'), True, True, True);
       end;
     end;
   end;

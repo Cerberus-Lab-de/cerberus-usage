@@ -291,6 +291,8 @@ mod tests {
         with_language("en", || {
             assert_eq!(pause_text(at(12, 14, 30), at(8, 9, 0), "seven_day"), "Max paused until Thu, Nov 12 14:30 (weekly limit)");
             assert_eq!(pause_text(at(8, 17, 5), at(8, 9, 0), "five_hour"), "Max paused until 17:05 (5-hour limit)");
+            // No zero padding on the day: "Nov 5", not "Nov 05".
+            assert_eq!(pause_text(at(5, 14, 30), at(2, 9, 0), "seven_day"), "Max paused until Thu, Nov 5 14:30 (weekly limit)");
         });
     }
 

@@ -109,7 +109,7 @@ pub fn plaintext_hint() -> String {
 
 /// Applies a language choice: the language changes at once for this session; saving it into the
 /// settings file is a second step that may fail (broken file, no path). On failure the text says that
-/// the choice only holds until the app is closed.
+/// the choice applies only until the app is closed.
 pub fn choose_language(settings_path: Option<&Path>, code: &str) -> Result<Settings, String> {
     crate::i18n::set_language(Some(code));
     let Some(path) = settings_path else {
@@ -781,11 +781,11 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         // The text is worded in the language that was just chosen (here English).
         let err = choose_language(Some(&path), "en").unwrap_err();
-        assert!(err.contains("only holds until the app is closed"), "{err}");
+        assert!(err.contains("applies only until the app is closed"), "{err}");
         assert_eq!(crate::i18n::current_code(), "en");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "a broken file is never overwritten");
         let none = choose_language(None, "en").unwrap_err();
-        assert!(none.contains("only holds until the app is closed"), "{none}");
+        assert!(none.contains("applies only until the app is closed"), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
