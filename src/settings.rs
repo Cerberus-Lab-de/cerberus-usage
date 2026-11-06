@@ -60,7 +60,7 @@ pub struct Settings {
     /// Claude projects folder; `None` uses `CLAUDE_CONFIG_DIR` or `%USERPROFILE%\.claude\projects`.
     pub logs_root: Option<PathBuf>,
     /// Look for new releases on GitHub (at start and every 24 h). Off: no request to GitHub unless the
-    /// user clicks "Jetzt prüfen" or installs.
+    /// user asks for a check or installs.
     #[serde(default = "default_true")]
     pub check_updates: bool,
     /// Interface language code; `None` follows the system.

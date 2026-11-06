@@ -88,7 +88,11 @@ pub enum ApiCard {
     Data { today: String, month: String, updated: String, error: Option<String> },
 }
 
-pub fn api_card(admin_key_stored: Option<bool>, api: Option<&ApiStatus>) -> ApiCard {
+pub fn api_card(admin_key_stored: Option<bool>, undecryptable: bool, api: Option<&ApiStatus>) -> ApiCard {
+    // A stored key that cannot be decrypted here is not "no key": say so, whatever an older snapshot holds.
+    if undecryptable {
+        return ApiCard::Error(tr("secrets.error.not_decryptable"));
+    }
     // A deleted key wins over a stale snapshot; an unreadable store without any status counts as no key.
     if admin_key_stored == Some(false) || (admin_key_stored.is_none() && api.is_none()) {
         return ApiCard::NoKey;
@@ -380,26 +384,38 @@ mod tests {
 
     #[test]
     fn api_card_states() {
-        assert_eq!(api_card(Some(false), None), ApiCard::NoKey);
-        assert_eq!(api_card(None, None), ApiCard::NoKey);
-        assert_eq!(api_card(Some(true), None), ApiCard::Pending);
+        assert_eq!(api_card(Some(false), false, None), ApiCard::NoKey);
+        assert_eq!(api_card(None, false, None), ApiCard::NoKey);
+        assert_eq!(api_card(Some(true), false, None), ApiCard::Pending);
 
         // Never succeeded: only the error text, never figures.
         for e in [ApiError::NotAvailable, ApiError::Server(500), ApiError::Unauthorized] {
-            assert_eq!(api_card(Some(true), Some(&status(false, Some(e.clone())))), ApiCard::Error(e.to_string()));
+            assert_eq!(api_card(Some(true), false, Some(&status(false, Some(e.clone())))), ApiCard::Error(e.to_string()));
         }
 
-        match api_card(Some(true), Some(&status(true, None))) {
+        match api_card(Some(true), false, Some(&status(true, None))) {
             ApiCard::Data { today, month, error, .. } => {
                 assert_eq!((today.as_str(), month.as_str()), ("$1.23", "$45.00"));
                 assert!(error.is_none());
             }
             other => panic!("{other:?}"),
         }
-        match api_card(Some(true), Some(&status(true, Some(ApiError::RateLimited)))) {
+        match api_card(Some(true), false, Some(&status(true, Some(ApiError::RateLimited)))) {
             ApiCard::Data { error, .. } => assert_eq!(error, Some(ApiError::RateLimited.to_string())),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stored_key_that_cannot_be_decrypted_is_not_reported_as_missing() {
+        let expected = ApiCard::Error(tr("secrets.error.not_decryptable"));
+        assert_ne!(expected, ApiCard::NoKey);
+        // The flags of an undecryptable key: presence unknown, undecryptable set.
+        assert_eq!(api_card(None, true, None), expected);
+        // Also over an older snapshot, and over a presence flag that is still true.
+        assert_eq!(api_card(Some(true), true, Some(&status(true, None))), expected);
+        let en = crate::i18n::with_language("en", || api_card(None, true, None));
+        assert_eq!(en, ApiCard::Error("The stored key cannot be decrypted".to_string()));
     }
 
     fn bal(nano: i128, deducted: bool) -> BalanceStatus {

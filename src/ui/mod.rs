@@ -75,8 +75,9 @@ pub struct Notice {
     pub text: String,
 }
 
-/// Everything the window shows. The only key material is the typed text in `key_input` until it is saved
-/// (or deleted); a stored key is never kept here.
+/// Everything the window shows. Typed key text lives in `key_input` until it is saved (or deleted).
+/// `settings` is a copy of the settings file, so it also holds the stored keys as `StoredKey`: DPAPI
+/// blobs by default, the readable key itself in plain-text mode. No code path displays those values.
 pub struct AppState {
     pub snapshot: Option<Snapshot>,
     pub mode: ModeDisplay,
@@ -119,6 +120,8 @@ pub struct AppState {
     pub worker_gone: bool,
     /// The note about an unreadable saved state is shown once.
     state_note_shown: bool,
+    /// The settings problem of the last snapshot, to notice when the file breaks or is repaired.
+    seen_settings_error: Option<String>,
 }
 
 impl AppState {
@@ -150,7 +153,21 @@ impl AppState {
             baseline_edited: false,
             worker_gone: false,
             state_note_shown: false,
+            seen_settings_error: None,
         }
+    }
+
+    /// Reads the key states again when the settings problem reported by the worker has changed (the
+    /// file broke or was repaired while the app runs), so the flags follow without a restart. Compares
+    /// with the previous snapshot only, so it reads nothing on frames where nothing changed. Returns
+    /// whether it read.
+    pub fn refresh_keys_if_settings_error_changed(&mut self, error: Option<&str>, store: &dyn SecretStore) -> bool {
+        if self.seen_settings_error.as_deref() == error {
+            return false;
+        }
+        self.seen_settings_error = error.map(str::to_string);
+        self.refresh_keys(store);
+        true
     }
 
     /// Reads both key states from the store again (after a save, a delete or a storage switch; never per
@@ -688,6 +705,8 @@ impl CerberusApp {
             self.state.show_state_note_once(note.as_deref());
             self.state.reload_settings();
             self.paths.refresh(&self.state.settings);
+            let error = self.state.snapshot.as_ref().and_then(|s| s.settings_error.clone());
+            self.state.refresh_keys_if_settings_error_changed(error.as_deref(), &*self.store);
         }
         self.paths.poll_dialog();
         if self.update.poll() {
@@ -1021,7 +1040,7 @@ impl CerberusApp {
         }
 
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
-        cockpit::api_line(ui, &api_card(self.state.admin_key_stored, api));
+        cockpit::api_line(ui, &api_card(self.state.admin_key_stored, self.state.admin_key_undecryptable, api));
         if let Some(snapshot) = self.state.snapshot.as_ref().filter(|s| s.report.is_some()) {
             ui.add(
                 egui::Label::new(
@@ -1330,6 +1349,46 @@ mod tests {
         *store.0.borrow_mut() = Ok(None);
         s.refresh_keys(&store);
         assert_eq!((s.key_stored, s.admin_key_stored), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn key_flags_are_read_again_only_when_the_settings_problem_changes() {
+        use std::cell::Cell;
+        struct Counting(Cell<u32>, Cell<bool>);
+        impl SecretStore for Counting {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                self.0.set(self.0.get() + 1);
+                if self.1.get() { Err(SecretError::ConfigUnreadable) } else { Ok(Some("x".to_string())) }
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        let store = Counting(Cell::new(0), Cell::new(false));
+        let mut s = AppState::new();
+        // Snapshots without a problem: nothing to read, however many arrive.
+        for _ in 0..5 {
+            assert!(!s.refresh_keys_if_settings_error_changed(None, &store));
+        }
+        assert_eq!(store.0.get(), 0);
+        // The file breaks: one read of both slots, then quiet while the same problem stays.
+        store.1.set(true);
+        assert!(s.refresh_keys_if_settings_error_changed(Some("kaputt"), &store));
+        assert_eq!((s.key_stored, s.admin_key_stored), (None, None));
+        let reads = store.0.get();
+        assert_eq!(reads, 2);
+        for _ in 0..5 {
+            assert!(!s.refresh_keys_if_settings_error_changed(Some("kaputt"), &store));
+        }
+        assert_eq!(store.0.get(), reads);
+        // The file is repaired: the flags follow at once, without a restart.
+        store.1.set(false);
+        assert!(s.refresh_keys_if_settings_error_changed(None, &store));
+        assert_eq!((s.key_stored, s.admin_key_stored), (Some(true), Some(true)));
+        assert_eq!(store.0.get(), reads + 2);
     }
 
     #[test]

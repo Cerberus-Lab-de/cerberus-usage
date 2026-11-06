@@ -454,7 +454,7 @@ mod tests {
             error: Some(ApiError::NotAvailable),
             since_error: None,
         };
-        match crate::cards::api_card(Some(true), Some(&status)) {
+        match crate::cards::api_card(Some(true), false, Some(&status)) {
             ApiCard::Error(text) => assert!(api_error_is_dim(&text)),
             other => panic!("{other:?}"),
         }
