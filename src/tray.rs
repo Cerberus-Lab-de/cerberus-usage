@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, IconData, ViewportCommand};
 use crate::balance::Alert;
-use crate::pricing::format_usd;
+use crate::ui::details::figure_value;
 use crate::ui::ModeDisplay;
 use crate::view::mode_card_with_routing;
 use crate::worker::Snapshot;
@@ -197,7 +197,8 @@ pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay, routing_active: bool) -> 
         text.push_str(" (Umleitung aktiv)");
     }
     if let Some(report) = &snapshot.report {
-        text.push_str(&format!(" · heute {} (geschätzt)", format_usd(report.today.cost_nano)));
+        let note = if report.today.unpriced_requests > 0 { "geschätzt, unvollständig" } else { "geschätzt" };
+        text.push_str(&format!(" · heute {} ({note})", figure_value(&report.today)));
     }
     if !snapshot.alerts.is_empty() {
         text.push_str(" · Warnung");
@@ -325,6 +326,32 @@ mod tests {
         let mut s = snapshot(0);
         s.alerts = vec![Alert::LowBalance];
         assert!(tooltip(&s, ModeDisplay::ApiKey, false).contains("Warnung"));
+    }
+
+    #[test]
+    fn tray_tooltip_never_shows_zero_dollars_for_unpriced_use() {
+        use crate::report::Bucket;
+        let with_today = |today: Bucket| {
+            let mut s = snapshot(0);
+            s.report.as_mut().unwrap().today = today;
+            s
+        };
+        // Nothing could be priced: a dash and the incomplete hint, never "$0.00".
+        let all = with_today(Bucket { requests: 4, unpriced_requests: 4, ..Default::default() });
+        let tip = tooltip(&all, ModeDisplay::Max, false);
+        assert!(tip.contains("heute –") && tip.contains("unvollständig") && !tip.contains("$0.00"), "{tip}");
+        // Partly unpriced: the (too low) number is shown with the hint.
+        let part = with_today(Bucket { requests: 4, unpriced_requests: 1, cost_nano: 2_000_000_000, ..Default::default() });
+        let tip = tooltip(&part, ModeDisplay::Max, false);
+        assert!(tip.contains("$2.00") && tip.contains("unvollständig"), "{tip}");
+        // Fully priced: no hint.
+        let ok = with_today(Bucket { requests: 4, cost_nano: 2_000_000_000, ..Default::default() });
+        assert!(!tooltip(&ok, ModeDisplay::Max, false).contains("unvollständig"));
+        // The longest variant still fits Windows' 127 characters.
+        let mut long = with_today(Bucket { requests: 4, unpriced_requests: 1, cost_nano: 1_234_567_000_000_000, ..Default::default() });
+        long.alerts = vec![Alert::LowBalance];
+        let tip = tooltip(&long, ModeDisplay::Unknown, true);
+        assert!(tip.chars().count() < 128, "{} chars: {tip}", tip.chars().count());
     }
 
     #[test]

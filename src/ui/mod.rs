@@ -3,7 +3,7 @@
 mod banners;
 mod chart;
 mod cockpit;
-mod details;
+pub(crate) mod details;
 mod drawer;
 pub mod theme;
 mod updates;
