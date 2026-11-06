@@ -1299,15 +1299,17 @@ mod tests {
         assert_eq!(http.request_count(), 0);
     }
 
-    /// Needs a stored admin key and network. Run manually (save the key via the app first):
+    /// Needs a stored admin key (in the settings file, saved via the app) and network. Run manually:
     /// `cargo test live_cost_today -- --ignored --nocapture`. Prints amounts only.
     #[test]
     #[ignore]
     fn live_cost_today() {
+        use crate::config_store::{ConfigStore, KeyStore};
         use crate::secrets::KeyringStore;
-        let key = KeyringStore::new()
+        let path = crate::settings::default_path().expect("settings path");
+        let key = KeyStore::new(ConfigStore::new(path), std::sync::Arc::new(KeyringStore::new()))
             .get(Slot::AdminKey)
-            .expect("credential store")
+            .expect("key store")
             .expect("no admin key stored: save one in the app first");
         let now = Utc::now();
         let rows = fetch_cost(&UreqHttp::new(), &key, now - Duration::days(2), now + Duration::days(1), "1d")

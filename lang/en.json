@@ -141,6 +141,7 @@
   "secrets.error.bad_data": "The stored key is not readable",
   "secrets.error.not_decryptable": "The stored key cannot be decrypted",
   "secrets.error.config_unreadable": "The settings file is not readable",
+  "secrets.error.config_write_failed": "The settings file could not be written",
   "secrets.error.other": "Access to the credential store failed",
   "secrets.key.whitespace": "The key must not contain spaces or control characters.",
   "secrets.key.is_admin": "This is an admin key. Please enter a regular API key here.",

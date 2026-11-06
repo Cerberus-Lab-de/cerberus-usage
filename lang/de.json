@@ -141,6 +141,7 @@
   "secrets.error.bad_data": "Gespeicherter Schlüssel ist nicht lesbar",
   "secrets.error.not_decryptable": "Gespeicherter Schlüssel lässt sich nicht entschlüsseln",
   "secrets.error.config_unreadable": "Einstellungsdatei ist nicht lesbar",
+  "secrets.error.config_write_failed": "Die Einstellungsdatei ließ sich nicht schreiben",
   "secrets.error.other": "Zugriff auf den Anmeldeinformationsspeicher fehlgeschlagen",
   "secrets.key.whitespace": "Der Schlüssel darf keine Leer- oder Steuerzeichen enthalten.",
   "secrets.key.is_admin": "Das ist ein Admin-Key. Bitte hier einen normalen API-Key eintragen.",

@@ -1,7 +1,7 @@
 //! Keys inside `settings.json`: DPAPI-encrypted by default, readable when the user opts in.
 //!
 //! `ConfigStore` is a [`SecretStore`] over the file. `KeyStore` puts it in front of the old
-//! credential-store entries so keys saved by v1.0.x keep working until they are saved again.
+//! credential-store entries, which are read only until the start-up move has taken them over.
 //! No error or log line here ever carries a key value.
 
 use std::cell::Cell;
@@ -101,6 +101,16 @@ impl ConfigStore {
     }
 }
 
+/// What a failed locked save means: the file was unreadable (the edit never ran), the encryption
+/// failed, or the write itself failed.
+fn write_error(edit_ran: bool, encrypt_failed: bool) -> SecretError {
+    match (edit_ran, encrypt_failed) {
+        (false, _) => SecretError::ConfigUnreadable,
+        (true, true) => SecretError::Other,
+        (true, false) => SecretError::ConfigWriteFailed,
+    }
+}
+
 impl SecretStore for ConfigStore {
     fn get(&self, s: Slot) -> Result<Option<String>, SecretError> {
         let (mut settings, error) = settings::load(&self.path);
@@ -115,15 +125,20 @@ impl SecretStore for ConfigStore {
 
     fn set(&self, s: Slot, v: &str) -> Result<(), SecretError> {
         let ran = Cell::new(false);
+        let encrypt_failed = Cell::new(false);
         update_settings(&self.path, |current| {
             ran.set(true);
             let mut next = current.clone();
-            *slot_of(&mut next, s) = Some(encode(v, current.keys_plaintext).map_err(|_| String::new())?);
+            let stored = encode(v, current.keys_plaintext).map_err(|_| {
+                encrypt_failed.set(true);
+                String::new()
+            })?;
+            *slot_of(&mut next, s) = Some(stored);
             Ok(next)
         })
-        // A failure before the edit ran is a load failure; later ones are encryption or write errors.
+        // A failure before the edit ran is a load failure; after it, either the encryption or the write failed.
         .map(|_| ())
-        .map_err(|_| if ran.get() { SecretError::Other } else { SecretError::ConfigUnreadable })
+        .map_err(|_| write_error(ran.get(), encrypt_failed.get()))
     }
 
     fn delete(&self, s: Slot) -> Result<(), SecretError> {
@@ -142,7 +157,7 @@ impl SecretStore for ConfigStore {
             Ok(next)
         })
         .map(|_| ())
-        .map_err(|_| if ran.get() { SecretError::Other } else { SecretError::ConfigUnreadable })
+        .map_err(|_| write_error(ran.get(), false))
     }
 }
 
@@ -162,7 +177,8 @@ pub fn set_plaintext(path: &Path, on: bool) -> Result<Settings, String> {
     })
 }
 
-/// Settings file first, then the old credential-store entries (read-only fallback).
+/// Settings file first, then the old credential-store entries (read fallback; a save or delete also
+/// clears the old entry).
 pub struct KeyStore {
     config: ConfigStore,
     legacy: Arc<dyn SecretStore + Send + Sync>,
@@ -232,7 +248,13 @@ impl MigrationResult {
 /// compared, and only then is the legacy entry deleted. A broken config means no move at all (the
 /// broken file is reported on its own) and returns an empty list.
 pub fn migrate_keys(legacy: &dyn SecretStore, config: &ConfigStore) -> MigrationResult {
-    migrate_with(legacy, config, verified_in_file)
+    migrate_with(legacy, config, verified_in_file, flush_file)
+}
+
+/// Opens the file with write access and flushes it, so the rename of the last save is on disk
+/// before the only other copy of a key is deleted.
+fn flush_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 /// Re-reads the file from disk and checks that `slot` decrypts to `expected`.
@@ -251,13 +273,14 @@ fn migrate_with(
     legacy: &dyn SecretStore,
     config: &ConfigStore,
     verify: impl Fn(&Path, Slot, &str) -> bool,
+    flush: impl Fn(&Path) -> std::io::Result<()>,
 ) -> MigrationResult {
     let mut result = MigrationResult::default();
     if settings::load(&config.path).1.is_some() {
         return result;
     }
     for slot in [Slot::ApiKey, Slot::AdminKey] {
-        match migrate_slot(legacy, config, slot, &verify) {
+        match migrate_slot(legacy, config, slot, &verify, &flush) {
             Move::Failed => result.not_moved.push(slot),
             Move::OldEntryLeft => result.old_entry_left.push(slot),
             Move::Skipped | Move::Moved => {}
@@ -271,6 +294,7 @@ fn migrate_slot(
     config: &ConfigStore,
     slot: Slot,
     verify: &impl Fn(&Path, Slot, &str) -> bool,
+    flush: &impl Fn(&Path) -> std::io::Result<()>,
 ) -> Move {
     // The cheap check first: an existing config key means the legacy store is not even read.
     let (mut current, error) = settings::load(&config.path);
@@ -309,6 +333,10 @@ fn migrate_slot(
         // Leave no unproven entry behind: it would win over the legacy key on the next start.
         let _ = config.delete(slot);
         return Move::Failed;
+    }
+    // The old entry is the only other copy: if the new one cannot be flushed to disk, keep it.
+    if flush(&config.path).is_err() {
+        return Move::OldEntryLeft;
     }
     match legacy.delete(slot) {
         Ok(()) => Move::Moved,
@@ -668,7 +696,7 @@ mod tests {
         let (_d, path) = temp();
         let legacy = legacy_with_both();
         let config = ConfigStore::new(path.clone());
-        let failed = migrate_with(&legacy, &config, |_, _, _| false);
+        let failed = migrate_with(&legacy, &config, |_, _, _| false, |_| Ok(()));
         assert_eq!(failed.not_moved, vec![Slot::ApiKey, Slot::AdminKey]);
         assert!(failed.old_entry_left.is_empty());
         assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
@@ -677,6 +705,52 @@ mod tests {
         // The next start still finds the legacy keys and moves them.
         assert!(migrate_keys(&legacy, &config).is_empty());
         assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn a_failed_flush_keeps_the_legacy_entry_and_reports_the_slot() {
+        let (_d, path) = temp();
+        let legacy = legacy_with_both();
+        let config = ConfigStore::new(path.clone());
+        let result = migrate_with(&legacy, &config, verified_in_file, |_| Err(std::io::Error::other("disk")));
+        assert!(result.not_moved.is_empty());
+        assert_eq!(result.old_entry_left, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
+        // The keys are in the config, so nothing is lost either way.
+        assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn the_real_flush_opens_the_file_for_writing() {
+        let (_d, path) = temp();
+        assert!(flush_file(&path).is_err(), "a missing file cannot be flushed");
+        let config = ConfigStore::new(path.clone());
+        config.set(Slot::ApiKey, KEY).unwrap();
+        assert!(flush_file(&path).is_ok());
+        let legacy = legacy_with_both();
+        let other = ConfigStore::new(path.parent().unwrap().join("fresh.json"));
+        assert!(migrate_keys(&legacy, &other).is_empty());
+        assert!(!legacy.inner.has(Slot::ApiKey), "the real flush lets the move finish");
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_as_a_write_failure_and_not_as_a_store_problem() {
+        let (_d, path) = temp();
+        let store = ConfigStore::new(path.clone());
+        store.set(Slot::ApiKey, KEY).unwrap();
+        // A folder where the temporary file belongs makes every later save fail while reading still works.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert_eq!(store.set(Slot::AdminKey, ADMIN), Err(SecretError::ConfigWriteFailed));
+        assert_eq!(store.delete(Slot::ApiKey), Err(SecretError::ConfigWriteFailed));
+        // Nothing was lost, and the file still reads.
+        assert_eq!(store.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+        // The text names the settings file and says nothing of the credential store or a key.
+        let shown = SecretError::ConfigWriteFailed.to_string();
+        assert!(shown.contains("Einstellungsdatei") && !shown.contains("sk-ant"), "{shown}");
+        let en = crate::i18n::with_language("en", || SecretError::ConfigWriteFailed.to_string());
+        assert!(en.contains("settings file") && !en.to_lowercase().contains("credential"), "{en}");
     }
 
     #[test]

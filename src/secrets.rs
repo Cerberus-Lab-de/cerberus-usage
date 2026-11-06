@@ -1,4 +1,4 @@
-//! API keys in the Windows credential store (via `keyring` 4).
+//! Secret-store interface, the Windows credential store (via `keyring` 4) and the old v1.0.x entries.
 //!
 //! Keys never appear in errors: `SecretError` carries no payload, and the underlying
 //! `keyring` errors (some of which embed the raw secret bytes) are mapped, never forwarded.
@@ -39,6 +39,8 @@ pub enum SecretError {
     NotDecryptable,
     /// settings.json is unreadable or broken, so keys can be neither read nor saved.
     ConfigUnreadable,
+    /// settings.json could not be written (disk full, file locked), so a key was not saved.
+    ConfigWriteFailed,
     /// Any other store failure.
     Other,
 }
@@ -50,6 +52,7 @@ impl fmt::Display for SecretError {
             SecretError::BadData => "secrets.error.bad_data",
             SecretError::NotDecryptable => "secrets.error.not_decryptable",
             SecretError::ConfigUnreadable => "secrets.error.config_unreadable",
+            SecretError::ConfigWriteFailed => "secrets.error.config_write_failed",
             SecretError::Other => "secrets.error.other",
         }))
     }
