@@ -19,6 +19,10 @@ const EN_JSON: &str = include_str!("../lang/en.json");
 
 /// Largest language file that is accepted, in bytes.
 const MAX_FILE_BYTES: u64 = 1_048_576;
+/// Most files read from the language folder; the rest are left alone.
+const MAX_FILES: usize = 100;
+/// Longest single text accepted from a language file, in bytes.
+const MAX_VALUE_BYTES: usize = 4096;
 const ENGLISH: &str = "en";
 
 /// One entry of the language choice.
@@ -191,6 +195,14 @@ fn parse_lang(bytes: &[u8]) -> Result<Lang, Reason> {
         let Some(s) = value.as_str() else {
             return Err(Reason::with("lang.reason.not_string", "key", key.as_str()));
         };
+        if s.len() > MAX_VALUE_BYTES {
+            return Err(Reason::with("lang.reason.value_too_large", "key", key.as_str()));
+        }
+        // An empty text would hide a warning or blank a button, so it counts as missing and the key
+        // falls back to English. Only the thousands separator may be a blank on purpose.
+        if s.trim().is_empty() && key != "format.thousands" {
+            continue;
+        }
         texts.insert(key.clone(), s.to_string());
     }
     Ok(Lang { code: code.to_string(), name: name.to_string(), texts })
@@ -228,6 +240,13 @@ pub fn scan_folder(dir: &Path) -> Vec<LangProblem> {
                 .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
                 .collect();
             files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then(a.0.cmp(&b.0)));
+            if files.len() > MAX_FILES {
+                files.truncate(MAX_FILES);
+                problems.push((
+                    dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    Reason::with("lang.reason.too_many_files", "max", MAX_FILES.to_string()),
+                ));
+            }
             for (name, path) in files {
                 match load_file(&path) {
                     Ok(lang) => {
@@ -481,6 +500,16 @@ pub fn poison_global_for_test() {
     .join();
 }
 
+/// Held by every test that writes to, poisons or holds the process-wide state, or that expects a
+/// clean read of it, so they cannot see each other's locks (tests only).
+#[cfg(test)]
+static GLOBAL_STATE_TESTS: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub fn serialize_global_state_tests() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_STATE_TESTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Runs `f` while this thread holds the process-wide state exclusively (tests only).
 #[cfg(test)]
 pub fn with_global_held<R>(f: impl FnOnce() -> R) -> R {
@@ -684,6 +713,7 @@ mod tests {
 
     #[test]
     fn poisoned_lock_is_tolerated() {
+        let _serial = serialize_global_state_tests();
         let _ = std::thread::spawn(|| {
             let _guard = GLOBAL.write().unwrap_or_else(PoisonError::into_inner);
             panic!("poison the language state");
@@ -695,6 +725,114 @@ mod tests {
         assert_eq!(tr("no.such.key"), "no.such.key");
         set_language(Some("de"));
         assert_eq!(current_code(), "de");
+    }
+
+    fn builtin_text(raw: &str, key: &str) -> String {
+        parse_lang(raw.as_bytes()).ok().and_then(|l| l.texts.get(key).cloned()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_broken_settings_file_is_never_met_with_advice_to_delete_it() {
+        // (builtin, word for the keys, word for repairing, advice that must not appear)
+        let languages = [
+            (DE_JSON, "Keys", "repariert", ["gelöscht ist", "oder löschen", "oder gelöscht"]),
+            (EN_JSON, "keys", "repaired", ["or deleted", "or delete", "checked or"]),
+        ];
+        for (raw, keys, repair, advice) in languages {
+            for key in ["paths.error.settings_unreadable", "drawer.broken_settings", "drawer.broken_settings_nopath"] {
+                let text = builtin_text(raw, key);
+                assert!(text.contains(keys), "{key} does not mention the keys: {text}");
+                // The repair wording differs between the sentences ("repair the file" / "has been repaired").
+                assert!(text.contains(&repair[..5]), "{key} does not ask for a repair: {text}");
+                for bad in advice {
+                    assert!(!text.contains(bad), "{key} advises deleting: {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn move_texts_name_the_credential_store_and_promise_only_what_happens() {
+        let de_old = builtin_text(DE_JSON, "move.old_left");
+        let en_old = builtin_text(EN_JSON, "move.old_left");
+        assert!(de_old.contains("Daten entfernst") && en_old.contains("data is removed"), "{de_old} / {en_old}");
+        assert!(!DE_JSON.contains("Tresor"));
+        for raw in [DE_JSON, EN_JSON] {
+            let text = builtin_text(raw, "move.not_moved");
+            assert!(!text.contains("weiter genutzt") && !text.contains("stays in use"), "{text}");
+        }
+        assert!(builtin_text(DE_JSON, "drawer.plaintext.hint").contains("beiden PCs"));
+        assert!(builtin_text(EN_JSON, "drawer.plaintext.hint").contains("both PCs"));
+    }
+
+    #[test]
+    fn an_empty_value_counts_as_missing_and_falls_back_to_english() {
+        isolate();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "xx.json",
+            lang_json("xx", "Test", "\"drawer.plaintext.warning\":\"\", \"format.cost_note\":\"  \\t\", \"button.cancel\":\"Stop\"")
+                .as_bytes(),
+        );
+        assert!(scan_folder(dir.path()).is_empty());
+        with_language("xx", || {
+            assert_eq!(tr("drawer.plaintext.warning"), builtin_text(EN_JSON, "drawer.plaintext.warning"));
+            assert_eq!(tr("format.cost_note"), builtin_text(EN_JSON, "format.cost_note"));
+            assert_eq!(tr("button.cancel"), "Stop");
+        });
+    }
+
+    #[test]
+    fn a_blank_thousands_separator_may_be_intended() {
+        isolate();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "xx.json", lang_json("xx", "Test", "\"format.thousands\":\" \"").as_bytes());
+        assert!(scan_folder(dir.path()).is_empty());
+        with_language("xx", || assert_eq!(thousands_separator(), " "));
+    }
+
+    #[test]
+    fn a_value_over_4_kb_skips_the_file_and_the_limit_is_inclusive() {
+        isolate();
+        let dir = tempfile::tempdir().unwrap();
+        let at_limit = format!("\"k\":\"{}\"", "a".repeat(MAX_VALUE_BYTES));
+        let over = format!("\"k\":\"{}\"", "a".repeat(MAX_VALUE_BYTES + 1));
+        write_file(dir.path(), "a_ok.json", lang_json("aa", "A", &at_limit).as_bytes());
+        write_file(dir.path(), "b_big.json", lang_json("bb", "B", &over).as_bytes());
+        let problems = with_language("en", || scan_folder(dir.path()));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].file, "b_big.json");
+        assert!(problems[0].reason.contains("\"k\"") && problems[0].reason.contains("4 KB"), "{}", problems[0].reason);
+        assert!(available().iter().any(|l| l.code == "aa") && !available().iter().any(|l| l.code == "bb"));
+    }
+
+    /// A valid three-letter language code that differs for every `i`.
+    fn code_for(first: char, i: usize) -> String {
+        let letter = |n: usize| char::from(b'a' + (n % 26) as u8);
+        format!("{first}{}{}", letter(i / 26), letter(i))
+    }
+
+    #[test]
+    fn only_the_first_hundred_files_are_read_and_the_limit_is_reported_once() {
+        isolate();
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..MAX_FILES + 5 {
+            let code = code_for('x', i);
+            write_file(dir.path(), &format!("{code}.json"), lang_json(&code, "T", "").as_bytes());
+        }
+        let problems = with_language("en", || scan_folder(dir.path()));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].reason.contains("100") && problems[0].reason.contains("more than"), "{}", problems[0].reason);
+        let loaded = available().into_iter().filter(|l| l.code.starts_with('x')).count();
+        assert_eq!(loaded, MAX_FILES);
+        // Exactly at the limit is fine.
+        let exact = tempfile::tempdir().unwrap();
+        for i in 0..MAX_FILES {
+            let code = code_for('y', i);
+            write_file(exact.path(), &format!("{code}.json"), lang_json(&code, "T", "").as_bytes());
+        }
+        assert!(scan_folder(exact.path()).is_empty());
     }
 
     fn placeholders(text: &str) -> std::collections::BTreeSet<String> {

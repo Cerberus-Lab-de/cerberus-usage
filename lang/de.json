@@ -323,5 +323,7 @@
   "lang.reason.unreadable": "lässt sich nicht lesen: {kind}",
   "lang.reason.too_large": "die Datei ist größer als 1 MB",
   "lang.reason.duplicate": "der Sprachcode \"{code}\" kommt schon aus {first}",
-  "lang.reason.folder_unreadable": "der Ordner lässt sich nicht lesen: {kind}"
+  "lang.reason.folder_unreadable": "der Ordner lässt sich nicht lesen: {kind}",
+  "lang.reason.too_many_files": "mehr als {max} Dateien im Ordner, gelesen werden nur die ersten {max}",
+  "lang.reason.value_too_large": "der Text von \"{key}\" ist länger als 4 KB"
 }

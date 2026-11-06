@@ -156,6 +156,7 @@ mod tests {
 
     #[test]
     fn crash_box_text_survives_a_poisoned_language_state() {
+        let _serial = crate::i18n::serialize_global_state_tests();
         // Another thread panicked while it held the language state.
         crate::i18n::poison_global_for_test();
         let startup = startup_box_text("boom");
@@ -165,6 +166,7 @@ mod tests {
 
     #[test]
     fn crash_box_text_does_not_wait_for_a_held_language_state() {
+        let _serial = crate::i18n::serialize_global_state_tests();
         // The panicking thread may itself hold the state: the box then uses the built-in English text.
         let (startup, panic) = crate::i18n::with_global_held(|| (startup_box_text("boom"), panic_box_text()));
         assert!(startup.starts_with("Cerberus Usage could not open the window.") && startup.contains("boom"), "{startup}");
