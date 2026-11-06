@@ -243,11 +243,16 @@ pub fn with_limits(s: &Settings, budget: Option<&str>, low_balance: Option<&str>
     Ok(out)
 }
 
+/// Serialises every load-edit-save cycle in this process, so two writers cannot lose each other's change.
+static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Re-reads the file, applies `edit` and saves. A broken file is never overwritten; the error names the file.
 pub fn update_settings(
     path: &Path,
     edit: impl FnOnce(&Settings) -> Result<Settings, String>,
 ) -> Result<Settings, String> {
+    // Poison is harmless here: the guarded data is `()`, and the file is only replaced atomically.
+    let _guard = SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (current, error) = settings::load(path);
     if let Some(error) = error {
         return Err(format!("{error}. Datei: {}", path.display()));

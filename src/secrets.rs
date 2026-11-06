@@ -33,6 +33,10 @@ pub enum SecretError {
     StoreUnavailable,
     /// The stored value could not be read in the expected format.
     BadData,
+    /// A key in settings.json cannot be decrypted (other user or machine, or damaged).
+    NotDecryptable,
+    /// settings.json is unreadable or broken, so keys can be neither read nor saved.
+    ConfigUnreadable,
     /// Any other store failure.
     Other,
 }
@@ -42,6 +46,8 @@ impl fmt::Display for SecretError {
         f.write_str(match self {
             SecretError::StoreUnavailable => "Windows-Anmeldeinformationsspeicher nicht verfügbar",
             SecretError::BadData => "Gespeicherter Schlüssel ist nicht lesbar",
+            SecretError::NotDecryptable => "Gespeicherter Schlüssel lässt sich nicht entschlüsseln",
+            SecretError::ConfigUnreadable => "Einstellungsdatei ist nicht lesbar",
             SecretError::Other => "Zugriff auf den Anmeldeinformationsspeicher fehlgeschlagen",
         })
     }

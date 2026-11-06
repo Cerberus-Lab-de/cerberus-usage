@@ -1,6 +1,7 @@
 //! User settings (`%LOCALAPPDATA%\CerberusUsage\settings.json`): credit baseline, top-ups, alert limits.
 //!
-//! All amounts are nano-USD (`u64`), timestamps are RFC 3339. No keys are stored here.
+//! All amounts are nano-USD (`u64`), timestamps are RFC 3339. API and admin keys live here too,
+//! encrypted with DPAPI by default (see `config_store`).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,29 @@ pub struct TopUp {
     pub at: DateTime<Utc>,
 }
 
+/// How a stored key value is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyForm {
+    /// Base64 of a DPAPI blob (current Windows user).
+    Dpapi,
+    /// The key itself, readable in the file.
+    Plain,
+}
+
+/// A key as stored in `settings.json`. `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredKey {
+    pub form: KeyForm,
+    pub value: String,
+}
+
+impl std::fmt::Debug for StoredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredKey").field("form", &self.form).field("value", &"<redacted>").finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -37,6 +61,12 @@ pub struct Settings {
     /// user clicks "Jetzt prüfen" or installs.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Interface language code; `None` follows the system.
+    pub language: Option<String>,
+    /// Keys are written readable instead of DPAPI-encrypted.
+    pub keys_plaintext: bool,
+    pub api_key: Option<StoredKey>,
+    pub admin_key: Option<StoredKey>,
 }
 
 fn default_true() -> bool {
@@ -53,6 +83,10 @@ impl Default for Settings {
             obsidian_path: None,
             logs_root: None,
             check_updates: true,
+            language: None,
+            keys_plaintext: false,
+            api_key: None,
+            admin_key: None,
         }
     }
 }
@@ -143,6 +177,10 @@ mod tests {
             obsidian_path: None,
             logs_root: None,
             check_updates: false,
+            language: Some("de".to_string()),
+            keys_plaintext: true,
+            api_key: Some(StoredKey { form: KeyForm::Plain, value: "x".to_string() }),
+            admin_key: None,
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), (s, None));
@@ -160,6 +198,37 @@ mod tests {
         assert!(empty.check_updates && Settings::default().check_updates);
         let off: Settings = serde_json::from_str(r#"{"check_updates": false}"#).unwrap();
         assert!(!off.check_updates);
+    }
+
+    #[test]
+    fn old_config_loads_with_defaults() {
+        // The v1.0.1 file shape: no language, no keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"baseline": null, "topups": [], "monthly_budget_nano": 7, "low_balance_nano": null,
+                "obsidian_path": null, "logs_root": null, "check_updates": true}"#,
+        )
+        .unwrap();
+        let (s, err) = load(&path);
+        assert!(err.is_none());
+        assert!(!s.keys_plaintext && s.api_key.is_none() && s.admin_key.is_none() && s.language.is_none());
+        assert_eq!(s.monthly_budget_nano, Some(7));
+    }
+
+    #[test]
+    fn debug_never_shows_a_key() {
+        let s = Settings {
+            api_key: Some(StoredKey { form: KeyForm::Plain, value: "sk-ant-test-SECRET".to_string() }),
+            admin_key: Some(StoredKey { form: KeyForm::Dpapi, value: "sk-ant-test-SECRET".to_string() }),
+            ..Settings::default()
+        };
+        let shown = format!("{s:?} {:#?}", s.api_key);
+        assert!(!shown.contains("SECRET"), "leaked: {shown}");
+        assert!(shown.contains("<redacted>"));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""form":"plain""#) && json.contains(r#""form":"dpapi""#));
     }
 
     #[test]
