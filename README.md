@@ -29,15 +29,15 @@ Kleine Windows-App im Infobereich (Tray). Sie startet Obsidian wahlweise mit dem
 
 Die App sucht beim Start und danach einmal täglich nach einer neuen Version (Releases dieses Repos). Gibt es eine, erscheint im Cockpit ein dezenter Hinweis. Installiert wird nur nach Klick auf „Jetzt aktualisieren“, nie im Hintergrund.
 
-Jedes Release enthält neben dem Installer eine Manifest-Datei (`…exe.manifest.json`) mit Version, Dateiname, SHA-256 und einer **Ed25519-Signatur**. Der öffentliche Schlüssel ist in die App eingebaut; der private liegt nur im Windows-Anmeldeinformationsspeicher des Entwicklers, nie im Repo oder auf GitHub. Die App installiert nichts, wenn die Signatur falsch ist oder fehlt, die Prüfsumme nicht passt oder die Version nicht neuer ist als die laufende. Auch ein gekapertes GitHub-Konto kann so kein Update unterschieben.
+Jedes Release enthält neben dem Installer eine Manifest-Datei (`…exe.manifest.json`) mit Version, Dateiname, SHA-256 und einer **Ed25519-Signatur**. Der öffentliche Schlüssel ist in die App eingebaut; der private liegt im Windows-Anmeldeinformationsspeicher des Entwicklers (dazu eine Sicherung im Passwort-Manager des Entwicklers), nie im Repo oder auf GitHub. Die App installiert nichts, wenn die Signatur falsch ist oder fehlt, die Prüfsumme nicht passt oder die Version nicht neuer ist als die laufende. Ein gekapertes GitHub-Konto kann so kein Update unterschieben. Es könnte aber die Setup-Datei für Neuinstallationen austauschen (die hat keine Signaturprüfung durch die App) und Updates zurückhalten.
 
-Der Schalter „Nach Updates suchen“ in der Schublade schaltet das ab (dann geht keine Anfrage an GitHub raus). Dort stehen auch die aktuelle Version und „Jetzt prüfen“.
+Der Schalter „Nach Updates suchen“ in der Schublade schaltet die automatischen Prüfungen ab (dann geht von allein keine Anfrage an GitHub raus). Dort stehen auch die aktuelle Version und „Jetzt prüfen“.
 
 ## Datenschutz: was die App liest und sendet
 
 - **Liest lokal:** die Claude-Protokolle unter `%USERPROFILE%\.claude\projects` (oder `%CLAUDE_CONFIG_DIR%\projects`), und zwar **nur Metadaten** wie Zeit, Modell und Token-Zahlen, nie Gesprächsinhalte.
 - **Sendet an Anthropic** (`api.anthropic.com`) nur, wenn du einen **Admin-Key** gespeichert hast: die Abfrage der Kosten-API. Ohne Admin-Key geht nichts an Anthropic. Der normale API-Key geht nur an den von dir gestarteten Obsidian-Prozess, nicht an die App-Anfragen.
-- **GitHub** (`api.github.com`, `github.com` und die Download-Server für Releases) wird **nur für die Update-Prüfung** und den Update-Download angesprochen, und nur solange „Nach Updates suchen“ an ist. Die Anfrage enthält nur die Versionsabfrage.
+- **GitHub** (`api.github.com`, `github.com` und die Download-Server für Releases) wird **nur für die Update-Prüfung** und den Update-Download angesprochen. Automatische Prüfungen laufen nur, solange „Nach Updates suchen“ an ist. „Jetzt prüfen“ und „Jetzt aktualisieren“ gehen auch bei ausgeschaltetem Schalter raus, weil du sie selbst auslöst. Jede Anfrage verrät GitHub deine IP-Adresse und die App-Version (im User-Agent `cerberus-usage/<Version>`); mehr enthält sie nicht.
 - **Keine Telemetrie.** Es werden keine Nutzungsdaten gesendet, es gibt keine Konten und keinen eigenen Server.
 - **Keys** liegen im Windows-Anmeldeinformationsspeicher (Credential Manager), Dienst `cerberus-usage`. Nie in Dateien, Logs oder der Oberfläche; die Eingabefelder sind maskiert.
   - **API-Key** (`sk-ant-…`): nur für „Mit API-Key starten“. Er muss einem Workspace zugeordnet sein (Geltungsbereich Default), sonst lehnt die API Anfragen ab.
@@ -76,7 +76,7 @@ Das X-Symbol versteckt das Fenster im Tray. Ein Klick auf das Tray-Symbol holt e
 
 ## Aus dem Quellcode bauen
 
-Voraussetzungen: Windows 10/11 x86-64, Rust stable (Edition 2024) und die Visual-Studio-Build-Tools. In PowerShell (nicht in Git Bash, dessen `link.exe` stört das Linken):
+Voraussetzungen: Windows 10/11 x86-64, Rust 1.95 oder neuer (stable; so hoch ist die Mindestversion der eingesetzten UI-Bibliothek egui 0.37, die Edition ist 2024) und die Visual-Studio-Build-Tools. In PowerShell (nicht in Git Bash, dessen `link.exe` stört das Linken):
 
 ```powershell
 cargo test
@@ -89,7 +89,7 @@ Die App liegt danach unter `target\release\cerberus-usage.exe`. Läuft gerade ei
 
 Für Maintainer. Zusätzlich nötig: [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), die GitHub CLI (`gh`, angemeldet) und der Signaturschlüssel im Credential Store (einmalig mit `cargo run --release --bin sign-release -- keygen` erzeugt).
 
-1. Version in `Cargo.toml` erhöhen, Abschnitt in `CHANGELOG.md` ergänzen, committen und pushen.
+1. Version in `Cargo.toml` erhöhen, Abschnitt in `CHANGELOG.md` ergänzen. Nach jeder Änderung an `Cargo.lock` zusätzlich `python tools\third_party_licenses.py` ausführen (erzeugt `installer\THIRD-PARTY-LICENSES.txt`, nur Python-Standardbibliothek). Committen und pushen.
 2. `.\release.ps1 -DryRun` prüft Tests, Build und Installer, ohne zu signieren oder hochzuladen.
 3. `.\release.ps1` baut den Installer nach `dist\`, signiert das Manifest und fragt „Release v… auf GitHub veröffentlichen? (j/n)“. Erst bei „j“ wird das Release angelegt. Das Skript pusht nie Commits.
 
@@ -97,4 +97,4 @@ Die CI (`.github/workflows/ci.yml`) führt bei jedem Push Tests und Release-Buil
 
 ## Lizenz
 
-[MIT](LICENSE), Copyright (c) 2026 Cerberus Lab.
+[MIT](LICENSE), Copyright (c) 2026 Cerberus Lab. Die Lizenztexte der eingebauten Bibliotheken (inklusive der Schriften) stehen in `THIRD-PARTY-LICENSES.txt`; der Installer legt sie zusammen mit `LICENSE` in den Installationsordner.
