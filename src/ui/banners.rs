@@ -85,13 +85,21 @@ fn banner_colors(tone: Tone) -> (Color32, Stroke, Color32) {
     }
 }
 
+/// Index of the banner that gets a close button: the notice (always the last item), unless it
+/// removes itself. Warnings and errors that come from the state of the app have no close button.
+pub fn closable_index(item_count: usize, has_notice: bool, notice_expires: bool) -> Option<usize> {
+    (has_notice && !notice_expires && item_count > 0).then(|| item_count - 1)
+}
+
 /// Banners one under the other, each in its severity colour. A tall stack scrolls inside the strip.
-pub fn banner_strip(ui: &mut egui::Ui, items: &[(Tone, String)]) {
+/// The banner at `closable` has a close button; returns true when it was clicked.
+pub fn banner_strip(ui: &mut egui::Ui, items: &[(Tone, String)], closable: Option<usize>) -> bool {
     if items.is_empty() {
-        return;
+        return false;
     }
+    let mut closed = false;
     egui::ScrollArea::vertical().id_salt("banner-strip").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-        for (tone, text) in items {
+        for (i, (tone, text)) in items.iter().enumerate() {
             let (fill, stroke, text_color) = banner_colors(*tone);
             egui::Frame::new()
                 .fill(fill)
@@ -100,10 +108,26 @@ pub fn banner_strip(ui: &mut egui::Ui, items: &[(Tone, String)]) {
                 .inner_margin(egui::Margin::symmetric(10, 7))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(text).color(text_color));
+                    if closable == Some(i) {
+                        egui::Sides::new().shrink_left().show(
+                            ui,
+                            |ui| {
+                                ui.label(RichText::new(text).color(text_color));
+                            },
+                            |ui| {
+                                let close = egui::Button::new(RichText::new("✕").size(13.0).color(text_color)).frame(false);
+                                if ui.add(close).on_hover_text("Schließen").clicked() {
+                                    closed = true;
+                                }
+                            },
+                        );
+                    } else {
+                        ui.label(RichText::new(text).color(text_color));
+                    }
                 });
         }
     });
+    closed
 }
 
 #[cfg(test)]
@@ -167,6 +191,15 @@ mod tests {
         assert_eq!(items[0].1, save);
         let read = banner_items(&BannerInput { scan_error: Some("Ordner fehlt"), ..empty() });
         assert_eq!(read[0].1, "Fehler beim Lesen der Protokolle: Ordner fehlt");
+    }
+
+    #[test]
+    fn only_a_lasting_notice_gets_a_close_button() {
+        // The notice is the last item; a self-removing "gestartet" notice has no button.
+        assert_eq!(closable_index(3, true, false), Some(2));
+        assert_eq!(closable_index(3, true, true), None);
+        assert_eq!(closable_index(3, false, false), None);
+        assert_eq!(closable_index(0, true, false), None);
     }
 
     #[test]

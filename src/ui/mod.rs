@@ -34,7 +34,7 @@ use crate::view::{
     DetailKind, EscTarget, GrowAction, GrowState, differs_from_request, esc_may_close, esc_target, grow_cap, growth_for,
     mode_card_with_routing, shrink_to, toggle_detail,
 };
-use banners::{BannerInput, banner_items, banner_strip};
+use banners::{BannerInput, banner_items, banner_strip, closable_index};
 use details::{DetailData, DetailView, animated_area, effective_tab};
 use drawer::{Notes, Section};
 use theme::palette::{BG, MUTED, PANEL};
@@ -44,6 +44,8 @@ use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 const MODE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// After a successful start, "not running" polls are ignored for this long (the process may not show up yet).
 const START_GRACE: Duration = Duration::from_secs(15);
+/// The "Obsidian wurde im Modus … gestartet" notice goes away on its own after this long.
+const STARTED_NOTICE_TTL: Duration = Duration::from_secs(8);
 
 pub use crate::view::ModeDisplay;
 
@@ -85,6 +87,8 @@ pub struct AppState {
     /// Waiting for the user to confirm closing Obsidian before starting in this mode.
     pub confirm: Option<Mode>,
     pub notice: Option<Notice>,
+    /// When the current notice removes itself (only the "gestartet" notice does).
+    notice_expires: Option<Instant>,
     /// Content of the masked key field; cleared after a successful save.
     pub key_input: String,
     /// Whether an API key is stored (`None`: store not readable).
@@ -123,6 +127,7 @@ impl AppState {
             launching: None,
             confirm: None,
             notice: None,
+            notice_expires: None,
             key_input: String::new(),
             key_stored: None,
             admin_key_input: String::new(),
@@ -141,13 +146,36 @@ impl AppState {
         }
     }
 
+    /// Shows `notice` until it is closed (or replaced). Only [`Self::apply_outcome`] sets a timer.
+    pub fn set_notice(&mut self, notice: Option<Notice>) {
+        self.notice = notice;
+        self.notice_expires = None;
+    }
+
+    /// The user closed the notice.
+    pub fn dismiss_notice(&mut self) {
+        self.set_notice(None);
+    }
+
+    /// Whether the current notice goes away by itself, so it needs no close button.
+    pub fn notice_expires(&self) -> bool {
+        self.notice.is_some() && self.notice_expires.is_some()
+    }
+
+    /// Drops the "gestartet" notice once its time is up.
+    pub fn tick_notice(&mut self, now: Instant) {
+        if self.notice_expires.is_some_and(|at| now >= at) {
+            self.set_notice(None);
+        }
+    }
+
     /// The launch thread ended without a result (it panicked): the buttons come back, with an error.
     pub fn apply_launch_lost(&mut self) {
         self.launching = None;
-        self.notice = Some(Notice {
+        self.set_notice(Some(Notice {
             kind: NoticeKind::Error,
             text: "Der Startvorgang wurde unerwartet beendet. Ob Obsidian läuft, zeigt die Anzeige oben.".to_string(),
-        });
+        }));
     }
 
     /// Shows the one-time note from loading the saved state, unless a notice is already up.
@@ -157,7 +185,7 @@ impl AppState {
         }
         if let Some(text) = note {
             self.state_note_shown = true;
-            self.notice = Some(Notice { kind: NoticeKind::Info, text: text.to_string() });
+            self.set_notice(Some(Notice { kind: NoticeKind::Info, text: text.to_string() }));
         }
     }
 
@@ -212,6 +240,10 @@ impl AppState {
                 // Obsidian was closed: whoever starts it next, we no longer know the mode.
                 self.started_by_app = None;
             }
+            if self.running != Some(false) && self.notice_expires.is_some() {
+                // The running state changed: the "gestartet" notice no longer describes it.
+                self.set_notice(None);
+            }
             self.running = Some(false);
         }
         self.recompute_mode();
@@ -231,10 +263,11 @@ impl AppState {
             LaunchOutcome::NeedsConfirmation => self.confirm = Some(mode),
             LaunchOutcome::Started => {
                 self.apply_started(mode, now);
-                self.notice = outcome_message(mode, outcome).map(|text| Notice { kind: NoticeKind::Info, text });
+                self.set_notice(outcome_message(mode, outcome).map(|text| Notice { kind: NoticeKind::Info, text }));
+                self.notice_expires = self.notice.as_ref().map(|_| now + STARTED_NOTICE_TTL);
             }
             _ => {
-                self.notice = outcome_message(mode, outcome).map(|text| Notice { kind: NoticeKind::Error, text });
+                self.set_notice(outcome_message(mode, outcome).map(|text| Notice { kind: NoticeKind::Error, text }));
             }
         }
     }
@@ -581,6 +614,7 @@ impl CerberusApp {
         }
         let now = Instant::now();
         self.state.apply_answer(proc_answer(self.obsidian_running.load(Ordering::Relaxed)), now);
+        self.state.tick_notice(now);
         if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
             tray.update(tooltip(snapshot, self.state.mode, !self.routing_names.is_empty()), icon_state(&snapshot.alerts));
         }
@@ -607,11 +641,13 @@ impl CerberusApp {
                         if started {
                             // Re-check once the grace period is over (the poller only reports changes).
                             ctx.request_repaint_after(START_GRACE + Duration::from_secs(1));
+                            // And once more for the "gestartet" notice to go away.
+                            ctx.request_repaint_after(STARTED_NOTICE_TTL + Duration::from_millis(200));
                         }
                     }
                     LaunchMsg::StoreError(e) => {
                         self.state.launching = None;
-                        self.state.notice = Some(Notice { kind: NoticeKind::Error, text: e.to_string() });
+                        self.state.set_notice(Some(Notice { kind: NoticeKind::Error, text: e.to_string() }));
                     }
                 }
             }
@@ -627,7 +663,7 @@ impl CerberusApp {
         if self.launch_rx.is_some() {
             return;
         }
-        self.state.notice = None;
+        self.state.set_notice(None);
         self.state.launching = Some((mode, confirmed_close));
         self.control.set_launch_busy(ctx, true);
         self.launch_rx = Some(spawn_launch(mode, confirmed_close, ctx.clone()));
@@ -681,10 +717,15 @@ impl eframe::App for CerberusApp {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
             .show(ui, |ui| cockpit::top_bar(ui, &self.logo, &mut self.drawer_open));
         if !items.is_empty() {
-            egui::Panel::top("banner-strip")
+            let closable = closable_index(items.len(), self.state.notice.is_some(), self.state.notice_expires());
+            let closed = egui::Panel::top("banner-strip")
                 .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
                 .show_separator_line(false)
-                .show(ui, |ui| banner_strip(ui, &items));
+                .show(ui, |ui| banner_strip(ui, &items, closable))
+                .inner;
+            if closed {
+                self.state.dismiss_notice();
+            }
         }
         // Below the top bar and the banner strip: where the backdrop and the drawer go.
         let body = ui.available_rect_before_wrap();
@@ -708,7 +749,7 @@ impl eframe::App for CerberusApp {
 // ---- drawing -------------------------------------------------------------------------------------
 
 impl CerberusApp {
-    /// Every v1 banner, in severity colours.
+    /// Every v1 banner, in severity colours. The notice, if any, is always the last one.
     fn banners(&self) -> Vec<(crate::view::Tone, String)> {
         let snapshot = self.state.snapshot.as_ref();
         let pause_text = snapshot
@@ -1079,6 +1120,62 @@ mod tests {
             assert_eq!(proc_answer(proc_code(a)), a);
         }
         assert_eq!(proc_answer(99), None);
+    }
+
+    #[test]
+    fn started_notice_goes_after_eight_seconds() {
+        let t0 = Instant::now();
+        let mut s = AppState::new();
+        s.apply_outcome(Mode::Max, LaunchOutcome::Started, t0);
+        assert!(s.notice.is_some() && s.notice_expires());
+        s.tick_notice(t0 + STARTED_NOTICE_TTL - Duration::from_millis(1));
+        assert!(s.notice.is_some());
+        s.tick_notice(t0 + STARTED_NOTICE_TTL);
+        assert!(s.notice.is_none() && !s.notice_expires());
+    }
+
+    #[test]
+    fn started_notice_goes_when_the_running_state_changes() {
+        let t0 = Instant::now();
+        let mut s = AppState::new();
+        s.apply_outcome(Mode::Max, LaunchOutcome::Started, t0);
+        // Same state as the notice describes: it stays.
+        s.apply_running(true, t0 + Duration::from_secs(2));
+        assert!(s.notice.is_some());
+        // Inside the start grace a "closed" answer is ignored, so the notice stays too.
+        s.apply_running(false, t0 + Duration::from_secs(3));
+        assert!(s.notice.is_some());
+        // Obsidian really closed: the notice goes at once, well before the 8 s are up.
+        s.apply_running(false, t0 + START_GRACE + Duration::from_secs(1));
+        assert!(s.notice.is_none());
+    }
+
+    #[test]
+    fn other_notices_stay_until_closed_or_the_next_launch() {
+        let t0 = Instant::now();
+        let mut s = AppState::new();
+        s.apply_running(true, t0);
+        s.apply_outcome(Mode::ApiKey, LaunchOutcome::MissingKey, t0);
+        assert!(s.notice.is_some() && !s.notice_expires());
+        // Neither time nor a changed running state removes an error or an info note.
+        s.tick_notice(t0 + Duration::from_secs(3600));
+        s.apply_running(false, t0 + Duration::from_secs(3600));
+        assert!(s.notice.is_some());
+        s.dismiss_notice();
+        assert!(s.notice.is_none());
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        s.tick_notice(t0 + Duration::from_secs(7200));
+        assert!(s.notice.is_some() && !s.notice_expires());
+    }
+
+    #[test]
+    fn a_new_notice_cancels_the_timer_of_the_old_one() {
+        let t0 = Instant::now();
+        let mut s = AppState::new();
+        s.apply_outcome(Mode::Max, LaunchOutcome::Started, t0);
+        s.apply_outcome(Mode::Max, LaunchOutcome::MissingKey, t0 + Duration::from_secs(1));
+        s.tick_notice(t0 + STARTED_NOTICE_TTL + Duration::from_secs(1));
+        assert!(s.notice.is_some(), "the error must not vanish with the old timer");
     }
 
     #[test]

@@ -424,7 +424,7 @@ mod tests {
                         };
                         let mut output = ctx.run_ui(input, |ui| {
                             crate::ui::cockpit::top_bar(ui, &logo, &mut drawer);
-                            crate::ui::banners::banner_strip(ui, &[(crate::view::Tone::Amber, "x".into())]);
+                            crate::ui::banners::banner_strip(ui, &[(crate::view::Tone::Amber, "x".into())], Some(0));
                             let card = crate::view::mode_card(crate::view::ModeDisplay::Max);
                             crate::ui::cockpit::mode_card_ui(ui, card, Some((crate::launcher::Mode::Max, false)), None);
                             let figs = crate::ui::cockpit::figures(&report, &balance, true);
