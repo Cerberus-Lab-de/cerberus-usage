@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{tr, tr_args};
+
 /// Credit balance at a known point in time (read from the Console by the user).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
@@ -111,7 +113,7 @@ pub fn load(path: &Path) -> (Settings, Option<String>) {
         Err(_) => {
             return (
                 Settings::default(),
-                Some("Einstellungen konnten nicht gelesen werden".to_string()),
+                Some(tr("settings.read_failed")),
             );
         }
     };
@@ -119,10 +121,9 @@ pub fn load(path: &Path) -> (Settings, Option<String>) {
         Ok(s) => (s, None),
         Err(e) => (
             Settings::default(),
-            Some(format!(
-                "Einstellungen sind ungültig (Zeile {}, Spalte {}); die Datei wurde nicht verändert",
-                e.line(),
-                e.column()
+            Some(tr_args(
+                "settings.invalid",
+                &[("line", &e.line().to_string()), ("column", &e.column().to_string())],
             )),
         ),
     }

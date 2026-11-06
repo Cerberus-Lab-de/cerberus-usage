@@ -402,6 +402,42 @@ pub fn tr_n(key: &str, n: u64, args: &[(&str, &str)]) -> String {
     fill(&text, &all)
 }
 
+/// Like [`tr_args`] for code that must work when the language state is unusable (crash box).
+/// It never waits for the state lock, which the panicking thread itself may be holding, and a
+/// poisoned lock is read anyway. When no text is available it uses `fallback`.
+pub fn tr_args_or(key: &str, fallback: &str, args: &[(&str, &str)]) -> String {
+    #[cfg(test)]
+    let local = LOCAL.with(|l| l.borrow().as_ref().map(|s| resolve(s, &[key])));
+    #[cfg(not(test))]
+    let local: Option<Option<String>> = None;
+    let found = match local {
+        Some(found) => found,
+        None => match GLOBAL.try_read() {
+            Ok(guard) => resolve(&guard, &[key]),
+            Err(std::sync::TryLockError::Poisoned(p)) => resolve(&p.into_inner(), &[key]),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        },
+    };
+    fill(found.as_deref().unwrap_or(fallback), args)
+}
+
+/// Poisons the process-wide state, as a panic inside a write would (tests only).
+#[cfg(test)]
+pub fn poison_global_for_test() {
+    let _ = std::thread::spawn(|| {
+        let _guard = GLOBAL.write().unwrap_or_else(PoisonError::into_inner);
+        panic!("poisoning the language state on purpose");
+    })
+    .join();
+}
+
+/// Runs `f` while this thread holds the process-wide state exclusively (tests only).
+#[cfg(test)]
+pub fn with_global_held<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = GLOBAL.write().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
 /// Thousands separator of the current language (`,` if a file omits it).
 pub fn thousands_separator() -> String {
     read(|s| resolve(s, &["format.thousands"])).unwrap_or_else(|| ",".to_string())
@@ -641,5 +677,135 @@ mod tests {
                 "placeholders differ for {key}"
             );
         }
+    }
+
+    /// Modules whose texts come from the language files. `ui/` and `tray.rs` follow with the window.
+    const NON_UI_MODULES: [&str; 18] = [
+        "format", "cards", "view", "report", "worker", "analytics", "update", "update_worker", "paths", "paths_ui",
+        "secrets", "settings", "cleanup", "crash", "single_instance", "launcher", "balance", "log_scan",
+    ];
+
+    /// The part of a source file before its test module.
+    fn non_test_source(module: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(format!("{module}.rs"));
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let end = text.find("#[cfg(test)]\nmod tests").or_else(|| text.find("#[cfg(test)]\r\nmod tests"));
+        text[..end.unwrap_or(text.len())].to_string()
+    }
+
+    /// Contents of the string literals in Rust code; comments, char literals and lifetimes are skipped.
+    fn string_literals(code: &str) -> Vec<String> {
+        let chars: Vec<char> = code.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '/' if chars.get(i + 1) == Some(&'/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                'r' if matches!(chars.get(i + 1), Some('"' | '#'))
+                    && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')) =>
+                {
+                    let mut j = i + 1;
+                    let mut hashes = 0;
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if chars.get(j) != Some(&'"') {
+                        i += 1;
+                        continue;
+                    }
+                    j += 1;
+                    let start = j;
+                    let closing: String = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                    let mut end = start;
+                    while end < chars.len() && !chars[end..].starts_with(&closing.chars().collect::<Vec<_>>()) {
+                        end += 1;
+                    }
+                    out.push(chars[start..end.min(chars.len())].iter().collect());
+                    i = end + closing.len();
+                }
+                '"' => {
+                    let mut j = i + 1;
+                    let mut lit = String::new();
+                    while j < chars.len() && chars[j] != '"' {
+                        if chars[j] == '\\' {
+                            lit.push(chars[j]);
+                            j += 1;
+                        }
+                        if j < chars.len() {
+                            lit.push(chars[j]);
+                        }
+                        j += 1;
+                    }
+                    out.push(lit);
+                    i = j + 1;
+                }
+                '\'' => {
+                    // A char literal ('x', '\n', '"') is skipped whole; a lifetime has no closing quote.
+                    let close = if chars.get(i + 1) == Some(&'\\') { i + 3 } else { i + 2 };
+                    if chars.get(close) == Some(&'\'') {
+                        i = close + 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_german_left_in_non_ui_modules() {
+        let mut found = Vec::new();
+        for module in NON_UI_MODULES {
+            for lit in string_literals(&non_test_source(module)) {
+                if lit.chars().any(|c| "äöüÄÖÜß".contains(c)) {
+                    found.push(format!("{module}.rs: {lit}"));
+                }
+            }
+        }
+        assert!(found.is_empty(), "German text outside the language files:\n{}", found.join("\n"));
+    }
+
+    #[test]
+    fn the_scanner_reads_literals_and_skips_comments_and_chars() {
+        let code = "// \"ä\" in a comment\nlet a = \"ö \\\" ü\"; let c = '\"'; let r = r#\"ß \"x\"\"#; fn f<'a>() {} /* \"ä\" */";
+        assert_eq!(string_literals(code), vec!["ö \\\" ü".to_string(), "ß \"x\"".to_string()]);
+    }
+
+    #[test]
+    fn every_key_the_code_asks_for_exists_in_both_builtins() {
+        let de: serde_json::Map<String, serde_json::Value> = serde_json::from_str(DE_JSON).unwrap();
+        let en: serde_json::Map<String, serde_json::Value> = serde_json::from_str(EN_JSON).unwrap();
+        let known = |m: &serde_json::Map<String, serde_json::Value>, key: &str| {
+            m.contains_key(key) || m.contains_key(&format!("{key}.one")) || m.contains_key(&format!("{key}.other"))
+        };
+        let looks_like_key = |s: &str| {
+            s.contains('.')
+                && !s.ends_with(['.'])
+                && s.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+                && !["json", "log", "exe", "jsonl", "part", "tmp", "bad"].contains(&s.rsplit('.').next().unwrap_or(""))
+        };
+        let mut missing = Vec::new();
+        for module in NON_UI_MODULES {
+            for lit in string_literals(&non_test_source(module)) {
+                if looks_like_key(&lit) && !(known(&de, &lit) && known(&en, &lit)) {
+                    missing.push(format!("{module}.rs: {lit}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "keys missing in a built-in language:\n{}", missing.join("\n"));
     }
 }

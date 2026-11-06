@@ -12,7 +12,7 @@ use super::theme::palette::{AMBER, BG, CYAN, CYAN_DARK, LINE, MUTED, PANEL, PANE
 use super::cost_cell_text;
 use crate::analytics::ApiError;
 use crate::cards::{BalanceCard, api_error_text};
-use crate::format::{COST_NOTE, format_count, pause_text, unpriced_text};
+use crate::format::{cost_note, format_count, pause_text, unpriced_text};
 use crate::pricing::format_usd;
 use crate::report::{Bucket, Report};
 use crate::view::{DetailKind, bar_fraction, day_bars, truncate_name};
@@ -260,7 +260,7 @@ fn history(ui: &mut egui::Ui, kind: DetailKind, data: &DetailData, view: &mut De
         // Only taller content may need the window to grow.
         out.layout_changed = view.rows_expanded;
     }
-    ui.label(RichText::new(format!("Kosten sind {COST_NOTE}")).small().color(MUTED));
+    ui.label(RichText::new(format!("Kosten sind {}", cost_note())).small().color(MUTED));
 }
 
 fn balance(ui: &mut egui::Ui, data: &DetailData, out: &mut DetailOutput) {

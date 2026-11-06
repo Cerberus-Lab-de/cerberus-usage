@@ -11,6 +11,7 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::analytics::{ApiPoller, ApiStatus, Http};
 use crate::balance::{Alert, BalanceStatus, alerts, status as balance_status};
+use crate::i18n::{tr, tr_args};
 use crate::settings::{Settings, load as load_settings};
 use crate::log_scan::{ScanState, ScanStats, load_state_checked, save_state, scan};
 use crate::pricing::PriceTable;
@@ -130,7 +131,7 @@ impl Live {
     /// settings; the problem is reported instead.
     fn reload_settings(&mut self, path: Option<&Path>) {
         let Some(path) = path else {
-            self.settings_error = Some("Einstellungen: LOCALAPPDATA ist nicht gesetzt".to_string());
+            self.settings_error = Some(tr("worker.settings_no_localappdata"));
             return;
         };
         let (loaded, error) = load_settings(path);
@@ -218,7 +219,7 @@ fn guarded_tick(cfg: &WorkerConfig, core: &mut Core, tx: &Sender<Snapshot>, noti
                 core.last_report.clone(),
                 0,
                 0,
-                Some("Interner Fehler im Hintergrunddienst. Der nächste Durchlauf versucht es erneut.".to_string()),
+                Some(tr("worker.internal_error")),
             );
             snapshot.state_note = core.state_note.clone();
             deliver(tx, notify, snapshot)
@@ -260,12 +261,8 @@ fn tick(cfg: &WorkerConfig, core: &mut Core, tx: &Sender<Snapshot>, notify: &dyn
 
     let (files, scan_failed, mut error) = match outcome {
         Ok(Ok(stats)) => (stats.files_total, false, None),
-        Ok(Err(e)) => (0, true, Some(format!("Scan fehlgeschlagen: {e}"))),
-        Err(_) => (
-            0,
-            true,
-            Some("Scan fehlgeschlagen: interner Fehler".to_string()),
-        ),
+        Ok(Err(e)) => (0, true, Some(tr_args("worker.scan_failed", &[("error", &e.to_string())]))),
+        Err(_) => (0, true, Some(tr("worker.scan_failed_internal"))),
     };
 
     // Written only when the scan changed something and not more often than every SAVE_INTERVAL.
@@ -275,15 +272,19 @@ fn tick(cfg: &WorkerConfig, core: &mut Core, tx: &Sender<Snapshot>, notify: &dyn
                 core.state.dirty = false;
                 core.gate.saved(now);
             }
-            Err(e) => error = Some(format!("Zustand konnte nicht gespeichert werden: {e}")),
+            Err(e) => error = Some(tr_args("worker.save_failed", &[("error", &e.to_string())])),
         }
     }
     if error.is_none() {
         error = match &cfg.logs_unavailable {
             Some(reason) => Some(reason.clone()),
-            None if !cfg.logs_root.is_dir() => Some(format!(
-                "Protokollordner nicht gefunden: {}. Pfad in den Einstellungen unter „Pfade“ prüfen.",
-                cfg.logs_root.display()
+            None if !cfg.logs_root.is_dir() => Some(tr_args(
+                "worker.logs_not_found",
+                &[
+                    ("path", &cfg.logs_root.display().to_string()),
+                    ("settings", &tr("ui.settings")),
+                    ("paths", &tr("ui.paths")),
+                ],
             )),
             None => None,
         };

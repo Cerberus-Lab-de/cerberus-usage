@@ -530,7 +530,7 @@ impl CerberusApp {
         ui.add_enabled_ui(can_save, |ui| self.draw_limits_section(ui));
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         if let Some(text) = inert_limits_hint(api) {
-            warn(ui, text);
+            warn(ui, &text);
         }
 
         // -- Pfade

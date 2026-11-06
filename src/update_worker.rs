@@ -16,6 +16,7 @@ use chrono::{DateTime, Local};
 use semver::Version;
 
 use crate::analytics::Http;
+use crate::i18n::tr;
 use crate::update::{
     CURRENT_VERSION, Release, UpdateError, default_update_dir, download_verified_with_hash,
     latest_release, recheck_installer, run_installer,
@@ -36,9 +37,17 @@ pub fn next_check_delay(interval: Duration, failed: bool) -> Duration {
 }
 
 /// Shown when the build carries no update key (until the release process sets one).
-pub const NO_KEY_TEXT: &str = "Update-Schlüssel fehlt in dieser Version.";
-pub const LAUNCH_BUSY_TEXT: &str = "Obsidian wird gerade gestartet. Update abgebrochen, bitte später erneut versuchen.";
-const PANIC_TEXT: &str = "Interner Fehler bei der Update-Prüfung.";
+pub fn no_key_text() -> String {
+    tr("update.no_key_text")
+}
+
+pub fn launch_busy_text() -> String {
+    tr("update.launch_busy")
+}
+
+fn panic_text() -> String {
+    tr("update.panic")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateState {
@@ -123,7 +132,7 @@ pub fn automatic_checks_enabled(settings_path: Option<&Path>) -> bool {
 
 fn failure_text(e: &UpdateError) -> String {
     match e {
-        UpdateError::NoKey => NO_KEY_TEXT.to_string(),
+        UpdateError::NoKey => no_key_text(),
         other => other.to_string(),
     }
 }
@@ -186,11 +195,11 @@ impl Core {
             return;
         }
         let Some(release) = self.release.clone() else {
-            out.send(UpdateState::Failed("Kein Update bekannt. Bitte zuerst prüfen.".to_string()));
+            out.send(UpdateState::Failed(tr("update.none_known")));
             return;
         };
         if self.cfg.key.is_none() {
-            out.send(UpdateState::Failed(NO_KEY_TEXT.to_string()));
+            out.send(UpdateState::Failed(no_key_text()));
             return;
         }
         out.send(UpdateState::Downloading);
@@ -208,14 +217,14 @@ impl Core {
                 Err(e) => UpdateState::Failed(failure_text(&e)),
                 // The window may have started Obsidian meanwhile: never update under a running launch.
                 Ok(()) if self.cfg.launch_busy.load(Ordering::SeqCst) => {
-                    UpdateState::Failed(LAUNCH_BUSY_TEXT.to_string())
+                    UpdateState::Failed(launch_busy_text())
                 }
                 Ok(()) => match (self.cfg.run_installer)(&path) {
                     Ok(()) => {
                         self.installed = true;
                         UpdateState::Installing
                     }
-                    Err(_) => UpdateState::Failed("Der Installer konnte nicht gestartet werden.".to_string()),
+                    Err(_) => UpdateState::Failed(tr("update.installer_start_failed")),
                 },
             },
         };
@@ -260,7 +269,7 @@ fn run(cfg: UpdateConfig, cmds: Receiver<UpdateCmd>, tx: Sender<UpdateState>, no
             None => due = Instant::now() + DISABLED_RECHECK.min(interval),
         }));
         if step.is_err() {
-            out.send(UpdateState::Failed(PANIC_TEXT.to_string()));
+            out.send(UpdateState::Failed(panic_text()));
             due = Instant::now() + interval;
         }
         if out.gone {
@@ -506,7 +515,7 @@ mod tests {
         let r = available_rig(None, 1);
         let before = r.http.calls();
         r.cmd.send(UpdateCmd::Install).unwrap();
-        assert_eq!(next(&r.rx), UpdateState::Failed(NO_KEY_TEXT.to_string()));
+        assert_eq!(next(&r.rx), UpdateState::Failed(no_key_text()));
         assert_eq!(r.http.calls(), before);
         assert!(r.started.lock().unwrap().is_empty());
         assert!(!r.dir.path().join("dl").exists());
@@ -517,7 +526,7 @@ mod tests {
         let r = available_rig(None, 1);
         for _ in 0..2 {
             r.cmd.send(UpdateCmd::Install).unwrap();
-            assert_eq!(next(&r.rx), UpdateState::Failed(NO_KEY_TEXT.to_string()));
+            assert_eq!(next(&r.rx), UpdateState::Failed(no_key_text()));
         }
         // Same for "no release known" and a repeated failed check.
         let r = rig(Some(r#"{"check_updates": false}"#), 100_000, 100_000, Some(1));
@@ -551,7 +560,7 @@ mod tests {
         r.busy.store(true, Ordering::SeqCst);
         r.cmd.send(UpdateCmd::Install).unwrap();
         assert_eq!(next(&r.rx), UpdateState::Downloading);
-        assert_eq!(next(&r.rx), UpdateState::Failed(LAUNCH_BUSY_TEXT.to_string()));
+        assert_eq!(next(&r.rx), UpdateState::Failed(launch_busy_text()));
         assert!(r.started.lock().unwrap().is_empty());
         // Once the launch is over a retry goes through.
         r.busy.store(false, Ordering::SeqCst);

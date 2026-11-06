@@ -3,6 +3,7 @@
 
 use chrono::{Duration, NaiveDate};
 
+use crate::i18n::tr;
 use crate::report::Bucket;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,30 +24,34 @@ pub enum Tone {
     Neutral,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeCard {
     pub tone: Tone,
-    pub title: &'static str,
-    pub hint: &'static str,
+    pub title: String,
+    pub hint: String,
 }
 
 pub fn mode_card(m: ModeDisplay) -> ModeCard {
     match m {
         ModeDisplay::Max => ModeCard {
             tone: Tone::Green,
-            title: "Max",
-            hint: "Keine API-Kosten, sofern in Claude keine andere Anmeldung eingerichtet ist.",
+            title: tr("format.mode.max"),
+            hint: tr("view.mode.max.hint"),
         },
-        ModeDisplay::ApiKey => ModeCard { tone: Tone::Amber, title: "API-Key", hint: "Kosten nach Verbrauch." },
+        ModeDisplay::ApiKey => ModeCard {
+            tone: Tone::Amber,
+            title: tr("format.mode.api_key"),
+            hint: tr("view.mode.api_key.hint"),
+        },
         ModeDisplay::Unknown => ModeCard {
             tone: Tone::AmberOutline,
-            title: "Modus unbekannt",
-            hint: "Kosten möglich. Über die App neu starten.",
+            title: tr("view.mode.unknown.title"),
+            hint: tr("view.mode.unknown.hint"),
         },
         ModeDisplay::Closed => ModeCard {
             tone: Tone::Neutral,
-            title: "Obsidian geschlossen",
-            hint: "Starte Obsidian mit Max oder API-Key.",
+            title: tr("view.mode.closed.title"),
+            hint: tr("view.mode.closed.hint"),
         },
     }
 }
@@ -57,8 +62,8 @@ pub fn mode_card_with_routing(m: ModeDisplay, routing_active: bool) -> ModeCard 
     if routing_active && m == ModeDisplay::Max {
         return ModeCard {
             tone: Tone::AmberOutline,
-            title: "Max",
-            hint: "Umleitung aktiv, Kosten möglich. Siehe Hinweis oben.",
+            title: tr("format.mode.max"),
+            hint: tr("view.mode.routing.hint"),
         };
     }
     mode_card(m)
@@ -558,5 +563,23 @@ mod tests {
         // Second Esc, nothing focused: closes.
         assert!(esc_may_close(true, false, false));
         assert!(!esc_may_close(false, false, false));
+    }
+
+    #[test]
+    fn max_hint_keeps_its_qualifier_in_every_builtin() {
+        use crate::i18n::with_language;
+        // The Max claim only holds while no other login is set up inside Claude (spec, "Was auf keinen
+        // Fall passieren darf"): every shipped language must carry that qualifier, also under routing.
+        let (de, en) = (
+            with_language("de", || mode_card(ModeDisplay::Max).hint),
+            with_language("en", || mode_card(ModeDisplay::Max).hint),
+        );
+        assert!(de.contains("sofern in Claude keine andere Anmeldung eingerichtet ist"), "{de}");
+        assert!(en.contains("unless another login is set up in Claude"), "{en}");
+        assert!(en.to_lowercase().starts_with("no api costs"), "{en}");
+        let routed = with_language("en", || mode_card_with_routing(ModeDisplay::Max, true));
+        assert_ne!(routed.tone, Tone::Green);
+        assert!(routed.hint.contains("costs possible"), "{}", routed.hint);
+        assert_eq!(with_language("en", || mode_card(ModeDisplay::ApiKey).title), "API key");
     }
 }

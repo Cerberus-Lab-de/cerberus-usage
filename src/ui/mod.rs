@@ -21,7 +21,7 @@ use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::update::UpdateHttp;
 use crate::update_worker::spawn_update_checker;
 use crate::cards::{BalanceCard, api_card, balance_card};
-use crate::format::{COST_NOTE, outcome_message, pause_text, unpriced_text};
+use crate::format::{cost_note, outcome_message, pause_text, unpriced_text};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
 use crate::paths::{Env, real_env, resolve_logs_root};
 use crate::paths_ui::PathsPanel;
@@ -297,7 +297,7 @@ impl Default for AppState {
 /// Validate and store a key. Errors are fixed messages, never the value.
 pub fn save_key(store: &dyn SecretStore, slot: Slot, input: &str) -> Result<(), String> {
     let value = input.trim();
-    validate_key(slot, value).map_err(str::to_string)?;
+    validate_key(slot, value)?;
     store.set(slot, value).map_err(|e| e.to_string())
 }
 
@@ -1042,9 +1042,10 @@ impl CerberusApp {
             ui.add(
                 egui::Label::new(
                     RichText::new(format!(
-                        "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
+                        "Stand: {} · Preisliste vom {} · Kosten sind {}",
                         format_time(snapshot.updated),
-                        self.prices_as_of
+                        self.prices_as_of,
+                        cost_note()
                     ))
                     .small()
                     .color(MUTED),

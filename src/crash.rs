@@ -11,10 +11,27 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Local};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 
+use crate::i18n::tr_args_or;
+
 /// When the log grows beyond this it is started afresh (the file stays small).
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 /// Longest message kept per entry.
 const MAX_MESSAGE_CHARS: usize = 400;
+
+/// What the boxes say when the language state gives no text (poisoned, locked by the panicking
+/// thread, or a broken language file). A test keeps them equal to the built-in English texts.
+const STARTUP_BOX_FALLBACK: &str = "Cerberus Usage could not open the window.\n\n{error}\n\nAn entry was written to %LOCALAPPDATA%\\CerberusUsage\\crash.log.";
+const PANIC_BOX_FALLBACK: &str = "Cerberus Usage ran into an error and will close.\n\nDetails are in %LOCALAPPDATA%\\CerberusUsage\\crash.log.";
+
+/// Text of the box shown when the window cannot start. Never blocks on the language state.
+fn startup_box_text(error: &str) -> String {
+    tr_args_or("crash.box.startup", STARTUP_BOX_FALLBACK, &[("error", &scrub(error))])
+}
+
+/// Text of the box shown for a panic on the main thread. Never blocks on the language state.
+fn panic_box_text() -> String {
+    tr_args_or("crash.box.panic", PANIC_BOX_FALLBACK, &[])
+}
 
 /// `%LOCALAPPDATA%\CerberusUsage\crash.log`; `None` without `LOCALAPPDATA` (no guessing a folder).
 pub fn log_path() -> Option<PathBuf> {
@@ -71,14 +88,12 @@ pub fn show_error_box(text: &str) {
 
 /// Logs the failure to `crash.log` (best effort) and tells the user.
 pub fn report_startup_failure(error: &dyn std::fmt::Display) {
-    let message = format!("Fenster konnte nicht gestartet werden: {error}");
+    // The log is for support and stays in one language.
+    let message = format!("Window could not be started: {error}");
     if let Some(path) = log_path() {
         let _ = append_entry(&path, &format_entry(Local::now(), None, &message));
     }
-    show_error_box(&format!(
-        "Cerberus Usage konnte das Fenster nicht öffnen.\n\n{}\n\nEin Eintrag steht in %LOCALAPPDATA%\\CerberusUsage\\crash.log.",
-        scrub(&error.to_string())
-    ));
+    show_error_box(&startup_box_text(&error.to_string()));
 }
 
 /// Writes every panic to `crash.log`. A panic on the main (UI) thread also shows a message box,
@@ -90,14 +105,14 @@ pub fn install_panic_hook() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let message = match info.payload().downcast_ref::<&str>() {
                 Some(s) => (*s).to_string(),
-                None => info.payload().downcast_ref::<String>().cloned().unwrap_or_else(|| "(kein Text)".to_string()),
+                None => info.payload().downcast_ref::<String>().cloned().unwrap_or_else(|| "(no text)".to_string()),
             };
             let location = info.location().map(|l| (l.file(), l.line()));
             if let Some(path) = log_path() {
                 let _ = append_entry(&path, &format_entry(Local::now(), location, &message));
             }
             if std::thread::current().name() == Some("main") {
-                show_error_box("Cerberus Usage ist auf einen Fehler gestoßen und wird beendet.\n\nDetails stehen in %LOCALAPPDATA%\\CerberusUsage\\crash.log.");
+                show_error_box(&panic_box_text());
             }
         }));
         previous(info);
@@ -137,5 +152,45 @@ mod tests {
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
         append_entry(&path, "fresh\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn crash_box_text_survives_a_poisoned_language_state() {
+        // Another thread panicked while it held the language state.
+        crate::i18n::poison_global_for_test();
+        let startup = startup_box_text("boom");
+        assert!(startup.contains("konnte das Fenster nicht öffnen") && startup.contains("boom"), "{startup}");
+        assert!(panic_box_text().contains("auf einen Fehler gestoßen"), "{}", panic_box_text());
+    }
+
+    #[test]
+    fn crash_box_text_does_not_wait_for_a_held_language_state() {
+        // The panicking thread may itself hold the state: the box then uses the built-in English text.
+        let (startup, panic) = crate::i18n::with_global_held(|| (startup_box_text("boom"), panic_box_text()));
+        assert!(startup.starts_with("Cerberus Usage could not open the window.") && startup.contains("boom"), "{startup}");
+        assert!(panic.starts_with("Cerberus Usage ran into an error"), "{panic}");
+    }
+
+    #[test]
+    fn crash_box_falls_back_when_no_language_has_the_text() {
+        crate::i18n::isolate();
+        let dir = tempfile::tempdir().unwrap();
+        // A chosen language without the key still reaches the built-in English text first.
+        std::fs::write(dir.path().join("xx.json"), r#"{"_meta":{"code":"xx","name":"Test","format":1}}"#).unwrap();
+        assert!(crate::i18n::scan_folder(dir.path()).is_empty());
+        crate::i18n::with_language("xx", || {
+            assert!(panic_box_text().starts_with("Cerberus Usage ran into an error"));
+        });
+        // The fallback constants are the shipped English texts, so they cannot drift apart.
+        crate::i18n::with_language("en", || {
+            assert_eq!(crate::i18n::tr("crash.box.startup"), STARTUP_BOX_FALLBACK);
+            assert_eq!(crate::i18n::tr("crash.box.panic"), PANIC_BOX_FALLBACK);
+        });
+    }
+
+    #[test]
+    fn a_key_in_the_error_text_never_reaches_the_box() {
+        let text = startup_box_text("failed with sk-ant-api03-NOTREAL in a header");
+        assert!(!text.contains("NOTREAL"), "{text}");
     }
 }

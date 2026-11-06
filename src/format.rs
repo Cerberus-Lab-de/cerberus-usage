@@ -1,36 +1,60 @@
-//! Pure label and number formatting for the UI (German texts), kept out of the egui code so it is testable.
+//! Pure label and number formatting for the UI, kept out of the egui code so it is testable.
+//! All texts come from the language files (`crate::i18n`).
+
+use std::fmt::Write as _;
 
 use chrono::{DateTime, Datelike, TimeZone, Weekday};
 
+use crate::i18n::{thousands_separator, tr, tr_args, tr_n};
 use crate::launcher::{LaunchOutcome, Mode};
 
 /// Text shown next to every cost figure.
-pub const COST_NOTE: &str = "geschätzt, Listenpreis";
+pub fn cost_note() -> String {
+    tr("format.cost_note")
+}
 
-/// `1234567` -> `1.234.567`.
+/// `1234567` -> `1.234.567` (German) or `1,234,567` (English): the separator comes from the language.
 pub fn format_count(n: u64) -> String {
     let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let separator = thousands_separator();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * separator.len());
     for (i, c) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push('.');
+            out.push_str(&separator);
         }
         out.push(c);
     }
     out
 }
 
-fn limit_type_label(limit_type: &str) -> &str {
+/// Formats `t` with the pattern stored under `key`. A pattern from a language file can be invalid
+/// (chrono then fails while formatting) or missing, so `fallback` is used instead of panicking.
+pub fn format_time_by<Tz: TimeZone>(t: &DateTime<Tz>, key: &str, fallback: &str) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let pattern = tr(key);
+    let mut out = String::new();
+    if pattern != key && !pattern.is_empty() && write!(out, "{}", t.format(&pattern)).is_ok() {
+        return out;
+    }
+    out.clear();
+    // The fallback is a fixed, valid pattern.
+    let _ = write!(out, "{}", t.format(fallback));
+    out
+}
+
+fn limit_type_label(limit_type: &str) -> String {
     match limit_type {
-        "five_hour" => "5-Stunden-Limit",
-        "seven_day" => "Wochenlimit",
-        other => other,
+        "five_hour" => tr("format.limit.five_hour"),
+        "seven_day" => tr("format.limit.seven_day"),
+        other => other.to_string(),
     }
 }
 
-/// German weekday abbreviation (no locale dependency).
-fn weekday_de(d: Weekday) -> &'static str {
-    ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][d.num_days_from_monday() as usize]
+fn weekday_label(d: Weekday) -> String {
+    let key = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d.num_days_from_monday() as usize];
+    tr(&format!("format.weekday.{key}"))
 }
 
 /// `Max pausiert bis 17:42 (5-Stunden-Limit)`; with the date when the reset is not on the day
@@ -39,12 +63,17 @@ pub fn pause_text<Tz: TimeZone>(until: DateTime<Tz>, now: DateTime<Tz>, limit_ty
 where
     Tz::Offset: std::fmt::Display,
 {
-    let when = if until.date_naive() == now.date_naive() {
-        until.format("%H:%M").to_string()
-    } else {
-        format!("{}, {}", weekday_de(until.weekday()), until.format("%d.%m. %H:%M"))
-    };
-    format!("Max pausiert bis {when} ({})", limit_type_label(limit_type))
+    let limit = limit_type_label(limit_type);
+    let time = until.format("%H:%M").to_string();
+    if until.date_naive() == now.date_naive() {
+        return tr_args("format.pause.today", &[("time", &time), ("limit", &limit)]);
+    }
+    let weekday = weekday_label(until.weekday());
+    let date = format_time_by(&until, "format.date_short", "%m-%d");
+    tr_args(
+        "format.pause.later",
+        &[("weekday", &weekday), ("date", &date), ("time", &time), ("limit", &limit)],
+    )
 }
 
 /// Warning for routing variables that were left untouched. Takes names only, never values.
@@ -52,30 +81,25 @@ pub fn routing_warning(names: &[&str]) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    Some(format!(
-        "Achtung: {} {} gesetzt und kann ändern, wohin Anfragen gehen oder wer sie bezahlt. Die App lässt das unverändert.",
-        names.join(", "),
-        if names.len() == 1 { "ist" } else { "sind" }
-    ))
+    Some(tr_n("format.routing_warning", names.len() as u64, &[("names", &names.join(", "))]))
 }
 
 /// `None` when every request had a price.
 pub fn unpriced_text(unpriced_requests: u64) -> Option<String> {
-    match unpriced_requests {
-        0 => None,
-        1 => Some("1 Anfrage nicht bewertet".to_string()),
-        n => Some(format!("{} Anfragen nicht bewertet", format_count(n))),
+    if unpriced_requests == 0 {
+        return None;
     }
+    Some(tr_n("format.unpriced", unpriced_requests, &[("count", &format_count(unpriced_requests))]))
 }
 
 pub fn progress_text(scanned: usize, total: usize) -> String {
-    format!("Lese Protokolle … {scanned} / {total} Dateien")
+    tr_args("format.progress", &[("scanned", &scanned.to_string()), ("total", &total.to_string())])
 }
 
-pub fn mode_label(mode: Mode) -> &'static str {
+pub fn mode_label(mode: Mode) -> String {
     match mode {
-        Mode::Max => "Max",
-        Mode::ApiKey => "API-Key",
+        Mode::Max => tr("format.mode.max"),
+        Mode::ApiKey => tr("format.mode.api_key"),
     }
 }
 
@@ -83,19 +107,14 @@ pub fn mode_label(mode: Mode) -> &'static str {
 /// A spawn io error also arrives as `ObsidianNotFound`, hence the wording.
 pub fn outcome_message(mode: Mode, outcome: LaunchOutcome) -> Option<String> {
     match outcome {
-        LaunchOutcome::Started => Some(format!("Obsidian wurde im Modus {} gestartet.", mode_label(mode))),
+        LaunchOutcome::Started => Some(tr_args("format.outcome.started", &[("mode", &mode_label(mode))])),
         LaunchOutcome::NeedsConfirmation => None,
-        LaunchOutcome::CloseTimedOut => Some(
-            "Obsidian hat sich nicht rechtzeitig geschlossen. Es wurde nichts gestartet.".to_string(),
-        ),
-        LaunchOutcome::ProcessCheckFailed => Some(
-            "Ob Obsidian läuft, ließ sich nicht prüfen. Es wurde nichts geschlossen und nichts gestartet. Starte Obsidian bei Bedarf von Hand."
-                .to_string(),
-        ),
-        LaunchOutcome::MissingKey => Some(
-            "Kein API-Key gespeichert. Bitte unter Einstellungen einen Key speichern.".to_string(),
-        ),
-        LaunchOutcome::ObsidianNotFound => Some("Obsidian konnte nicht gestartet werden.".to_string()),
+        LaunchOutcome::CloseTimedOut => Some(tr("format.outcome.close_timed_out")),
+        LaunchOutcome::ProcessCheckFailed => Some(tr("format.outcome.process_check_failed")),
+        LaunchOutcome::MissingKey => {
+            Some(tr_args("format.outcome.missing_key", &[("settings", &tr("ui.settings"))]))
+        }
+        LaunchOutcome::ObsidianNotFound => Some(tr("format.outcome.not_found")),
         LaunchOutcome::ObsidianUnavailable(e) => Some(e.to_string()),
     }
 }
@@ -191,5 +210,70 @@ mod tests {
         let missing = crate::paths::PathError::ConfiguredMissing(r"D:\Apps\Obsidian.exe".into());
         let text = outcome_message(Mode::Max, LaunchOutcome::ObsidianUnavailable(missing)).unwrap();
         assert!(text.contains(r"D:\Apps\Obsidian.exe") && text.contains("Einstellungen"), "{text}");
+    }
+
+    #[test]
+    fn english_counts_use_a_comma() {
+        use crate::i18n::with_language;
+        assert_eq!(with_language("en", || format_count(1234)), "1,234");
+        assert_eq!(with_language("en", || format_count(1_234_567)), "1,234,567");
+        assert_eq!(with_language("en", || format_count(999)), "999");
+        // German stays on the dot.
+        assert_eq!(with_language("de", || format_count(1234)), "1.234");
+        assert_eq!(format_count(1234), "1.234");
+    }
+
+    #[test]
+    fn unpriced_text_is_singular_and_plural_in_english() {
+        use crate::i18n::with_language;
+        with_language("en", || {
+            assert_eq!(unpriced_text(0), None);
+            assert_eq!(unpriced_text(1).unwrap(), "1 request not priced");
+            assert_eq!(unpriced_text(2).unwrap(), "2 requests not priced");
+            assert_eq!(unpriced_text(1234).unwrap(), "1,234 requests not priced");
+        });
+    }
+
+    #[test]
+    fn routing_warning_agrees_with_the_number_of_names() {
+        use crate::i18n::with_language;
+        with_language("en", || {
+            assert!(routing_warning(&["A"]).unwrap().starts_with("Warning: A is set"));
+            assert!(routing_warning(&["A", "B"]).unwrap().starts_with("Warning: A, B are set"));
+        });
+        assert!(routing_warning(&["A"]).unwrap().starts_with("Achtung: A ist gesetzt"));
+        assert!(routing_warning(&["A", "B"]).unwrap().starts_with("Achtung: A, B sind gesetzt und können"));
+    }
+
+    #[test]
+    fn pause_text_follows_the_language() {
+        use crate::i18n::with_language;
+        let tz = FixedOffset::east_opt(3600).unwrap();
+        let at = |d: u32, h: u32, m: u32| tz.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap();
+        with_language("en", || {
+            assert_eq!(pause_text(at(12, 14, 30), at(8, 9, 0), "seven_day"), "Max paused until Thu, 11-12 14:30 (weekly limit)");
+            assert_eq!(pause_text(at(8, 17, 5), at(8, 9, 0), "five_hour"), "Max paused until 17:05 (5-hour limit)");
+        });
+    }
+
+    #[test]
+    fn a_broken_date_pattern_in_a_language_file_falls_back() {
+        // A pattern from a user file can be invalid; formatting must not panic.
+        crate::i18n::isolate();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("xx.json"),
+            r#"{"_meta":{"code":"xx","name":"Test","format":1},"format.date_short":"%Q %","format.thousands":"'"}"#,
+        )
+        .unwrap();
+        assert!(crate::i18n::scan_folder(dir.path()).is_empty());
+        crate::i18n::with_language("xx", || {
+            let tz = FixedOffset::east_opt(3600).unwrap();
+            let t = tz.with_ymd_and_hms(2026, 11, 12, 14, 30, 0).unwrap();
+            assert_eq!(format_time_by(&t, "format.date_short", "%m-%d"), "11-12");
+            // A key nobody defines uses the fallback too.
+            assert_eq!(format_time_by(&t, "format.no_such_pattern", "%m-%d"), "11-12");
+            assert_eq!(format_count(1234), "1'234");
+        });
     }
 }

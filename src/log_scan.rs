@@ -468,12 +468,9 @@ fn set_aside(path: &Path) -> LoadedState {
     // rename replaces an older .bad on Windows, so only the newest copy stays.
     let kept = std::fs::rename(path, &bad).is_ok();
     let note = if kept {
-        format!(
-            "Die gespeicherte Verbrauchsliste war nicht lesbar und wird aus den Protokollen neu aufgebaut. Die alte Datei liegt als {}.",
-            bad.display()
-        )
+        crate::i18n::tr_args("log_scan.set_aside.kept", &[("path", &bad.display().to_string())])
     } else {
-        "Die gespeicherte Verbrauchsliste war nicht lesbar und wird aus den Protokollen neu aufgebaut.".to_string()
+        crate::i18n::tr("log_scan.set_aside.lost")
     };
     LoadedState { state: ScanState::default(), note: Some(note) }
 }

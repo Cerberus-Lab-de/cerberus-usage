@@ -8,7 +8,7 @@ use super::details::figure_value;
 use super::theme::{BIG, palette::*};
 use crate::analytics::ApiError;
 use crate::cards::{ApiCard, BalanceCard};
-use crate::format::{COST_NOTE, format_count, progress_text, unpriced_text};
+use crate::format::{cost_note, format_count, progress_text, unpriced_text};
 use crate::launcher::Mode;
 use crate::report::{Bucket, Report};
 use crate::view::{DetailKind, ModeCard, Tone};
@@ -121,7 +121,7 @@ pub struct Figure {
 }
 
 fn bucket_lines(b: &Bucket) -> Vec<(String, bool)> {
-    let mut lines = vec![(format!("{} Anfragen", format_count(b.requests)), false), (COST_NOTE.to_string(), false)];
+    let mut lines = vec![(format!("{} Anfragen", format_count(b.requests)), false), (cost_note(), false)];
     if let Some(text) = unpriced_text(b.unpriced_requests) {
         lines.push((text, true));
     }
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn local_figures_keep_the_estimate_note_and_unpriced_hint() {
         let f = figures(&report(), &estimate(true), false);
-        assert!(f[0].lines.iter().any(|(t, _)| t == COST_NOTE));
+        assert!(f[0].lines.iter().any(|(t, _)| *t == cost_note()));
         assert!(!f[0].lines.iter().any(|(_, warn)| *warn), "today had every request priced");
         assert!(f[1].lines.iter().any(|(t, warn)| *warn && t == "2 Anfragen nicht bewertet"));
     }
