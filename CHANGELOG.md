@@ -1,5 +1,9 @@
 # Änderungen
 
+## [1.0.1] - 2026-11-06
+
+- Test der Update-Funktion, keine Funktionsänderung.
+
 ## [1.0.0] - 2026-11-05
 
 Erste öffentliche Version.

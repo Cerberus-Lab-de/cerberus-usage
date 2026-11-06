@@ -1,6 +1,6 @@
 [package]
 name = "cerberus-usage"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Windows tray app that starts Obsidian with a Claude Max subscription or an API key and shows usage and cost."
 license = "MIT"
