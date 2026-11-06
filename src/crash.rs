@@ -44,7 +44,7 @@ pub fn scrub(message: &str) -> String {
     let mut rest = message;
     while let Some(i) = rest.find("sk-ant-") {
         out.push_str(&rest[..i]);
-        out.push_str("sk-ant-<entfernt>");
+        out.push_str("sk-ant-<removed>");
         let after = &rest[i + "sk-ant-".len()..];
         let end = after.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')')).unwrap_or(after.len());
         rest = &after[end..];
@@ -57,7 +57,7 @@ pub fn scrub(message: &str) -> String {
 pub fn format_entry(time: DateTime<Local>, location: Option<(&str, u32)>, message: &str) -> String {
     let place = match location {
         Some((file, line)) => format!("{file}:{line}"),
-        None => "unbekannt".to_string(),
+        None => "unknown".to_string(),
     };
     format!("{} {} {}\n", time.format("%Y-%m-%d %H:%M:%S"), place, scrub(message).replace('\n', " "))
 }
@@ -129,7 +129,7 @@ mod tests {
         let t = Local.with_ymd_and_hms(2026, 11, 5, 14, 30, 5).unwrap();
         let e = format_entry(t, Some(("src/ui.rs", 42)), "boom\nsecond line");
         assert_eq!(e, "2026-11-05 14:30:05 src/ui.rs:42 boom second line\n");
-        assert!(format_entry(t, None, "x").contains("unbekannt"));
+        assert!(format_entry(t, None, "x").contains("unknown"));
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
         let fake = "sk-ant-api03-NICHTECHT-1234";
         let out = scrub(&format!("failed with {fake} in header, and sk-ant-admin01-ALSONOT end"));
         assert!(!out.contains("NICHTECHT") && !out.contains("ALSONOT") && !out.contains("1234"), "{out}");
-        assert!(out.contains("sk-ant-<entfernt>") && out.contains("end"), "{out}");
+        assert!(out.contains("sk-ant-<removed>") && out.contains("end"), "{out}");
         assert_eq!(scrub(&"a".repeat(5000)).chars().count(), MAX_MESSAGE_CHARS);
     }
 

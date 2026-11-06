@@ -21,7 +21,8 @@ use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::update::UpdateHttp;
 use crate::update_worker::spawn_update_checker;
 use crate::cards::{BalanceCard, api_card, balance_card};
-use crate::format::{cost_note, outcome_message, pause_text, unpriced_text};
+use crate::format::{cost_note, format_time_by, outcome_message, pause_text, unpriced_text};
+use crate::i18n::{tr, tr_args};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
 use crate::paths::{Env, real_env, resolve_logs_root};
 use crate::paths_ui::PathsPanel;
@@ -45,7 +46,7 @@ use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 const MODE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// After a successful start, "not running" polls are ignored for this long (the process may not show up yet).
 const START_GRACE: Duration = Duration::from_secs(15);
-/// The "Obsidian wurde im Modus … gestartet" notice goes away on its own after this long.
+/// The "Obsidian was started in … mode" notice goes away on its own after this long.
 const STARTED_NOTICE_TTL: Duration = Duration::from_secs(8);
 
 pub use crate::view::ModeDisplay;
@@ -88,7 +89,7 @@ pub struct AppState {
     /// Waiting for the user to confirm closing Obsidian before starting in this mode.
     pub confirm: Option<Mode>,
     pub notice: Option<Notice>,
-    /// When the current notice removes itself (only the "gestartet" notice does).
+    /// When the current notice removes itself (only the "started" notice does).
     notice_expires: Option<Instant>,
     /// Content of the masked key field; cleared after a successful save.
     pub key_input: String,
@@ -175,7 +176,7 @@ impl AppState {
         self.notice.is_some() && self.notice_expires.is_some()
     }
 
-    /// Drops the "gestartet" notice once its time is up.
+    /// Drops the "started" notice once its time is up.
     pub fn tick_notice(&mut self, now: Instant) {
         if self.notice_expires.is_some_and(|at| now >= at) {
             self.set_notice(None);
@@ -187,7 +188,7 @@ impl AppState {
         self.launching = None;
         self.set_notice(Some(Notice {
             kind: NoticeKind::Error,
-            text: "Der Startvorgang wurde unerwartet beendet. Ob Obsidian läuft, zeigt die Anzeige oben.".to_string(),
+            text: tr("ui.launch_lost"),
         }));
     }
 
@@ -227,7 +228,7 @@ impl AppState {
 
     fn recompute_mode(&mut self) {
         self.mode = match self.running {
-            // No real answer yet (check blocked, settings unreadable): never claim "geschlossen".
+            // No real answer yet (check blocked, settings unreadable): never claim "closed".
             None => ModeDisplay::Unknown,
             Some(running) => mode_display(self.started_by_app, running),
         };
@@ -256,7 +257,7 @@ impl AppState {
                 self.started_by_app = None;
             }
             if self.running != Some(false) && self.notice_expires.is_some() {
-                // The running state changed: the "gestartet" notice no longer describes it.
+                // The running state changed: the "started" notice no longer describes it.
                 self.set_notice(None);
             }
             self.running = Some(false);
@@ -321,30 +322,15 @@ fn migrate_at_start(path: &Path) -> MigrationResult {
 
 /// Notice for keys that did not move cleanly. Names the key type only, never a value.
 fn move_notice_text(result: &MigrationResult) -> Option<String> {
-    let names = |slots: &[Slot]| slots.iter().map(|&s| key_label(s)).collect::<Vec<_>>().join(" und ");
+    let names = |slots: &[Slot]| slots.iter().map(|&s| key_label(s)).collect::<Vec<_>>().join(&tr("ui.and"));
     let mut parts = Vec::new();
     if !result.not_moved.is_empty() {
-        parts.push(format!(
-            "Der Umzug von {} aus dem Windows-Tresor ist nicht gelungen. Der Schlüssel geht nicht verloren und wird weiter genutzt, der nächste Start versucht es erneut.",
-            names(&result.not_moved)
-        ));
+        parts.push(tr_args("move.not_moved", &[("names", &names(&result.not_moved))]));
     }
     if !result.old_entry_left.is_empty() {
-        parts.push(format!(
-            "{} wurde übernommen, der alte Eintrag im Windows-Tresor ließ sich aber nicht entfernen. Er bleibt ungenutzt liegen und verschwindet bei der Deinstallation.",
-            names(&result.old_entry_left)
-        ));
+        parts.push(tr_args("move.old_left", &[("names", &names(&result.old_entry_left))]));
     }
     if parts.is_empty() { None } else { Some(parts.join(" ")) }
-}
-
-/// Start-up language: reads the language folder, then applies the saved choice. A choice without a
-/// matching file (removed or broken) falls back to the default language and leaves the settings
-/// file untouched, so the choice comes back when the file does. Returns the files that were skipped.
-fn apply_startup_language(settings: &Settings, dir: Option<&Path>) -> Vec<crate::i18n::LangProblem> {
-    let problems = dir.map(crate::i18n::scan_folder).unwrap_or_default();
-    crate::i18n::set_language(settings.language.as_deref());
-    problems
 }
 
 /// Presence check only; the value is dropped immediately. (The app uses [`key_check`]; tests use this.)
@@ -378,11 +364,12 @@ fn wipe_key_field(ctx: &egui::Context, id: egui::Id, input: &mut String) {
     ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
 }
 
-fn key_label(slot: Slot) -> &'static str {
-    match slot {
-        Slot::ApiKey => "API-Key",
-        Slot::AdminKey => "Admin-Key",
-    }
+/// Name of a key inside a sentence ("API key", "admin key").
+fn key_label(slot: Slot) -> String {
+    tr(match slot {
+        Slot::ApiKey => "key.name.api",
+        Slot::AdminKey => "key.name.admin",
+    })
 }
 
 /// An optional limit as it is typed into its field (`65.03`, empty for none).
@@ -391,21 +378,21 @@ fn amount_input(nano: Option<u64>) -> String {
 }
 
 /// Status line of a key slot. An unreadable store must not look like "no key".
-pub fn key_status_text(stored: Option<bool>) -> &'static str {
+pub fn key_status_text(stored: Option<bool>) -> String {
     key_status_line(stored, false)
 }
 
 /// Like [`key_status_text`], but a key that is stored and cannot be decrypted on this PC or user says so
 /// and asks for a new input instead of looking like an unreadable store.
-pub fn key_status_line(stored: Option<bool>, undecryptable: bool) -> &'static str {
+pub fn key_status_line(stored: Option<bool>, undecryptable: bool) -> String {
     if undecryptable {
-        return "gespeichert, aber hier nicht entschlüsselbar (anderer PC oder Benutzer). Bitte neu eingeben";
+        return tr("key.status.undecryptable");
     }
-    match stored {
-        Some(true) => "gespeichert",
-        Some(false) => "nicht gespeichert",
-        None => "Speicher nicht lesbar",
-    }
+    tr(match stored {
+        Some(true) => "key.status.stored",
+        Some(false) => "key.status.not_stored",
+        None => "key.status.unreadable",
+    })
 }
 
 /// Cost cell of a table row. A row where no request had a price shows only the note, not "$0.00".
@@ -427,10 +414,7 @@ pub fn logs_target(settings_path: Option<&Path>, env: Env) -> (PathBuf, Option<S
         if error.is_some() {
             return (
                 PathBuf::new(),
-                Some(format!(
-                    "Die Einstellungsdatei ist nicht lesbar, deshalb werden die Protokolle nicht gelesen. Bitte die Datei prüfen: {}",
-                    path.display()
-                )),
+                Some(tr_args("ui.logs_settings_unreadable", &[("path", &path.display().to_string())])),
             );
         }
         configured = settings.logs_root;
@@ -512,7 +496,7 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicU8> {
             // The image name follows the Obsidian path from the settings.
             // Unknown image name (unreadable settings): keep the last answer.
             if let Some(image) = sys.current_image_name() {
-                // A failed check keeps the last answer instead of showing "geschlossen".
+                // A failed check keeps the last answer instead of showing "closed".
                 let answer = poll_answer(sys.obsidian_running(&image), last);
                 shared.store(proc_code(answer), Ordering::Relaxed);
                 if last != answer {
@@ -638,8 +622,8 @@ impl CerberusApp {
             state.set_notice(Some(Notice { kind: NoticeKind::Error, text }));
         }
         state.reload_settings();
-        // Reads the language folder once and picks the language; never writes the settings file.
-        let lang_problems = apply_startup_language(&state.settings, crate::i18n::app_lang_dir().as_deref());
+        // `main` already picked the language and scanned the folder; only the skipped files are taken over.
+        let lang_problems = crate::i18n::take_startup_problems();
         let paths = PathsPanel::new(&state.settings);
         let logo = cc.egui_ctx.load_texture(
             "logo",
@@ -726,7 +710,7 @@ impl CerberusApp {
             };
             if let Some(msg) = received {
                 self.launch_rx = None;
-                // A waiting "Beenden" goes through now.
+                // A waiting "Quit" goes through now.
                 self.control.set_launch_busy(ctx, false);
                 let Some(msg) = msg else {
                     self.state.apply_launch_lost();
@@ -739,7 +723,7 @@ impl CerberusApp {
                         if started {
                             // Re-check once the grace period is over (the poller only reports changes).
                             ctx.request_repaint_after(START_GRACE + Duration::from_secs(1));
-                            // And once more for the "gestartet" notice to go away.
+                            // And once more for the "started" notice to go away.
                             ctx.request_repaint_after(STARTED_NOTICE_TTL + Duration::from_millis(200));
                         }
                     }
@@ -984,7 +968,7 @@ impl CerberusApp {
             ui,
             mode_card_with_routing(self.state.mode, !self.routing_names.is_empty()),
             self.state.launching,
-            self.update.start_block_reason(),
+            self.update.start_block_reason().as_deref(),
         ) {
             self.start_launch(ctx, mode, false);
         }
@@ -1002,7 +986,7 @@ impl CerberusApp {
         let mut area_out = None;
         match self.state.snapshot.as_ref() {
             None => {
-                ui.label("Lese Protokolle …");
+                ui.label(tr("ui.reading_logs"));
             }
             Some(snapshot) => match &snapshot.report {
                 None => cockpit::scan_progress(ui, snapshot.scanned_files, snapshot.total_files),
@@ -1041,11 +1025,13 @@ impl CerberusApp {
         if let Some(snapshot) = self.state.snapshot.as_ref().filter(|s| s.report.is_some()) {
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!(
-                        "Stand: {} · Preisliste vom {} · Kosten sind {}",
-                        format_time(snapshot.updated),
-                        self.prices_as_of,
-                        cost_note()
+                    RichText::new(tr_args(
+                        "ui.status_line",
+                        &[
+                            ("time", &format_time(snapshot.updated)),
+                            ("prices", &self.prices_as_of),
+                            ("note", &cost_note()),
+                        ],
                     ))
                     .small()
                     .color(MUTED),
@@ -1062,14 +1048,14 @@ impl CerberusApp {
         let mut answer: Option<bool> = None;
         egui::Modal::new(egui::Id::unique("confirm-close")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Obsidian schließen?");
-            ui.label("Obsidian läuft und muss geschlossen werden. Laufende Claudian-Antworten brechen ab. Jetzt schließen?");
+            ui.heading(tr("confirm.close.title"));
+            ui.label(tr("confirm.close.body"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Ja, schließen").clicked() {
+                if ui.button(tr("confirm.close.yes")).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(tr("button.cancel")).clicked() {
                     answer = Some(false);
                 }
             });
@@ -1086,7 +1072,7 @@ impl CerberusApp {
 }
 
 fn format_time(t: DateTime<Local>) -> String {
-    t.format("%d.%m.%Y %H:%M:%S").to_string()
+    format_time_by(&t, "format.datetime", "%Y-%m-%d %H:%M:%S")
 }
 
 // ---- startup -------------------------------------------------------------------------------------
@@ -1095,7 +1081,7 @@ fn data_dir() -> PathBuf {
     crate::cleanup::data_dir()
 }
 
-/// Opens the window and the tray icon and runs until "Beenden".
+/// Opens the window and the tray icon and runs until "Quit".
 pub fn run() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
         .expect("embedded icon is a valid PNG");
@@ -1387,7 +1373,7 @@ mod tests {
         assert_eq!(settings.language.as_deref(), Some("xx"));
 
         // No lang folder next to the test either.
-        let problems = apply_startup_language(&settings, Some(&dir.join("lang")));
+        let problems = crate::i18n::apply_startup(settings.language.as_deref(), Some(&dir.join("lang")));
         assert!(problems.is_empty());
         // Falls back to a shipped language and keeps answering.
         let code = crate::i18n::current_code();

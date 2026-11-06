@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Datelike, TimeZone, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Weekday};
 
 use crate::i18n::{thousands_separator, tr, tr_args, tr_n};
 use crate::launcher::{LaunchOutcome, Mode};
@@ -44,6 +44,24 @@ where
     out
 }
 
+/// Like [`format_time_by`] for a plain date.
+pub fn format_date_by(d: NaiveDate, key: &str, fallback: &str) -> String {
+    let pattern = tr(key);
+    let mut out = String::new();
+    if pattern != key && !pattern.is_empty() && write!(out, "{}", d.format(&pattern)).is_ok() {
+        return out;
+    }
+    out.clear();
+    // The fallback is a fixed, valid pattern.
+    let _ = write!(out, "{}", d.format(fallback));
+    out
+}
+
+/// `352 requests` with the thousands separator and the singular where it applies.
+pub fn requests_text(n: u64) -> String {
+    tr_n("format.requests", n, &[("count", &format_count(n))])
+}
+
 fn limit_type_label(limit_type: &str) -> String {
     match limit_type {
         "five_hour" => tr("format.limit.five_hour"),
@@ -64,7 +82,7 @@ where
     Tz::Offset: std::fmt::Display,
 {
     let limit = limit_type_label(limit_type);
-    let time = until.format("%H:%M").to_string();
+    let time = format_time_by(&until, "format.time_short", "%H:%M");
     if until.date_naive() == now.date_naive() {
         return tr_args("format.pause.today", &[("time", &time), ("limit", &limit)]);
     }
@@ -185,6 +203,26 @@ mod tests {
     }
 
     #[test]
+    fn request_counts_agree_with_the_number() {
+        use crate::i18n::with_language;
+        assert_eq!(requests_text(1), "1 Anfrage");
+        assert_eq!(requests_text(1234), "1.234 Anfragen");
+        with_language("en", || {
+            assert_eq!(requests_text(1), "1 request");
+            assert_eq!(requests_text(1234), "1,234 requests");
+        });
+    }
+
+    #[test]
+    fn dates_follow_the_language_pattern() {
+        use crate::i18n::with_language;
+        let d = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        assert_eq!(format_date_by(d, "format.date", "%Y-%m-%d"), "05.11.2026");
+        with_language("en", || assert_eq!(format_date_by(d, "format.date", "%Y-%m-%d"), "2026-11-05"));
+        assert_eq!(format_date_by(d, "format.no_such_pattern", "%Y-%m-%d"), "2026-11-05");
+    }
+
+    #[test]
     fn progress_text_shows_counts() {
         assert_eq!(progress_text(3, 40), "Lese Protokolle … 3 / 40 Dateien");
     }
@@ -251,7 +289,7 @@ mod tests {
         let tz = FixedOffset::east_opt(3600).unwrap();
         let at = |d: u32, h: u32, m: u32| tz.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap();
         with_language("en", || {
-            assert_eq!(pause_text(at(12, 14, 30), at(8, 9, 0), "seven_day"), "Max paused until Thu, 11-12 14:30 (weekly limit)");
+            assert_eq!(pause_text(at(12, 14, 30), at(8, 9, 0), "seven_day"), "Max paused until Thu, Nov 12 14:30 (weekly limit)");
             assert_eq!(pause_text(at(8, 17, 5), at(8, 9, 0), "five_hour"), "Max paused until 17:05 (5-hour limit)");
         });
     }

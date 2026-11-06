@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use cerberus_usage::{cleanup, crash, single_instance, ui};
+use cerberus_usage::{cleanup, crash, i18n, single_instance, ui};
 
 fn main() -> eframe::Result {
     // Only flag: run by the uninstaller after the user agreed. No window, no single-instance lock.
@@ -8,6 +8,8 @@ fn main() -> eframe::Result {
         std::process::exit(cleanup::run_uninstall_cleanup());
     }
     crash::install_panic_hook();
+    // Before the first dialog (already running, crash box) can appear: the saved language, read only.
+    i18n::apply_saved_language();
     if !single_instance::acquire_app() {
         single_instance::show_already_running_notice();
         return Ok(());

@@ -3,6 +3,8 @@
 use eframe::egui::{self, CornerRadius, Rect, Sense, Shape, Stroke, pos2, vec2};
 
 use super::theme::palette::{AMBER, CYAN, LINE, MUTED};
+use crate::format::format_date_by;
+use crate::i18n::{tr, tr_args};
 use crate::pricing::format_usd;
 use crate::view::{DayBar, bar_fraction};
 
@@ -13,9 +15,9 @@ const UNPRICED_FRACTION: f32 = 0.3;
 
 /// Hover text of one bar: the date and the estimated cost, or the reason there is no cost.
 pub fn bar_tooltip(bar: &DayBar) -> String {
-    let date = bar.date.format("%d.%m.%Y");
+    let date = format_date_by(bar.date, "format.date", "%Y-%m-%d");
     if bar.unpriced_only {
-        format!("{date} · nicht bewertet")
+        tr_args("chart.unpriced_day", &[("date", &date)])
     } else {
         format!("{date} · {}", format_usd(bar.cost_nano))
     }
@@ -58,10 +60,11 @@ pub fn day_chart(ui: &mut egui::Ui, bars: &[DayBar]) {
 
     ui.horizontal(|ui| {
         if let Some(first) = bars.first() {
-            ui.label(egui::RichText::new(first.date.format("%d.%m.").to_string()).small().color(MUTED));
+            let short = format_date_by(first.date, "format.date_short", "%m-%d");
+            ui.label(egui::RichText::new(short).small().color(MUTED));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new("heute").small().color(MUTED));
+            ui.label(egui::RichText::new(tr("chart.today")).small().color(MUTED));
         });
     });
 }

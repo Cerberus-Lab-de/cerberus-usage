@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::cards::update_settings;
 use crate::dpapi;
+use crate::i18n::tr;
 use crate::secrets::{SecretError, SecretStore, Slot};
 use crate::settings::{self, KeyForm, Settings, StoredKey};
 
@@ -152,14 +153,8 @@ pub fn set_plaintext(path: &Path, on: bool) -> Result<Settings, String> {
         let mut next = current.clone();
         for key in [&mut next.api_key, &mut next.admin_key] {
             if let Some(stored) = key.as_ref() {
-                let plain = decode(stored).map_err(|_| {
-                    "Ein gespeicherter Schlüssel lässt sich nicht entschlüsseln. Umstellung abgebrochen, nichts wurde geändert."
-                        .to_string()
-                })?;
-                *key = Some(
-                    encode(&plain, on)
-                        .map_err(|_| "Ein Schlüssel konnte nicht verschlüsselt werden. Umstellung abgebrochen.".to_string())?,
-                );
+                let plain = decode(stored).map_err(|_| tr("config.switch.undecryptable"))?;
+                *key = Some(encode(&plain, on).map_err(|_| tr("config.switch.encrypt_failed"))?);
             }
         }
         next.keys_plaintext = on;

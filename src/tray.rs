@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, IconData, ViewportCommand};
 use crate::balance::Alert;
+use crate::i18n::{tr, tr_args};
 use crate::ui::details::figure_value;
 use crate::ui::ModeDisplay;
 use crate::view::mode_card_with_routing;
@@ -30,7 +31,7 @@ pub enum CloseAction {
     WaitForLaunch,
 }
 
-/// The X button only hides, unless the user chose "Beenden" or there is no tray icon to bring the
+/// The X button only hides, unless the user chose "Quit" or there is no tray icon to bring the
 /// window back. A launch in flight is never cut off: quitting then waits for its result.
 pub fn close_action(quit_requested: bool, tray_available: bool, launch_busy: bool) -> CloseAction {
     if quit_requested {
@@ -105,7 +106,7 @@ impl WindowControl {
         }
     }
 
-    /// "Beenden" was chosen but a launch is still running.
+    /// "Quit" was chosen but a launch is still running.
     pub fn quit_waiting(&self) -> bool {
         self.quit_pending.load(Ordering::Relaxed) && self.launch_busy.load(Ordering::Relaxed)
     }
@@ -140,7 +141,7 @@ impl WindowControl {
         ctx.request_repaint();
     }
 
-    /// "Beenden": closes at once, or as soon as a running launch has finished.
+    /// "Quit": closes at once, or as soon as a running launch has finished.
     pub fn quit(&self, ctx: &egui::Context) {
         self.quit_when_idle(ctx);
     }
@@ -192,23 +193,29 @@ pub fn icon_with_badge(rgba: &[u8], width: u32, height: u32, state: IconState) -
 /// Tooltip text: mode, today's estimated cost, a hint when warnings are active. Windows cuts tooltips
 /// at 127 characters. Built from the snapshot only, which never holds a key.
 pub fn tooltip(snapshot: &Snapshot, mode: ModeDisplay, routing_active: bool) -> String {
-    let mut text = format!("Cerberus Usage · {}", mode_card_with_routing(mode, routing_active).title);
-    if routing_active && mode == ModeDisplay::Max {
-        text.push_str(" (Umleitung aktiv)");
-    }
+    let title = mode_card_with_routing(mode, routing_active).title;
+    let key = if routing_active && mode == ModeDisplay::Max { "tray.tip.mode_routing" } else { "tray.tip.mode" };
+    let mut parts = vec![tr_args(key, &[("mode", &title)])];
     if let Some(report) = &snapshot.report {
-        let note = if report.today.unpriced_requests > 0 { "geschätzt, unvollständig" } else { "geschätzt" };
-        text.push_str(&format!(" · heute {} ({note})", figure_value(&report.today)));
+        let note = tr(if report.today.unpriced_requests > 0 { "tray.tip.incomplete" } else { "tray.tip.estimated" });
+        parts.push(tr_args("tray.tip.today", &[("amount", &figure_value(&report.today)), ("note", &note)]));
     }
     if !snapshot.alerts.is_empty() {
-        text.push_str(" · Warnung");
+        parts.push(tr("tray.tip.warning"));
     }
-    text
+    parts.join(" · ")
+}
+
+/// Labels of the tray menu in the language in use: "open" and "quit".
+pub fn menu_labels() -> (String, String) {
+    (tr("tray.open"), tr("button.quit"))
 }
 
 /// Keeps the icon alive; dropping it removes the icon from the notification area.
 pub struct Tray {
     icon: TrayIcon,
+    open_item: MenuItem,
+    quit_item: MenuItem,
     base_rgba: Vec<u8>,
     size: (u32, u32),
     shown: Option<(String, IconState)>,
@@ -218,8 +225,9 @@ impl Tray {
     /// Must be created on the thread that runs the window event loop (the main thread).
     pub fn new(ctx: &egui::Context, control: &Arc<WindowControl>, icon: &IconData) -> Result<Tray, String> {
         let menu = Menu::new();
-        let open = MenuItem::with_id(ID_OPEN, "Öffnen", true, None);
-        let quit = MenuItem::with_id(ID_QUIT, "Beenden", true, None);
+        let (open_label, quit_label) = menu_labels();
+        let open = MenuItem::with_id(ID_OPEN, open_label, true, None);
+        let quit = MenuItem::with_id(ID_QUIT, quit_label, true, None);
         menu.append(&open).map_err(|e| e.to_string())?;
         menu.append(&quit).map_err(|e| e.to_string())?;
 
@@ -257,10 +265,20 @@ impl Tray {
         control.tray_available.store(true, Ordering::Relaxed);
         Ok(Tray {
             icon: tray,
+            open_item: open,
+            quit_item: quit,
             base_rgba: icon.rgba.clone(),
             size: (icon.width, icon.height),
             shown: None,
         })
+    }
+
+    /// Re-labels the menu after a language change. The tooltip follows by itself: it is built from the
+    /// language in use on every poll and only sent when it differs.
+    pub fn set_language_texts(&mut self) {
+        let (open, quit) = menu_labels();
+        self.open_item.set_text(open);
+        self.quit_item.set_text(quit);
     }
 
     /// Updates tooltip and icon badge; does nothing when neither changed.
@@ -355,8 +373,32 @@ mod tests {
     }
 
     #[test]
+    fn tray_labels_follow_the_language() {
+        use crate::i18n::with_language;
+        assert_eq!(menu_labels(), ("Öffnen".to_string(), "Beenden".to_string()));
+        with_language("en", || assert_eq!(menu_labels(), ("Open".to_string(), "Quit".to_string())));
+        with_language("de", || assert_eq!(menu_labels(), ("Öffnen".to_string(), "Beenden".to_string())));
+    }
+
+    #[test]
+    fn tooltip_is_english_under_en() {
+        use crate::i18n::with_language;
+        let mut s = snapshot(1_230_000_000);
+        s.alerts = vec![Alert::LowBalance];
+        let tip = with_language("en", || tooltip(&s, ModeDisplay::Max, true));
+        assert_eq!(tip, "Cerberus Usage · Max (redirect active) · today $1.23 (estimated) · warning");
+        // The same snapshot reads German under German, so a switch changes the next tooltip at once.
+        let de = with_language("de", || tooltip(&s, ModeDisplay::Max, true));
+        assert_eq!(de, "Cerberus Usage · Max (Umleitung aktiv) · heute $1.23 (geschätzt) · Warnung");
+        let incomplete = Bucket { requests: 4, unpriced_requests: 1, cost_nano: 2_000_000_000, ..Default::default() };
+        let mut part = snapshot(0);
+        part.report.as_mut().unwrap().today = incomplete;
+        assert!(with_language("en", || tooltip(&part, ModeDisplay::Closed, false)).contains("estimated, incomplete"));
+    }
+
+    #[test]
     fn close_request_decisions() {
-        // With a tray: X hides, "Beenden" exits.
+        // With a tray: X hides, "Quit" exits.
         assert_eq!(close_action(false, true, false), CloseAction::Hide);
         assert_eq!(close_action(false, true, true), CloseAction::Hide);
         assert_eq!(close_action(true, true, false), CloseAction::Exit);
@@ -385,7 +427,7 @@ mod tests {
         assert!(!control.quit_waiting());
         assert_eq!(control.close_action(), CloseAction::Exit, "quit goes through once the launch is done");
 
-        // Without a launch "Beenden" is immediate.
+        // Without a launch "Quit" is immediate.
         let control = WindowControl::new();
         control.quit(&ctx);
         assert_eq!(control.close_action(), CloseAction::Exit);

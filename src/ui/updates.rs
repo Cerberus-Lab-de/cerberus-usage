@@ -1,4 +1,4 @@
-//! Update state as the window sees it: the dim hint line in the cockpit, the "Über" block in the
+//! Update state as the window sees it: the dim hint line in the cockpit, the "About" block in the
 //! drawer and the confirm dialog. The checker thread (`update_worker`) does the work; this only keeps
 //! the last state it sent and draws it. No IO per frame.
 
@@ -10,15 +10,13 @@ use chrono::{DateTime, Local};
 use eframe::egui::{self, RichText};
 
 use super::theme::palette::{AMBER, CYAN, MUTED};
+use crate::format::format_time_by;
+use crate::i18n::{tr, tr_args};
 use crate::update::{CURRENT_VERSION, Release};
 use crate::update_worker::{UpdateCmd, UpdateState};
 
 /// The repository, as shown and opened from the drawer.
 pub const REPO_URL: &str = "https://github.com/Cerberus-Lab-de/cerberus-usage";
-
-pub const CONFIRM_TEXT: &str = "Cerberus Usage wird beendet und aktualisiert.";
-pub const RUNNING_TEXT: &str = "Das Update läuft bereits.";
-pub const BLOCKED_TEXT: &str = "Nicht möglich, solange Obsidian gestartet wird.";
 
 /// Only pages of our own repository are ever opened in the browser.
 pub fn url_allowed(url: &str) -> bool {
@@ -26,15 +24,18 @@ pub fn url_allowed(url: &str) -> bool {
 }
 
 /// Why installing is refused right now (`None`: allowed).
-pub fn install_block_reason(launch_running: bool) -> Option<&'static str> {
-    launch_running.then_some(BLOCKED_TEXT)
+pub fn install_block_reason(launch_running: bool) -> Option<String> {
+    launch_running.then(|| tr("updates.blocked"))
 }
 
-/// "Zuletzt geprüft: 05.11.2026 21:30" or the not-yet text.
+/// "Last checked: 2026-11-05 21:30" or the not-yet text.
 pub fn last_checked_text(checked: Option<DateTime<Local>>) -> String {
     match checked {
-        Some(t) => format!("Zuletzt geprüft: {}", t.format("%d.%m.%Y %H:%M")),
-        None => "Noch nicht geprüft.".to_string(),
+        Some(t) => {
+            let time = format_time_by(&t, "format.datetime_short", "%Y-%m-%d %H:%M");
+            tr_args("updates.last_checked", &[("time", &time)])
+        }
+        None => tr("updates.not_checked"),
     }
 }
 
@@ -63,7 +64,7 @@ pub struct UpdateUi {
     last_checked: Option<DateTime<Local>>,
     /// Latest failure, for the dim line.
     failed: Option<String>,
-    /// The user clicked "Jetzt prüfen" or installed: the next failure is shown in full.
+    /// The user clicked "Check now" or installed: the next failure is shown in full.
     explicit_pending: bool,
     explicit_error: Option<String>,
     /// The explicit action was an install (its error is also shown in the cockpit).
@@ -103,7 +104,7 @@ impl UpdateUi {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if !matches!(self.state, UpdateState::Failed(_)) {
-                        self.apply(UpdateState::Failed("Der Update-Dienst ist nicht verfügbar.".to_string()));
+                        self.apply(UpdateState::Failed(tr("updates.service_gone")));
                     }
                     break;
                 }
@@ -172,9 +173,9 @@ impl UpdateUi {
     }
 
     /// Why Obsidian cannot be started right now (a download or the installer is running).
-    pub fn start_block_reason(&self) -> Option<&'static str> {
+    pub fn start_block_reason(&self) -> Option<String> {
         (self.downloading() || self.install_pending || self.state == UpdateState::Installing)
-            .then_some("Ein Update wird gerade installiert.")
+            .then(|| tr("updates.start_blocked"))
     }
 
     pub fn check_now(&mut self) {
@@ -189,15 +190,16 @@ impl UpdateUi {
         }
     }
 
-    /// The "Version x.y.z verfügbar · Änderungen · Jetzt aktualisieren" part, shared by the cockpit
+    /// The "Version x.y.z available · Changes · Update now" part, shared by the cockpit
     /// and the drawer.
     fn available_row(&mut self, ui: &mut egui::Ui, launch_running: bool) {
         let Some(release) = self.available.clone() else { return };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new(format!("Version {} verfügbar", release.version)).size(13.0).color(MUTED));
+            let version = release.version.to_string();
+            ui.label(RichText::new(tr_args("updates.available", &[("version", &version)])).size(13.0).color(MUTED));
             ui.label(RichText::new("·").color(MUTED));
-            if link(ui, "Änderungen").clicked() {
+            if link(ui, &tr("updates.changes")).clicked() {
                 Self::open(ui.ctx(), &release.notes_url);
             }
             ui.label(RichText::new("·").color(MUTED));
@@ -208,14 +210,14 @@ impl UpdateUi {
     fn install_button(&mut self, ui: &mut egui::Ui, launch_running: bool) {
         if self.downloading() || self.install_pending {
             ui.spinner();
-            ui.label(RichText::new("Update wird geladen …").size(13.0).color(MUTED));
+            ui.label(RichText::new(tr("updates.downloading")).size(13.0).color(MUTED));
             return;
         }
         let reason = install_block_reason(launch_running)
-            .or((self.state == UpdateState::Installing).then_some(RUNNING_TEXT));
+            .or_else(|| (self.state == UpdateState::Installing).then(|| tr("updates.running")));
         let response = ui.add_enabled(
             reason.is_none(),
-            egui::Button::new(RichText::new("Jetzt aktualisieren").size(13.0).color(CYAN)).frame(false),
+            egui::Button::new(RichText::new(tr("button.update_now")).size(13.0).color(CYAN)).frame(false),
         );
         let response = match reason {
             Some(text) => response.on_disabled_hover_text(text),
@@ -232,37 +234,37 @@ impl UpdateUi {
             HintLine::None => {}
             HintLine::Available(_) => {
                 self.available_row(ui, launch_running);
-                // A failed "Jetzt prüfen" is shown in the drawer only; a failed install here too.
+                // A failed "Check now" is shown in the drawer only; a failed install here too.
                 if let (Some(error), true) = (&self.explicit_error, self.error_from_install) {
                     ui.add(egui::Label::new(RichText::new(error).size(13.0).color(AMBER)).wrap());
                 }
             }
             HintLine::Failed(message) => {
-                ui.label(RichText::new("Update-Prüfung fehlgeschlagen").size(12.0).color(MUTED))
+                ui.label(RichText::new(tr("updates.check_failed")).size(12.0).color(MUTED))
                     .on_hover_text(message);
             }
         }
     }
 
-    /// The update part of the drawer's "Über" section. Returns the new value of "Nach Updates
-    /// suchen" when it was clicked; the caller saves it.
+    /// The update part of the drawer's "About" section. Returns the new value of "Check for
+    /// updates" when it was clicked; the caller saves it.
     pub fn draw_about(&mut self, ui: &mut egui::Ui, check_updates: bool, can_save: bool, settings_ok: bool, launch_running: bool) -> Option<bool> {
         ui.label(format!("Cerberus Usage {CURRENT_VERSION}"));
-        ui.add(egui::Label::new(RichText::new("Cerberus Usage von Cerberus Lab").size(12.0).color(MUTED)));
+        ui.add(egui::Label::new(RichText::new(tr("updates.about.by")).size(12.0).color(MUTED)));
         ui.add_space(4.0);
 
         let mut toggled = None;
         if settings_ok {
             ui.add_enabled_ui(can_save, |ui| {
                 let mut on = check_updates;
-                if ui.checkbox(&mut on, "Nach Updates suchen").changed() {
+                if ui.checkbox(&mut on, tr("toggle.check_updates")).changed() {
                     toggled = Some(on);
                 }
             });
         } else {
             ui.add(
                 egui::Label::new(
-                    RichText::new("Einstellungsdatei nicht lesbar: automatische Prüfung ist aus.")
+                    RichText::new(tr("updates.settings_unreadable"))
                         .size(12.0)
                         .color(MUTED),
                 )
@@ -272,9 +274,7 @@ impl UpdateUi {
         if settings_ok && !check_updates {
             ui.add(
                 egui::Label::new(
-                    RichText::new(
-                        "Automatische Prüfung aus. Es wird nichts an GitHub gesendet, außer du klickst auf „Jetzt prüfen“.",
-                    )
+                    RichText::new(tr_args("updates.auto_off", &[("button", &tr("button.check_now"))]))
                     .size(12.0)
                     .color(MUTED),
                 )
@@ -283,12 +283,12 @@ impl UpdateUi {
         }
 
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.busy(), egui::Button::new("Jetzt prüfen")).clicked() {
+            if ui.add_enabled(!self.busy(), egui::Button::new(tr("button.check_now"))).clicked() {
                 self.check_now();
             }
             if self.state == UpdateState::Checking {
                 ui.spinner();
-                ui.label(RichText::new("Prüfe …").size(12.0).color(MUTED));
+                ui.label(RichText::new(tr("updates.checking")).size(12.0).color(MUTED));
             }
         });
         ui.add(egui::Label::new(RichText::new(last_checked_text(self.last_checked)).size(12.0).color(MUTED)));
@@ -296,7 +296,7 @@ impl UpdateUi {
         if self.available.is_some() {
             self.available_row(ui, launch_running);
         } else if matches!(self.state, UpdateState::UpToDate { .. }) {
-            ui.add(egui::Label::new(RichText::new("Du hast die neueste Version.").size(12.0).color(MUTED)));
+            ui.add(egui::Label::new(RichText::new(tr("updates.up_to_date")).size(12.0).color(MUTED)));
         }
         if let Some(error) = &self.explicit_error {
             ui.add(egui::Label::new(RichText::new(error).color(AMBER)).wrap());
@@ -309,7 +309,7 @@ impl UpdateUi {
         if link(ui, REPO_URL.trim_start_matches("https://")).clicked() {
             Self::open(ui.ctx(), REPO_URL);
         }
-        ui.add(egui::Label::new(RichText::new("Lizenz: MIT").size(12.0).color(MUTED)));
+        ui.add(egui::Label::new(RichText::new(tr("updates.license")).size(12.0).color(MUTED)));
         toggled
     }
 
@@ -331,12 +331,12 @@ impl UpdateUi {
         let mut answer = None;
         egui::Modal::new(egui::Id::unique("confirm-update")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Jetzt aktualisieren?");
-            ui.label(CONFIRM_TEXT);
+            ui.heading(tr("updates.confirm.title"));
+            ui.label(tr("updates.confirm.text"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let reason = install_block_reason(launch_running);
-                let button = ui.add_enabled(reason.is_none(), egui::Button::new("Jetzt aktualisieren"));
+                let button = ui.add_enabled(reason.is_none(), egui::Button::new(tr("button.update_now")));
                 let button = match reason {
                     Some(text) => button.on_disabled_hover_text(text),
                     None => button,
@@ -344,7 +344,7 @@ impl UpdateUi {
                 if button.clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(tr("button.cancel")).clicked() {
                     answer = Some(false);
                 }
             });

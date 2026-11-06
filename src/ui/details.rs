@@ -12,14 +12,15 @@ use super::theme::palette::{AMBER, BG, CYAN, CYAN_DARK, LINE, MUTED, PANEL, PANE
 use super::cost_cell_text;
 use crate::analytics::ApiError;
 use crate::cards::{BalanceCard, api_error_text};
-use crate::format::{cost_note, format_count, pause_text, unpriced_text};
+use crate::format::{cost_note, format_count, format_date_by, pause_text, requests_text, unpriced_text};
+use crate::i18n::{tr, tr_args};
 use crate::pricing::format_usd;
 use crate::report::{Bucket, Report};
 use crate::view::{DetailKind, bar_fraction, day_bars, truncate_name};
 
 /// Longest name shown in a bar row; the full name is in the tooltip.
 const NAME_CHARS: usize = 28;
-/// Rows shown before "weitere anzeigen".
+/// Rows shown before "show more".
 const MAX_ROWS: usize = 8;
 const DAYS: usize = 30;
 
@@ -39,12 +40,12 @@ pub fn tabs_for(kind: DetailKind) -> &'static [DetailTab] {
     }
 }
 
-fn tab_label(tab: DetailTab) -> &'static str {
-    match tab {
-        DetailTab::Projects => "Projekte",
-        DetailTab::Models => "Modelle",
-        DetailTab::Days => "Tage",
-    }
+fn tab_label(tab: DetailTab) -> String {
+    tr(match tab {
+        DetailTab::Projects => "details.tab.projects",
+        DetailTab::Models => "details.tab.models",
+        DetailTab::Days => "details.tab.days",
+    })
 }
 
 /// The tab to show: the wanted one if this detail has it, else the first.
@@ -68,32 +69,40 @@ pub fn figure_value(b: &Bucket) -> String {
 }
 
 pub fn token_summary(b: &Bucket) -> String {
-    format!(
-        "{} Ein · {} Cache · {} Aus",
-        format_count(b.input),
-        format_count(b.cache_read.saturating_add(b.cache_write)),
-        format_count(b.output)
+    tr_args(
+        "details.tokens",
+        &[
+            ("input", &format_count(b.input)),
+            ("cache", &format_count(b.cache_read.saturating_add(b.cache_write))),
+            ("output", &format_count(b.output)),
+        ],
     )
 }
 
 /// What the list of a Today/Month detail shows, with its title and the text for "nothing yet".
-pub fn rows_for<'a>(kind: DetailKind, tab: DetailTab, report: &'a Report) -> (&'static str, &'static str, Vec<(Cow<'a, str>, &'a Bucket)>) {
+pub fn rows_for<'a>(kind: DetailKind, tab: DetailTab, report: &'a Report) -> (String, String, Vec<(Cow<'a, str>, &'a Bucket)>) {
     let named = |rows: &'a [(String, Bucket)]| rows.iter().map(|(n, b)| (Cow::Borrowed(n.as_str()), b)).collect::<Vec<_>>();
     match (kind, effective_tab(kind, tab)) {
-        (DetailKind::Today, DetailTab::Models) => ("Heute nach Modell", "Noch keine Anfragen heute.", named(&report.today_by_model)),
-        (DetailKind::Today, _) => ("Heute nach Projekt", "Noch keine Anfragen heute.", named(&report.today_by_project)),
-        (_, DetailTab::Models) => ("Diesen Monat nach Modell", "Noch keine Anfragen in diesem Monat.", named(&report.by_model)),
+        (DetailKind::Today, DetailTab::Models) => {
+            (tr("details.title.today_model"), tr("details.empty.today"), named(&report.today_by_model))
+        }
+        (DetailKind::Today, _) => {
+            (tr("details.title.today_project"), tr("details.empty.today"), named(&report.today_by_project))
+        }
+        (_, DetailTab::Models) => (tr("details.title.month_model"), tr("details.empty.month"), named(&report.by_model)),
         (_, DetailTab::Days) => (
-            "Letzte Tage",
-            "Noch keine Anfragen in den letzten Tagen.",
+            tr("details.title.days"),
+            tr("details.empty.days"),
             report.by_day.iter().map(|(d, b)| (Cow::Owned(day_label(*d)), b)).collect(),
         ),
-        (_, DetailTab::Projects) => ("Diesen Monat nach Projekt", "Noch keine Anfragen in diesem Monat.", named(&report.by_project)),
+        (_, DetailTab::Projects) => {
+            (tr("details.title.month_project"), tr("details.empty.month"), named(&report.by_project))
+        }
     }
 }
 
 fn day_label(date: NaiveDate) -> String {
-    date.format("%d.%m.%Y").to_string()
+    format_date_by(date, "format.date", "%Y-%m-%d")
 }
 
 /// Everything a detail area reads. The balance texts come from `cards`, not from here.
@@ -187,8 +196,8 @@ fn segmented(ui: &mut egui::Ui, current: &mut DetailTab, tabs: &[DetailTab]) -> 
     changed
 }
 
-/// Name and cost on one line, a thin bar below. Returns `true` when "weitere anzeigen" or
-/// "Weniger anzeigen" was clicked.
+/// Name and cost on one line, a thin bar below. Returns `true` when "show more" or
+/// "Show less" was clicked.
 fn bar_rows(ui: &mut egui::Ui, rows: &[(Cow<str>, &Bucket)], empty_text: &str, expanded: bool) -> bool {
     if rows.is_empty() {
         ui.label(RichText::new(empty_text).color(MUTED));
@@ -213,12 +222,15 @@ fn bar_rows(ui: &mut egui::Ui, rows: &[(Cow<str>, &Bucket)], empty_text: &str, e
         painter.rect_filled(track, CornerRadius::same(3), PANEL2);
         let fill_w = (width * bar_fraction(b.cost_nano, max)).max(if b.cost_nano > 0 { 2.0 } else { 0.0 });
         painter.rect_filled(egui::Rect::from_min_size(track.min, vec2(fill_w, 5.0)), CornerRadius::same(3), CYAN_DARK);
-        response.on_hover_text(format!("{name}\n{} Anfragen · {}", format_count(b.requests), token_summary(b)));
+        response.on_hover_text(tr_args(
+            "details.row_hover",
+            &[("name", name), ("requests", &requests_text(b.requests)), ("tokens", &token_summary(b))],
+        ));
     }
     if hidden > 0 {
-        return ui.link(format!("+ {hidden} weitere anzeigen")).clicked();
+        return ui.link(tr_args("details.more", &[("count", &hidden.to_string())])).clicked();
     }
-    expanded && rows.len() > MAX_ROWS && ui.link("Weniger anzeigen").clicked()
+    expanded && rows.len() > MAX_ROWS && ui.link(tr("details.less")).clicked()
 }
 
 fn explanation(ui: &mut egui::Ui, text: &str) {
@@ -230,7 +242,7 @@ fn warn_line(ui: &mut egui::Ui, text: &str) {
 }
 
 fn figure_lines(ui: &mut egui::Ui, b: &Bucket) {
-    ui.label(format!("{} Anfragen", format_count(b.requests)));
+    ui.label(requests_text(b.requests));
     ui.label(RichText::new(token_summary(b)).small().color(MUTED));
     if let Some(text) = unpriced_text(b.unpriced_requests) {
         warn_line(ui, &text);
@@ -241,7 +253,7 @@ fn history(ui: &mut egui::Ui, kind: DetailKind, data: &DetailData, view: &mut De
     let tabs = tabs_for(kind);
     view.tab = effective_tab(kind, view.tab);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("LETZTE 30 TAGE · GESCHÄTZT").small().color(MUTED));
+        ui.label(RichText::new(tr("details.history.title")).small().color(MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if segmented(ui, &mut view.tab, tabs) {
                 view.rows_expanded = false;
@@ -251,29 +263,25 @@ fn history(ui: &mut egui::Ui, kind: DetailKind, data: &DetailData, view: &mut De
     });
     let today = Local::now().date_naive();
     day_chart(ui, &day_bars(&data.report.by_day, today, DAYS));
-    explanation(ui, "Aus den Claude-Protokollen auf diesem Rechner, nach Listenpreis berechnet. Das ist nicht die Rechnung.");
+    explanation(ui, &tr("details.history.note"));
     ui.add_space(2.0);
     let (title, empty, rows) = rows_for(kind, view.tab, data.report);
     ui.label(RichText::new(title).strong());
-    if bar_rows(ui, &rows, empty, view.rows_expanded) {
+    if bar_rows(ui, &rows, &empty, view.rows_expanded) {
         view.rows_expanded = !view.rows_expanded;
         // Only taller content may need the window to grow.
         out.layout_changed = view.rows_expanded;
     }
-    ui.label(RichText::new(format!("Kosten sind {}", cost_note())).small().color(MUTED));
+    ui.label(RichText::new(tr_args("details.cost_line", &[("note", &cost_note())])).small().color(MUTED));
 }
 
 fn balance(ui: &mut egui::Ui, data: &DetailData, out: &mut DetailOutput) {
     match data.balance {
         BalanceCard::NoBaseline => {
-            ui.label("Noch kein Startwert. Trage unter Einstellungen den aktuellen Betrag aus der Console ein.");
+            ui.label(tr_args("details.balance.none", &[("settings", &tr("ui.settings"))]));
         }
         BalanceCard::Estimate { deducted, details, note, .. } => {
-            ui.label(if *deducted {
-                "Geschätzt aus dem Startwert, den Aufladungen und den API-Kosten seit dem Startwert."
-            } else {
-                "Geschätzt aus dem Startwert und den Aufladungen, ohne Kostenabzug."
-            });
+            ui.label(tr(if *deducted { "details.balance.deducted" } else { "details.balance.not_deducted" }));
             for line in details {
                 ui.label(RichText::new(line).color(MUTED));
             }
@@ -285,14 +293,14 @@ fn balance(ui: &mut egui::Ui, data: &DetailData, out: &mut DetailOutput) {
             }
         }
     }
-    if ui.link("In den Einstellungen ändern").clicked() {
+    if ui.link(tr("details.balance.change")).clicked() {
         out.open_drawer = true;
     }
 }
 
 fn max_status(ui: &mut egui::Ui, data: &DetailData) {
     let report = data.report;
-    ui.label(RichText::new("LETZTE 5 STUNDEN · GESCHÄTZT").small().color(MUTED));
+    ui.label(RichText::new(tr("details.max.title")).small().color(MUTED));
     ui.label(RichText::new(figure_value(&report.last_5h)).text_style(egui::TextStyle::Name(super::theme::BIG.into())).strong());
     figure_lines(ui, &report.last_5h);
     ui.add_space(2.0);
@@ -301,7 +309,7 @@ fn max_status(ui: &mut egui::Ui, data: &DetailData) {
             warn_line(ui, &pause_text(pause.until.with_timezone(&Local), Local::now(), &pause.limit_type));
         }
         None => {
-            ui.label(RichText::new("Keine Pause in den Protokollen.").color(MUTED));
+            ui.label(RichText::new(tr("details.max.no_pause")).color(MUTED));
         }
     }
 }

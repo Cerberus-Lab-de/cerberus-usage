@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, PoisonError, RwLock};
+use std::sync::{LazyLock, Mutex, PoisonError, RwLock};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -33,6 +33,29 @@ pub struct LangInfo {
 pub struct LangProblem {
     pub file: String,
     pub reason: String,
+}
+
+/// Why a language file was skipped: the key of the reason text and its placeholders. It is turned
+/// into text only after a scan has stored the files, because the built-in languages are parsed
+/// while the state itself is being built.
+struct Reason {
+    key: &'static str,
+    args: Vec<(&'static str, String)>,
+}
+
+impl Reason {
+    fn new(key: &'static str) -> Self {
+        Reason { key, args: Vec::new() }
+    }
+
+    fn with(key: &'static str, name: &'static str, value: impl Into<String>) -> Self {
+        Reason { key, args: vec![(name, value.into())] }
+    }
+
+    fn text(&self) -> String {
+        let args: Vec<(&str, &str)> = self.args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        tr_args(self.key, &args)
+    }
 }
 
 struct Lang {
@@ -137,50 +160,50 @@ fn valid_code(code: &str) -> bool {
     primary_ok && rest_ok
 }
 
-fn parse_lang(bytes: &[u8]) -> Result<Lang, String> {
+fn parse_lang(bytes: &[u8]) -> Result<Lang, Reason> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())?;
-    let map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| Reason::new("lang.reason.not_utf8"))?;
+    // The parser's own wording is a technical detail and stays as it is.
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| Reason::with("lang.reason.invalid_json", "detail", e.to_string()))?;
     let meta = map
         .get("_meta")
         .and_then(|m| m.as_object())
-        .ok_or_else(|| "missing _meta object".to_string())?;
+        .ok_or_else(|| Reason::new("lang.reason.no_meta"))?;
     if meta.get("format").and_then(|f| f.as_u64()) != Some(1) {
-        return Err("_meta.format must be 1".to_string());
+        return Err(Reason::new("lang.reason.bad_format"));
     }
     let code = meta
         .get("code")
         .and_then(|c| c.as_str())
         .filter(|c| valid_code(c))
-        .ok_or_else(|| "_meta.code is missing or not a valid language code".to_string())?;
+        .ok_or_else(|| Reason::new("lang.reason.bad_code"))?;
     let name = meta
         .get("name")
         .and_then(|n| n.as_str())
         .filter(|n| !n.trim().is_empty())
-        .ok_or_else(|| "_meta.name is missing".to_string())?;
+        .ok_or_else(|| Reason::new("lang.reason.no_name"))?;
     let mut texts = HashMap::new();
     for (key, value) in &map {
         if key == "_meta" {
             continue;
         }
         let Some(s) = value.as_str() else {
-            return Err(format!("the value of \"{key}\" is not a string"));
+            return Err(Reason::with("lang.reason.not_string", "key", key.as_str()));
         };
         texts.insert(key.clone(), s.to_string());
     }
     Ok(Lang { code: code.to_string(), name: name.to_string(), texts })
 }
 
-fn load_file(path: &Path) -> Result<Lang, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot be read: {}", e.kind()))?;
+fn load_file(path: &Path) -> Result<Lang, Reason> {
+    let unreadable = |e: std::io::Error| Reason::with("lang.reason.unreadable", "kind", e.kind().to_string());
+    let file = std::fs::File::open(path).map_err(unreadable)?;
     let mut bytes = Vec::new();
     // Read one byte past the limit so an oversized file is never read in full.
-    file.take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot be read: {}", e.kind()))?;
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(unreadable)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err("file is larger than 1 MB".to_string());
+        return Err(Reason::new("lang.reason.too_large"));
     }
     parse_lang(&bytes)
 }
@@ -189,7 +212,7 @@ fn load_file(path: &Path) -> Result<Lang, String> {
 /// returns the files that were skipped. Built-in languages stay in place. A
 /// missing folder is not a problem.
 pub fn scan_folder(dir: &Path) -> Vec<LangProblem> {
-    let mut problems = Vec::new();
+    let mut problems: Vec<(String, Reason)> = Vec::new();
     let mut loaded: HashMap<String, (String, Lang)> = HashMap::new();
 
     match std::fs::read_dir(dir) {
@@ -210,30 +233,57 @@ pub fn scan_folder(dir: &Path) -> Vec<LangProblem> {
                     Ok(lang) => {
                         let key = lang.code.to_ascii_lowercase();
                         if let Some((first, _)) = loaded.get(&key) {
-                            problems.push(LangProblem {
-                                file: name,
-                                reason: format!("language code \"{}\" is already provided by {first}", lang.code),
-                            });
+                            let reason = Reason {
+                                key: "lang.reason.duplicate",
+                                args: vec![("code", lang.code.clone()), ("first", first.clone())],
+                            };
+                            problems.push((name, reason));
                         } else {
                             loaded.insert(key, (name, lang));
                         }
                     }
-                    Err(reason) => problems.push(LangProblem { file: name, reason }),
+                    Err(reason) => problems.push((name, reason)),
                 }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => problems.push(LangProblem {
-            file: dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            reason: format!("folder cannot be read: {}", e.kind()),
-        }),
+        Err(e) => problems.push((
+            dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            Reason::with("lang.reason.folder_unreadable", "kind", e.kind().to_string()),
+        )),
     }
 
     write(|state| {
         state.folder = loaded.into_iter().map(|(k, (_, lang))| (k, lang)).collect();
         state.chosen = resolve_choice(state);
     });
-    problems
+    // Worded after the files are stored, so a reason already follows a language that was just loaded.
+    problems.into_iter().map(|(file, reason)| LangProblem { file, reason: reason.text() }).collect()
+}
+
+/// Problems of the start-up scan, kept for the window (which shows them in the settings).
+static STARTUP_PROBLEMS: Mutex<Vec<LangProblem>> = Mutex::new(Vec::new());
+
+/// Picks the language for the start: the saved choice (or the system language), then the language
+/// folder. A choice without a matching file falls back to the default language; nothing is written,
+/// so the choice comes back when the file does. Returns the files that were skipped.
+pub fn apply_startup(language: Option<&str>, dir: Option<&Path>) -> Vec<LangProblem> {
+    // The choice first, so the reasons of skipped files are worded in it where it is built in.
+    set_language(language);
+    dir.map(scan_folder).unwrap_or_default()
+}
+
+/// Applies the language from the saved settings before the first dialog can appear. Read only: a
+/// missing or broken settings file simply leaves the system language.
+pub fn apply_saved_language() {
+    let language = crate::settings::default_path().ok().and_then(|path| crate::settings::load(&path).0.language);
+    let problems = apply_startup(language.as_deref(), app_lang_dir().as_deref());
+    *STARTUP_PROBLEMS.lock().unwrap_or_else(PoisonError::into_inner) = problems;
+}
+
+/// The skipped files of [`apply_saved_language`], handed over once.
+pub fn take_startup_problems() -> Vec<LangProblem> {
+    std::mem::take(&mut *STARTUP_PROBLEMS.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// The `lang` folder next to the running executable (it may not exist).
@@ -539,7 +589,8 @@ mod tests {
         let mut big = lang_json("ff", "F", "").into_bytes();
         big.resize(1_048_577, b' ');
         write_file(dir.path(), "f_big.json", &big);
-        let problems = scan_folder(dir.path());
+        // The reasons are worded in the language in use; the words checked below are the English ones.
+        let problems = with_language("en", || scan_folder(dir.path()));
         let names: Vec<&str> = problems.iter().map(|p| p.file.as_str()).collect();
         assert_eq!(
             names,
@@ -679,10 +730,16 @@ mod tests {
         }
     }
 
-    /// Modules whose texts come from the language files. `ui/` and `tray.rs` follow with the window.
-    const NON_UI_MODULES: [&str; 18] = [
+    /// Modules whose texts come from the language files, outside the window code.
+    const NON_UI_MODULES: [&str; 19] = [
         "format", "cards", "view", "report", "worker", "analytics", "update", "update_worker", "paths", "paths_ui",
         "secrets", "settings", "cleanup", "crash", "single_instance", "launcher", "balance", "log_scan",
+        "config_store",
+    ];
+
+    /// The window code and the tray: every text the user sees there comes from the language files.
+    const UI_MODULES: [&str; 9] = [
+        "ui/mod", "ui/cockpit", "ui/details", "ui/banners", "ui/chart", "ui/drawer", "ui/updates", "ui/theme", "tray",
     ];
 
     /// The part of a source file before its test module.
@@ -780,6 +837,19 @@ mod tests {
     }
 
     #[test]
+    fn no_german_left_in_ui_modules() {
+        let mut found = Vec::new();
+        for module in UI_MODULES {
+            for lit in string_literals(&non_test_source(module)) {
+                if lit.chars().any(|c| "äöüÄÖÜß".contains(c)) {
+                    found.push(format!("{module}.rs: {lit}"));
+                }
+            }
+        }
+        assert!(found.is_empty(), "German text outside the language files:\n{}", found.join("\n"));
+    }
+
+    #[test]
     fn the_scanner_reads_literals_and_skips_comments_and_chars() {
         let code = "// \"ä\" in a comment\nlet a = \"ö \\\" ü\"; let c = '\"'; let r = r#\"ß \"x\"\"#; fn f<'a>() {} /* \"ä\" */";
         assert_eq!(string_literals(code), vec!["ö \\\" ü".to_string(), "ß \"x\"".to_string()]);
@@ -796,10 +866,10 @@ mod tests {
             s.contains('.')
                 && !s.ends_with(['.'])
                 && s.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
-                && !["json", "log", "exe", "jsonl", "part", "tmp", "bad"].contains(&s.rsplit('.').next().unwrap_or(""))
+                && !["json", "log", "exe", "jsonl", "part", "tmp", "bad", "ttf"].contains(&s.rsplit('.').next().unwrap_or(""))
         };
         let mut missing = Vec::new();
-        for module in NON_UI_MODULES {
+        for module in NON_UI_MODULES.into_iter().chain(UI_MODULES) {
             for lit in string_literals(&non_test_source(module)) {
                 if looks_like_key(&lit) && !(known(&de, &lit) && known(&en, &lit)) {
                     missing.push(format!("{module}.rs: {lit}"));
@@ -807,5 +877,65 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "keys missing in a built-in language:\n{}", missing.join("\n"));
+    }
+
+    #[test]
+    fn no_shipped_text_has_an_em_dash() {
+        for (name, json) in [("de", DE_JSON), ("en", EN_JSON)] {
+            let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).unwrap();
+            for (key, value) in &map {
+                assert!(!value.as_str().unwrap_or_default().contains('\u{2014}'), "{name}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn all_weekday_keys_exist_in_both_builtins() {
+        for (name, json) in [("de", DE_JSON), ("en", EN_JSON)] {
+            let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).unwrap();
+            for day in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] {
+                let key = format!("format.weekday.{day}");
+                let text = map.get(&key).and_then(|v| v.as_str());
+                assert!(text.is_some_and(|t| !t.is_empty()), "{name}: {key} is missing or empty");
+            }
+        }
+    }
+
+    /// Every `.rs` file below `dir`.
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A key nobody asks for is dead weight in every language file. Test code does not count.
+    #[test]
+    fn every_key_is_used() {
+        // Keys built at run time: the day abbreviations (`format!("format.weekday.{day}")`).
+        const DYNAMIC_PREFIXES: [&str; 1] = ["format.weekday."];
+        let mut files = Vec::new();
+        rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut used = std::collections::HashSet::new();
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap();
+            let end = text.find("#[cfg(test)]\nmod tests").or_else(|| text.find("#[cfg(test)]\r\nmod tests"));
+            used.extend(string_literals(&text[..end.unwrap_or(text.len())]));
+        }
+        let en: serde_json::Map<String, serde_json::Value> = serde_json::from_str(EN_JSON).unwrap();
+        let unused: Vec<&String> = en
+            .keys()
+            .filter(|k| *k != "_meta")
+            .filter(|key| {
+                let base = key.strip_suffix(".one").or_else(|| key.strip_suffix(".other")).unwrap_or(key);
+                let plural = base.len() != key.len();
+                !(used.contains(key.as_str()) || (plural && used.contains(base)) || DYNAMIC_PREFIXES.iter().any(|p| key.starts_with(p)))
+            })
+            .collect();
+        assert!(unused.is_empty(), "keys in lang/en.json that no non-test code uses:\n{unused:#?}");
     }
 }

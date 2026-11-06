@@ -15,7 +15,9 @@ use eframe::egui::{
 };
 
 use super::theme::palette::{AMBER, BG, CYAN, MUTED, TEXT};
-use super::{CerberusApp, Notice, NoticeKind, amount_input, key_field_id, key_label, key_status_line, wipe_key_field};
+use super::{CerberusApp, Notice, NoticeKind, amount_input, key_field_id, key_status_line, wipe_key_field};
+use crate::format::format_time_by;
+use crate::i18n::{tr, tr_args};
 use crate::cards::{
     inert_limits_hint, should_commit, update_settings, with_baseline, with_chosen_language, with_limits, with_topup,
     without_topup,
@@ -85,21 +87,25 @@ impl SettingsAction {
     }
 }
 
-/// "Einstellungen: <path> · Keys: in dieser Datei, …". Never contains a key; says why when there is no path.
+/// "Settings: <path> · Keys: in this file, …". Never contains a key; says why when there is no path.
 pub fn footer_text(settings_path: Option<&Path>, keys_plaintext: bool) -> String {
     let place = match settings_path {
         Some(p) => p.display().to_string(),
-        None => "nicht verfügbar (LOCALAPPDATA ist nicht gesetzt)".to_string(),
+        None => tr("drawer.footer.no_path"),
     };
-    let form = if keys_plaintext { "im Klartext" } else { "verschlüsselt" };
-    format!("Einstellungen: {place} · Keys: in dieser Datei, {form}")
+    let form = tr(if keys_plaintext { "drawer.footer.plain" } else { "drawer.footer.encrypted" });
+    tr_args("drawer.footer", &[("place", &place), ("form", &form)])
 }
 
 /// Warning shown before keys are written as plain text. Says what changes and what the default protects against.
-pub const PLAINTEXT_WARNING: &str = "Die Keys stehen danach lesbar in der Einstellungsdatei, auch in Backups und Kopien. Wer die Datei bekommt, kann die Keys benutzen. Dafür lässt sich die Datei auf einen anderen PC mitnehmen. Beide gespeicherten Keys werden sofort umgewandelt.";
+pub fn plaintext_warning() -> String {
+    tr("drawer.plaintext.warning")
+}
 
 /// Under the switch: the default and its honest limit.
-pub const PLAINTEXT_HINT: &str = "Standard ist verschlüsselt (Windows, nur dieser Benutzer auf diesem PC). Das schützt davor, dass die Datei mitgenommen oder versehentlich geteilt wird. Programme, die unter deinem Windows-Benutzer laufen, können die Keys trotzdem lesen. Für einen Umzug auf einen anderen PC: Klartext einschalten, Datei kopieren, dort wieder ausschalten.";
+pub fn plaintext_hint() -> String {
+    tr("drawer.plaintext.hint")
+}
 
 /// Applies a language choice: the language changes at once for this session; saving it into the
 /// settings file is a second step that may fail (broken file, no path). On failure the text says that
@@ -107,10 +113,10 @@ pub const PLAINTEXT_HINT: &str = "Standard ist verschlüsselt (Windows, nur dies
 pub fn choose_language(settings_path: Option<&Path>, code: &str) -> Result<Settings, String> {
     crate::i18n::set_language(Some(code));
     let Some(path) = settings_path else {
-        return Err("Die Sprache gilt nur bis zum Beenden der App. Einstellungen sind nicht verfügbar.".to_string());
+        return Err(tr("drawer.lang.session_only"));
     };
     update_settings(path, |s| Ok(with_chosen_language(s, code)))
-        .map_err(|e| format!("Die Sprache gilt nur bis zum Beenden der App, gespeichert wurde sie nicht. {e}"))
+        .map_err(|e| tr_args("drawer.lang.session_only_failed", &[("error", e.as_str())]))
 }
 
 /// The command that opens a folder in Explorer. The program is `explorer.exe` in the Windows folder
@@ -126,10 +132,11 @@ pub fn explorer_command(system_root: Option<&Path>, dir: &Path) -> Option<Comman
 /// folder nothing is created or started.
 pub fn open_folder_command(system_root: Option<&Path>, dir: &Path) -> Result<Command, String> {
     if system_root.is_none() {
-        return Err("Der Windows-Ordner ist nicht bekannt (SystemRoot fehlt), der Explorer wird nicht gestartet.".to_string());
+        return Err(tr("drawer.err.no_system_root"));
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("Der Sprachordner lässt sich nicht anlegen ({}).", e.kind()))?;
-    explorer_command(system_root, dir).ok_or_else(|| "Der Explorer wird nicht gestartet.".to_string())
+    std::fs::create_dir_all(dir)
+        .map_err(|e| tr_args("drawer.err.lang_dir_create", &[("kind", &e.kind().to_string())]))?;
+    explorer_command(system_root, dir).ok_or_else(|| tr("drawer.err.explorer_skipped"))
 }
 
 /// A pick in the language list changes nothing when it is both the saved choice and the language in
@@ -138,19 +145,19 @@ pub fn language_pick_is_noop(saved: Option<&str>, current: &str, pick: &str) -> 
     saved.is_some_and(|s| s.eq_ignore_ascii_case(pick)) && current.eq_ignore_ascii_case(pick)
 }
 
-/// "Löschen" is offered for a stored key, and also for one that is stored but cannot be decrypted
+/// "Delete" is offered for a stored key, and also for one that is stored but cannot be decrypted
 /// here, so a foreign key can be removed. An unreadable store or file keeps it disabled.
 pub fn delete_enabled(stored: Option<bool>, undecryptable: bool) -> bool {
     stored == Some(true) || undecryptable
 }
 
 fn open_lang_folder() -> Result<(), String> {
-    let dir = crate::i18n::app_lang_dir().ok_or_else(|| "Der Sprachordner ist nicht bekannt.".to_string())?;
+    let dir = crate::i18n::app_lang_dir().ok_or_else(|| tr("drawer.err.lang_dir_unknown"))?;
     let root = std::env::var_os("SystemRoot").map(PathBuf::from);
     open_folder_command(root.as_deref(), &dir)?
         .spawn()
         .map(drop)
-        .map_err(|e| format!("Der Explorer lässt sich nicht starten ({}).", e.kind()))
+        .map_err(|e| tr_args("drawer.err.explorer_failed", &[("kind", &e.kind().to_string())]))
 }
 
 /// Cubic ease-out of the slide.
@@ -223,7 +230,11 @@ impl CerberusApp {
             Ok(()) => {
                 wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
                 self.state.refresh_keys(&*self.store);
-                self.set_note(slot_note(slot), NoticeKind::Info, format!("{} gespeichert.", key_label(slot)));
+                let key = match slot {
+                    Slot::ApiKey => "drawer.key_saved.api",
+                    Slot::AdminKey => "drawer.key_saved.admin",
+                };
+                self.set_note(slot_note(slot), NoticeKind::Info, tr(key));
             }
             Err(msg) => {
                 *self.input_mut(slot) = input;
@@ -237,7 +248,11 @@ impl CerberusApp {
         match self.store.delete(slot) {
             Ok(()) => {
                 self.state.refresh_keys(&*self.store);
-                self.set_note(slot_note(slot), NoticeKind::Info, format!("{} gelöscht.", key_label(slot)));
+                let key = match slot {
+                    Slot::ApiKey => "drawer.key_deleted.api",
+                    Slot::AdminKey => "drawer.key_deleted.admin",
+                };
+                self.set_note(slot_note(slot), NoticeKind::Info, tr(key));
             }
             Err(e) => self.set_note(slot_note(slot), NoticeKind::Error, e.to_string()),
         }
@@ -255,15 +270,15 @@ impl CerberusApp {
             return;
         }
         let Some(path) = self.state.settings_path.clone() else {
-            self.set_note(key, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            self.set_note(key, NoticeKind::Error, tr("drawer.settings_unavailable"));
             return;
         };
         match self.paths.apply(action, &path) {
             Ok(settings) => {
                 self.state.settings = settings;
                 let text = match key {
-                    NoteKey::Obsidian => "Gespeichert. Der Obsidian-Pfad gilt ab dem nächsten Start.",
-                    _ => "Gespeichert. Der Protokollordner gilt nach einem Neustart der App.",
+                    NoteKey::Obsidian => tr("drawer.saved.obsidian"),
+                    _ => tr("drawer.saved.logs"),
                 };
                 self.set_note(key, NoticeKind::Info, text);
             }
@@ -285,23 +300,25 @@ impl CerberusApp {
             }
             Err(text) => self.set_note(NoteKey::Language, NoticeKind::Error, text),
         }
+        // The language changed for this session either way: the tray menu follows at once (the tooltip
+        // is rebuilt on the next poll) and the reasons of skipped files are worded again.
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_language_texts();
+        }
+        self.rescan_languages();
     }
 
     /// Switches how keys are stored, at once, in both directions. On error nothing changed.
     fn apply_plaintext(&mut self, on: bool) {
         let Some(path) = self.state.settings_path.clone() else {
-            self.set_note(NoteKey::Plaintext, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            self.set_note(NoteKey::Plaintext, NoticeKind::Error, tr("drawer.settings_unavailable"));
             return;
         };
         match crate::config_store::set_plaintext(&path, on) {
             Ok(settings) => {
                 self.state.settings = settings;
                 self.state.refresh_keys(&*self.store);
-                let text = if on {
-                    "Die Keys stehen jetzt im Klartext in der Einstellungsdatei."
-                } else {
-                    "Die Keys sind jetzt verschlüsselt gespeichert."
-                };
+                let text = tr(if on { "drawer.plaintext.on" } else { "drawer.plaintext.off" });
                 self.set_note(NoteKey::Plaintext, NoticeKind::Info, text);
             }
             Err(text) => self.set_note(NoteKey::Plaintext, NoticeKind::Error, text),
@@ -316,14 +333,14 @@ impl CerberusApp {
         let mut answer = None;
         egui::Modal::new(egui::Id::unique("confirm-plaintext")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Keys im Klartext speichern?");
-            ui.label(PLAINTEXT_WARNING);
+            ui.heading(tr("drawer.plaintext.title"));
+            ui.label(plaintext_warning());
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Im Klartext speichern").clicked() {
+                if ui.button(tr("drawer.plaintext.confirm")).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(tr("button.cancel")).clicked() {
                     answer = Some(false);
                 }
             });
@@ -338,10 +355,10 @@ impl CerberusApp {
         }
     }
 
-    /// "Nach Updates suchen" applies at once, through the same safe save as every other setting.
+    /// "Check for updates" applies at once, through the same safe save as every other setting.
     fn apply_check_updates(&mut self, on: bool) {
         let Some(path) = self.state.settings_path.clone() else {
-            self.set_note(NoteKey::Updates, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            self.set_note(NoteKey::Updates, NoticeKind::Error, tr("drawer.settings_unavailable"));
             return;
         };
         match update_settings(&path, |s| Ok(crate::settings::Settings { check_updates: on, ..s.clone() })) {
@@ -357,7 +374,7 @@ impl CerberusApp {
     pub(super) fn apply_settings_action(&mut self, action: SettingsAction) {
         let key = action.note_key();
         let Some(path) = self.state.settings_path.clone() else {
-            self.set_note(key, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            self.set_note(key, NoticeKind::Error, tr("drawer.settings_unavailable"));
             return;
         };
         let now = Utc::now();
@@ -365,9 +382,7 @@ impl CerberusApp {
         let result = update_settings(&path, |s| match &action {
             SettingsAction::Baseline => with_baseline(s, &st.baseline_input, now),
             SettingsAction::TopUp => with_topup(s, &st.topup_input, now),
-            SettingsAction::Remove(entry) => without_topup(s, entry).ok_or_else(|| {
-                "Diese Aufladung steht nicht mehr in der Einstellungsdatei. Es wurde nichts geändert.".to_string()
-            }),
+            SettingsAction::Remove(entry) => without_topup(s, entry).ok_or_else(|| tr("drawer.topup_gone")),
             SettingsAction::Budget => with_limits(s, Some(st.budget_input.as_str()), None),
             SettingsAction::LowBalance => with_limits(s, None, Some(st.low_balance_input.as_str())),
         });
@@ -391,11 +406,7 @@ impl CerberusApp {
                     }
                     SettingsAction::Remove(_) => {}
                 }
-                self.set_note(
-                    key,
-                    NoticeKind::Info,
-                    "Gespeichert. Die Karten übernehmen die Änderung beim nächsten Durchlauf (höchstens eine Minute).",
-                );
+                self.set_note(key, NoticeKind::Info, tr("drawer.saved.cards"));
             }
             Err(text) => self.set_note(key, NoticeKind::Error, text),
         }
@@ -457,10 +468,10 @@ impl CerberusApp {
             ui.add(egui::Separator::default().spacing(4.0));
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Einstellungen").size(14.0).strong().color(TEXT));
+                    ui.label(RichText::new(tr("ui.settings")).size(14.0).strong().color(TEXT));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let close = egui::Button::new(RichText::new("✕").size(13.0).color(MUTED)).frame(false);
-                        if ui.add(close).on_hover_text("Schließen").clicked() {
+                        if ui.add(close).on_hover_text(tr("button.close")).clicked() {
                             self.drawer_open = false;
                         }
                     });
@@ -479,34 +490,32 @@ impl CerberusApp {
         let broken = self.state.snapshot.as_ref().is_some_and(|s| s.settings_error.is_some());
         let can_save = !broken && self.state.settings_path.is_some();
         if broken {
-            let place = self.state.settings_path.as_ref().map(|p| format!(" {}", p.display())).unwrap_or_default();
-            warn(
-                ui,
-                &format!(
-                    "Die Einstellungsdatei ist nicht lesbar. Speichern ist gesperrt, solange die Datei nicht geprüft oder gelöscht ist:{place}"
-                ),
-            );
+            let text = match &self.state.settings_path {
+                Some(p) => tr_args("drawer.broken_settings", &[("path", &p.display().to_string())]),
+                None => tr("drawer.broken_settings_nopath"),
+            };
+            warn(ui, &text);
         } else if self.state.settings_path.is_none() {
-            warn(ui, "Speichern nicht möglich: Die Umgebungsvariable LOCALAPPDATA ist nicht gesetzt, es gibt keinen Ort für die Einstellungen.");
+            warn(ui, &tr("drawer.no_localappdata"));
         }
 
-        // -- Sprache
-        section_title(ui, "Sprache");
+        // -- Language
+        section_title(ui, &tr("drawer.section.language"));
         self.draw_language_section(ui);
 
-        // -- Schlüssel
-        section_title(ui, "Schlüssel");
-        ui.label("API-Key");
+        // -- Keys
+        section_title(ui, &tr("drawer.section.keys"));
+        ui.label(tr("drawer.api_key"));
         self.draw_key_row(ui, Slot::ApiKey, "sk-ant-…");
-        hint(ui, "Nur für „Mit API-Key starten“. Der Key muss einem Workspace zugeordnet sein (Geltungsbereich Default), sonst lehnt die API Anfragen ab.");
+        hint(ui, &tr_args("drawer.api_key.hint", &[("button", &tr("button.start_api"))]));
         ui.add_space(6.0);
-        ui.label("Admin-Key");
+        ui.label(tr("drawer.admin_key"));
         self.draw_key_row(ui, Slot::AdminKey, "sk-ant-admin01-…");
-        hint(ui, "Nur für die Kosten-API, braucht ein Organisations-Konto. Liefert die echten Kosten von Anthropic.");
+        hint(ui, &tr("drawer.admin_key.hint"));
         ui.add_space(6.0);
         ui.add_enabled_ui(can_save, |ui| {
             let mut on = self.state.settings.keys_plaintext;
-            if ui.checkbox(&mut on, "Keys im Klartext speichern").changed() {
+            if ui.checkbox(&mut on, tr("drawer.plaintext.checkbox")).changed() {
                 if on {
                     self.plaintext_confirm_open = true;
                 } else {
@@ -514,27 +523,27 @@ impl CerberusApp {
                 }
             }
         });
-        hint(ui, PLAINTEXT_HINT);
+        hint(ui, &plaintext_hint());
         field_note(ui, self.note(NoteKey::Plaintext));
 
-        // -- Guthaben
-        let title = section_title(ui, "Guthaben");
+        // -- Balance
+        let title = section_title(ui, &tr("drawer.section.balance"));
         if self.drawer_scroll == Some(Section::Balance) {
             self.drawer_scroll = None;
             title.scroll_to_me(Some(Align::TOP));
         }
         ui.add_enabled_ui(can_save, |ui| self.draw_balance_section(ui));
 
-        // -- Grenzen
-        section_title(ui, "Grenzen");
+        // -- Limits
+        section_title(ui, &tr("drawer.section.limits"));
         ui.add_enabled_ui(can_save, |ui| self.draw_limits_section(ui));
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
         if let Some(text) = inert_limits_hint(api) {
             warn(ui, &text);
         }
 
-        // -- Pfade
-        section_title(ui, "Pfade");
+        // -- Paths
+        section_title(ui, &tr("ui.paths"));
         let notes = [self.notes.get(&NoteKey::Obsidian), self.notes.get(&NoteKey::Logs)]
             .map(|n| n.map(|n| RowNote { error: n.kind == NoticeKind::Error, text: n.text.as_str() }));
         // `notes` borrows `self.notes`; the action is applied after the borrow ends.
@@ -543,8 +552,8 @@ impl CerberusApp {
             self.apply_paths_action(ui.ctx(), action);
         }
 
-        // -- Über
-        section_title(ui, "Über");
+        // -- About
+        section_title(ui, &tr("drawer.section.about"));
         let launch_running = self.launch_running();
         let check_updates = self.state.settings.check_updates;
         if let Some(on) = self.update.draw_about(ui, check_updates, can_save, !broken, launch_running) {
@@ -577,7 +586,7 @@ impl CerberusApp {
                     }
                 }
             });
-            open_folder = ui.button("Sprachordner öffnen").clicked();
+            open_folder = ui.button(tr("drawer.lang.open_folder")).clicked();
         });
         if let Some(code) = chosen {
             self.apply_language(&code);
@@ -594,7 +603,7 @@ impl CerberusApp {
         for problem in &self.lang_problems {
             ui.add(egui::Label::new(RichText::new(format!("{}: {}", problem.file, problem.reason)).size(12.0).color(AMBER)));
         }
-        hint(ui, "Eigene Sprachdateien (.json) kommen in den Sprachordner und erscheinen, sobald die Einstellungen neu geöffnet werden.");
+        hint(ui, &tr("drawer.lang.hint"));
     }
 
     fn draw_key_row(&mut self, ui: &mut egui::Ui, slot: Slot, hint_text: &str) {
@@ -623,8 +632,10 @@ impl CerberusApp {
         );
         let empty = input.is_empty();
         ui.horizontal_wrapped(|ui| {
-            save = ui.add_enabled(!empty, egui::Button::new("Speichern")).clicked();
-            delete = ui.add_enabled(delete_enabled(stored, undecryptable), egui::Button::new("Löschen")).clicked();
+            save = ui.add_enabled(!empty, egui::Button::new(tr("button.save"))).clicked();
+            delete = ui
+                .add_enabled(delete_enabled(stored, undecryptable), egui::Button::new(tr("button.delete")))
+                .clicked();
         });
         field_note(ui, self.note(slot_note(slot)));
         if save {
@@ -638,32 +649,36 @@ impl CerberusApp {
     fn draw_balance_section(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<SettingsAction> = None;
 
-        ui.label("Startwert aus der Console (USD)");
+        ui.label(tr("drawer.baseline.label"));
         let baseline = self.state.settings.baseline.clone();
         let current = amount_input(baseline.as_ref().map(|b| b.amount_nano));
         ui.horizontal_wrapped(|ui| {
             let st = &mut self.state;
-            if amount_field(ui, &mut st.baseline_input, &mut st.baseline_edited, &current, "65,03") {
+            if amount_field(ui, &mut st.baseline_input, &mut st.baseline_edited, &current, &tr("drawer.baseline.example")) {
                 action = Some(SettingsAction::Baseline);
             }
             match &baseline {
-                Some(b) => hint(ui, &format!("gilt seit {}", b.at.with_timezone(&Local).format("%d.%m.%Y"))),
-                None => hint(ui, "noch nicht gesetzt"),
+                Some(b) => {
+                    let date = format_time_by(&b.at.with_timezone(&Local), "format.date", "%Y-%m-%d");
+                    hint(ui, &tr_args("drawer.baseline.since", &[("date", &date)]));
+                }
+                None => hint(ui, &tr("drawer.baseline.unset")),
             }
         });
-        hint(ui, "Der Startwert gilt ab jetzt; Aufladungen und Kosten davor zählen nicht. Speichert mit Enter.");
+        hint(ui, &tr("drawer.baseline.hint"));
         field_note(ui, self.note(NoteKey::Baseline));
 
         ui.add_space(6.0);
-        ui.label("Aufladungen");
+        ui.label(tr("drawer.topups.label"));
         let topups = self.state.settings.topups.clone();
         if topups.is_empty() {
-            hint(ui, "Keine Aufladungen eingetragen.");
+            hint(ui, &tr("drawer.topups.none"));
         }
         for topup in &topups {
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} · {}", topup.at.with_timezone(&Local).format("%d.%m.%Y"), format_usd(topup.amount_nano)));
-                if ui.small_button("Entfernen").clicked() {
+                let date = format_time_by(&topup.at.with_timezone(&Local), "format.date", "%Y-%m-%d");
+                ui.label(format!("{date} · {}", format_usd(topup.amount_nano)));
+                if ui.small_button(tr("button.remove")).clicked() {
                     action = Some(SettingsAction::Remove(topup.clone()));
                 }
             });
@@ -673,7 +688,7 @@ impl CerberusApp {
             let r = ui.add(egui::TextEdit::singleline(&mut self.state.topup_input).hint_text("10").desired_width(120.0));
             // A top-up is added on Enter or the button, never on blur: half-typed text must not become money.
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let add = ui.button("+ Hinzufügen").clicked();
+            let add = ui.button(tr("button.add")).clicked();
             if (enter || add) && !self.state.topup_input.trim().is_empty() {
                 action = Some(SettingsAction::TopUp);
             }
@@ -690,7 +705,7 @@ impl CerberusApp {
         let budget_now = amount_input(self.state.settings.monthly_budget_nano);
         let low_now = amount_input(self.state.settings.low_balance_nano);
 
-        ui.label("Monatsbudget (USD, optional)");
+        ui.label(tr("drawer.budget.label"));
         let st = &mut self.state;
         if amount_field(ui, &mut st.budget_input, &mut st.budget_edited, &budget_now, "20") {
             action = Some(SettingsAction::Budget);
@@ -698,13 +713,13 @@ impl CerberusApp {
         field_note(ui, self.notes.get(&NoteKey::Budget));
 
         ui.add_space(4.0);
-        ui.label("Warngrenze Guthaben (USD, optional)");
+        ui.label(tr("drawer.low_balance.label"));
         let st = &mut self.state;
         if amount_field(ui, &mut st.low_balance_input, &mut st.low_balance_edited, &low_now, "10") {
             action = Some(SettingsAction::LowBalance);
         }
         field_note(ui, self.notes.get(&NoteKey::LowBalance));
-        hint(ui, "Leer lassen schaltet die Grenze aus. Speichert mit Enter.");
+        hint(ui, &tr("drawer.limits.hint"));
 
         if let Some(action) = action {
             self.apply_settings_action(action);
@@ -733,10 +748,10 @@ mod tests {
     #[test]
     fn plaintext_texts_are_honest_about_what_encryption_protects_against() {
         // The warning names what becomes readable and where the copies end up.
-        assert!(PLAINTEXT_WARNING.contains("lesbar") && PLAINTEXT_WARNING.contains("Backups"));
+        assert!(plaintext_warning().contains("lesbar") && plaintext_warning().contains("Backups"));
         // The default does not claim protection from other programs of the same Windows user.
-        assert!(PLAINTEXT_HINT.contains("mitgenommen") && PLAINTEXT_HINT.contains("trotzdem lesen"));
-        assert!(!PLAINTEXT_HINT.contains('\u{2014}') && !PLAINTEXT_WARNING.contains('\u{2014}'));
+        assert!(plaintext_hint().contains("mitgenommen") && plaintext_hint().contains("trotzdem lesen"));
+        assert!(!plaintext_hint().contains('\u{2014}') && !plaintext_warning().contains('\u{2014}'));
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -764,11 +779,25 @@ mod tests {
         let dir = temp_dir("choice-broken");
         let path = dir.join("settings.json");
         std::fs::write(&path, "{ not json").unwrap();
+        // The text is worded in the language that was just chosen (here English).
         let err = choose_language(Some(&path), "en").unwrap_err();
-        assert!(err.contains("nur bis zum Beenden"), "{err}");
+        assert!(err.contains("only holds until the app is closed"), "{err}");
         assert_eq!(crate::i18n::current_code(), "en");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "a broken file is never overwritten");
         let none = choose_language(None, "en").unwrap_err();
+        assert!(none.contains("only holds until the app is closed"), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_language_error_is_worded_in_the_german_choice_too() {
+        crate::i18n::isolate();
+        let dir = temp_dir("choice-broken-de");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = choose_language(Some(&path), "de").unwrap_err();
+        assert!(err.contains("nur bis zum Beenden"), "{err}");
+        let none = choose_language(None, "de").unwrap_err();
         assert!(none.contains("nur bis zum Beenden"), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
     }
