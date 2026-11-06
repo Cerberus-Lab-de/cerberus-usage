@@ -27,6 +27,13 @@ pub const START_DELAY: Duration = Duration::from_secs(5);
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// While automatic checks are off, the setting is looked at this often (a tiny file read).
 const DISABLED_RECHECK: Duration = Duration::from_secs(60 * 60);
+/// After a failed check (often: no network yet right after logon) the next one comes sooner.
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60 * 60);
+
+/// Wait until the next automatic check: the normal interval after a success, an hour after a failure.
+pub fn next_check_delay(interval: Duration, failed: bool) -> Duration {
+    if failed { RETRY_AFTER_FAILURE.min(interval) } else { interval }
+}
 
 /// Shown when the build carries no update key (until the release process sets one).
 pub const NO_KEY_TEXT: &str = "Update-Schlüssel fehlt in dieser Version.";
@@ -152,7 +159,8 @@ struct Core {
 }
 
 impl Core {
-    fn check(&mut self, out: &mut Out<'_>, explicit: bool) {
+    /// Returns true when the check failed.
+    fn check(&mut self, out: &mut Out<'_>, explicit: bool) -> bool {
         if explicit {
             out.send(UpdateState::Checking);
         }
@@ -168,7 +176,9 @@ impl Core {
             }
             Err(e) => UpdateState::Failed(failure_text(&e)),
         };
+        let failed = matches!(state, UpdateState::Failed(_));
         out.send(state);
+        failed
     }
 
     fn install(&mut self, out: &mut Out<'_>) {
@@ -233,19 +243,19 @@ fn run(cfg: UpdateConfig, cmds: Receiver<UpdateCmd>, tx: Sender<UpdateState>, no
         }
         let step = catch_unwind(AssertUnwindSafe(|| match cmd {
             Some(UpdateCmd::CheckNow) => {
-                core.check(&mut out, true);
-                due = Instant::now() + interval;
+                let failed = core.check(&mut out, true);
+                due = Instant::now() + next_check_delay(interval, failed);
             }
             Some(UpdateCmd::Install) => core.install(&mut out),
             Some(UpdateCmd::SettingsChanged) => {
                 if automatic_checks_enabled(settings_path.as_deref()) {
-                    core.check(&mut out, false);
-                    due = Instant::now() + interval;
+                    let failed = core.check(&mut out, false);
+                    due = Instant::now() + next_check_delay(interval, failed);
                 }
             }
             None if automatic_checks_enabled(settings_path.as_deref()) => {
-                core.check(&mut out, false);
-                due = Instant::now() + interval;
+                let failed = core.check(&mut out, false);
+                due = Instant::now() + next_check_delay(interval, failed);
             }
             None => due = Instant::now() + DISABLED_RECHECK.min(interval),
         }));
@@ -267,6 +277,14 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn a_failed_check_retries_after_an_hour_and_a_good_one_waits_a_day() {
+        assert_eq!(next_check_delay(CHECK_INTERVAL, false), Duration::from_secs(24 * 3600));
+        assert_eq!(next_check_delay(CHECK_INTERVAL, true), Duration::from_secs(3600));
+        // A test interval shorter than the retry time is never stretched.
+        assert_eq!(next_check_delay(Duration::from_millis(50), true), Duration::from_millis(50));
+    }
 
     const REPO: &str = "https://github.com/Cerberus-Lab-de/cerberus-usage/";
     const INSTALLER: &[u8] = b"fake installer bytes";
