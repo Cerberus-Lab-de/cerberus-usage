@@ -17,7 +17,7 @@ fn is_transient(e: &io::Error) -> bool {
 /// Runs `op` up to [`TRIES`] times, pausing [`PAUSE`] between attempts, while it fails with a
 /// transient sharing error. Any other error, and the last transient one, is returned as is.
 pub fn retry_transient<T>(op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    retry_with(TRIES, |d| std::thread::sleep(d), op)
+    retry_with(TRIES, std::thread::sleep, op)
 }
 
 fn retry_with<T>(
