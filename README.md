@@ -4,7 +4,9 @@ A small Windows tray app. It launches Obsidian with either your Claude Max subsc
 
 ![Cerberus Usage](docs/screenshot.png)
 
-Windows 10/11 x86-64 only, MIT licensed, no telemetry. The app's interface is in German for now, so button and setting names below are quoted in German.
+**Website and full documentation (English and German):** [cerberus-lab.de/cerberus-usage](https://cerberus-lab.de/cerberus-usage)
+
+Windows 10/11 x86-64 only, MIT licensed, no telemetry. The app's interface is in German for now, so button and setting names below are quoted in German. This is an independent project, not affiliated with Anthropic.
 
 ## What it does
 
