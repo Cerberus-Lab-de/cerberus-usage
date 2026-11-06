@@ -1,100 +1,100 @@
 # Cerberus Usage
 
-Kleine Windows-App im Infobereich (Tray). Sie startet Obsidian wahlweise mit dem Claude-Max-Abo oder mit einem API-Key und zeigt, was Claude kostet. Die Anzeige macht klar, wer gerade bezahlt.
+A small Windows tray app. It launches Obsidian with either your Claude Max subscription or an API key, and shows what Claude costs. The display makes it clear who is paying right now.
 
 ![Cerberus Usage](docs/screenshot.png)
 
-*English in short: Cerberus Usage is a small Windows tray app. It launches Obsidian either with your Claude Max subscription or with an API key, and shows what Claude costs, estimated locally from Claude's log metadata, plus the real API cost from Anthropic if you provide an admin key. Windows 10/11 x86-64 only, MIT licensed, no telemetry. The installer is not code-signed, so SmartScreen warns on first run; updates are verified with an Ed25519 signature.*
+Windows 10/11 x86-64 only, MIT licensed, no telemetry. The app's interface is in German for now, so button and setting names below are quoted in German.
 
-## Was die App kann
+## What it does
 
-- **Obsidian starten** im Max-Modus (ohne `ANTHROPIC_API_KEY`) oder im API-Key-Modus. Der Key wird nur an den Obsidian-Prozess übergeben, nie dauerhaft gesetzt. Beide Modi entfernen auch `ANTHROPIC_AUTH_TOKEN` für den Obsidian-Prozess, weil er sonst jede andere Anmeldung übersteuert. Ist `ANTHROPIC_BASE_URL` oder `CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY` gesetzt, bleibt es unverändert, aber das Fenster warnt und nennt den Namen (nie den Wert). Die Anzeige „Max“ bzw. „API-Key“ gilt nur, sofern in Claude selbst (`apiKeyHelper`, `env`-Block in den Claude-Einstellungen) keine andere Anmeldung eingerichtet ist; das kann die App nicht sehen.
-- **Prüfung, ob Obsidian läuft**: schlägt sie fehl (z. B. `tasklist` gesperrt), schließt und startet die App nichts und sagt es.
-- **Lokal geschätzte Kosten** aus den Claude-Protokollen unter `%USERPROFILE%\.claude\projects` (heute, Monat, letzte 5 Std., nach Projekt und Modell). Es werden nur Metadaten gelesen, nie Inhalte. Das ist eine Rechnung nach Listenpreis, nicht die Rechnung von Anthropic.
-- **API-Kosten laut Anthropic** über die Kosten-API, wenn ein Admin-Key gespeichert ist.
-- **Guthaben (geschätzt)**: Startwert aus der Console, plus Aufladungen, minus die API-Kosten seit dem Startwert.
-- **Warnungen** bei Monatsbudget, niedrigem Guthaben und Max-Pause: als Banner im Fenster und als farbiger Punkt am Tray-Symbol.
-- **Updates**: siehe unten.
+- **Launches Obsidian** in Max mode (without `ANTHROPIC_API_KEY`) or in API key mode. The key is passed to the Obsidian process only and is never set permanently. Both modes also remove `ANTHROPIC_AUTH_TOKEN` for the Obsidian process, because it would otherwise override any other login. If `ANTHROPIC_BASE_URL` or `CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY` is set, it stays unchanged, but the window warns and names the variable (never its value). The "Max" or "API-Key" display only holds as long as no other login is configured inside Claude itself (`apiKeyHelper`, the `env` block in Claude's settings); the app cannot see that.
+- **Checks whether Obsidian is running.** If the check fails (for example, `tasklist` is blocked), the app neither closes nor starts anything, and says so.
+- **Locally estimated costs** from Claude's logs under `%USERPROFILE%\.claude\projects` (today, this month, last 5 hours, by project and model). Only metadata is read, never content. This is a calculation at list price, not Anthropic's invoice.
+- **API costs according to Anthropic** through the cost API, if an admin key is stored.
+- **Estimated balance:** the starting value from the Console, plus top-ups, minus API costs since the starting value.
+- **Alerts** for the monthly budget, low balance and a Max pause: as a banner in the window and as a colored dot on the tray icon.
+- **Updates:** see below.
 
-## Installieren
+## Install
 
-1. Den neuesten `CerberusUsage-Setup-<Version>.exe` von der [Releases-Seite](https://github.com/Cerberus-Lab-de/cerberus-usage/releases) laden und starten.
-2. Der Installer läuft pro Benutzer, ohne Admin-Rechte, und installiert nach `%LOCALAPPDATA%\Programs\CerberusUsage\`. Er legt einen Startmenü-Eintrag an; Desktop-Verknüpfung (an) und Autostart (aus) sind Häkchen im Setup. Die App erscheint unter Windows → Apps.
+1. Download the latest `CerberusUsage-Setup-<version>.exe` from the [releases page](https://github.com/Cerberus-Lab-de/cerberus-usage/releases) and run it.
+2. The installer runs per user, without admin rights, and installs to `%LOCALAPPDATA%\Programs\CerberusUsage\`. It adds a Start menu entry; the desktop shortcut (on) and autostart (off) are checkboxes in the setup. The app appears under Windows → Apps.
 
-**SmartScreen:** Der Installer ist nicht mit einem Windows-Zertifikat signiert (das kostet Geld und ist eine eigene Entscheidung). Windows zeigt deshalb beim ersten Start „Der Computer wurde durch Windows geschützt“. Klick auf **Weitere Informationen → Trotzdem ausführen**. Wer prüfen will, was er startet, baut die App aus dem Quellcode (siehe unten).
+**SmartScreen:** the installer is not signed with a Windows certificate (that costs money and is a separate decision). Windows therefore shows "Windows protected your PC" on first run. Click **More info → Run anyway**. If you want to check what you are running, build the app from source (see below).
 
-**Deinstallieren:** Windows → Apps → Cerberus Usage. Die Deinstallation fragt, ob Einstellungen, Zählerstand und gespeicherte Keys ebenfalls entfernt werden sollen. Bei „Nein“ (und bei stiller Deinstallation) bleiben sie erhalten.
+**Uninstall:** Windows → Apps → Cerberus Usage. The uninstaller asks whether settings, the scan state and stored keys should be removed too. If you answer "No" (and on a silent uninstall), they stay.
 
-## Updates und Signatur
+## Updates and signature
 
-Die App sucht beim Start und danach einmal täglich nach einer neuen Version (Releases dieses Repos). Gibt es eine, erscheint im Cockpit ein dezenter Hinweis. Installiert wird nur nach Klick auf „Jetzt aktualisieren“, nie im Hintergrund.
+The app looks for a new version (this repo's releases) at startup and once a day after that. If there is one, a subtle notice appears in the cockpit. It installs only after you click "Jetzt aktualisieren" (update now), never in the background.
 
-Jedes Release enthält neben dem Installer eine Manifest-Datei (`…exe.manifest.json`) mit Version, Dateiname, SHA-256 und einer **Ed25519-Signatur**. Der öffentliche Schlüssel ist in die App eingebaut; der private liegt im Windows-Anmeldeinformationsspeicher des Entwicklers (dazu eine Sicherung im Passwort-Manager des Entwicklers), nie im Repo oder auf GitHub. Die App installiert nichts, wenn die Signatur falsch ist oder fehlt, die Prüfsumme nicht passt oder die Version nicht neuer ist als die laufende. Ein gekapertes GitHub-Konto kann so kein Update unterschieben. Es könnte aber die Setup-Datei für Neuinstallationen austauschen (die hat keine Signaturprüfung durch die App) und Updates zurückhalten.
+Every release contains a manifest file (`…exe.manifest.json`) next to the installer, with the version, file name, SHA-256 and an **Ed25519 signature**. The public key is built into the app. The private key is in the developer's Windows Credential Manager (with a backup in the developer's password manager), never in the repo or on GitHub. The app installs nothing if the signature is wrong or missing, the checksum does not match, or the version is not newer than the running one. A hijacked GitHub account therefore cannot push an update. It could, however, replace the setup file for new installs (the app does not check the signature of those) and withhold updates.
 
-Der Schalter „Nach Updates suchen“ in der Schublade schaltet die automatischen Prüfungen ab (dann geht von allein keine Anfrage an GitHub raus). Dort stehen auch die aktuelle Version und „Jetzt prüfen“.
+The "Nach Updates suchen" (check for updates) switch in the settings drawer turns off automatic checks (no request goes to GitHub on its own then). The current version and "Jetzt prüfen" (check now) are there too.
 
-## Datenschutz: was die App liest und sendet
+## Privacy: what the app reads and sends
 
-- **Liest lokal:** die Claude-Protokolle unter `%USERPROFILE%\.claude\projects` (oder `%CLAUDE_CONFIG_DIR%\projects`), und zwar **nur Metadaten** wie Zeit, Modell und Token-Zahlen, nie Gesprächsinhalte.
-- **Sendet an Anthropic** (`api.anthropic.com`) nur, wenn du einen **Admin-Key** gespeichert hast: die Abfrage der Kosten-API. Ohne Admin-Key geht nichts an Anthropic. Der normale API-Key geht nur an den von dir gestarteten Obsidian-Prozess, nicht an die App-Anfragen.
-- **GitHub** (`api.github.com`, `github.com` und die Download-Server für Releases) wird **nur für die Update-Prüfung** und den Update-Download angesprochen. Automatische Prüfungen laufen nur, solange „Nach Updates suchen“ an ist. „Jetzt prüfen“ und „Jetzt aktualisieren“ gehen auch bei ausgeschaltetem Schalter raus, weil du sie selbst auslöst. Jede Anfrage verrät GitHub deine IP-Adresse und die App-Version (im User-Agent `cerberus-usage/<Version>`); mehr enthält sie nicht.
-- **Keine Telemetrie.** Es werden keine Nutzungsdaten gesendet, es gibt keine Konten und keinen eigenen Server.
-- **Keys** liegen im Windows-Anmeldeinformationsspeicher (Credential Manager), Dienst `cerberus-usage`. Nie in Dateien, Logs oder der Oberfläche; die Eingabefelder sind maskiert.
-  - **API-Key** (`sk-ant-…`): nur für „Mit API-Key starten“. Er muss einem Workspace zugeordnet sein (Geltungsbereich Default), sonst lehnt die API Anfragen ab.
-  - **Admin-Key** (`sk-ant-admin01-…`): nur für die Kosten-API.
+- **Reads locally:** Claude's logs under `%USERPROFILE%\.claude\projects` (or `%CLAUDE_CONFIG_DIR%\projects`), and **only metadata** such as time, model and token counts, never conversation content.
+- **Sends to Anthropic** (`api.anthropic.com`) only if you have stored an **admin key**: the cost API query. Without an admin key, nothing goes to Anthropic. The normal API key goes only to the Obsidian process you start, not into the app's own requests.
+- **GitHub** (`api.github.com`, `github.com` and the release download servers) is contacted **only for the update check** and the update download. Automatic checks run only while "Nach Updates suchen" is on. "Jetzt prüfen" and "Jetzt aktualisieren" also go out when the switch is off, because you trigger them yourself. Every request reveals your IP address and the app version to GitHub (in the user agent `cerberus-usage/<version>`); it contains nothing else.
+- **No telemetry.** No usage data is sent, and there are no accounts and no server of our own.
+- **Keys** are stored in the Windows Credential Manager, service `cerberus-usage`. Never in files, logs or the interface; the input fields are masked.
+  - **API key** (`sk-ant-…`): only for "Mit API-Key starten" (start with API key). It must be assigned to a workspace (scope Default), otherwise the API rejects requests.
+  - **Admin key** (`sk-ant-admin01-…`): only for the cost API.
 
-### Wo liegen die Daten?
+### Where is the data?
 
-Unter `%LOCALAPPDATA%\CerberusUsage\`:
+Under `%LOCALAPPDATA%\CerberusUsage\`:
 
-- `settings.json`: Startwert, Aufladungen, Monatsbudget, Warngrenze (Beträge in Nano-USD), Update-Schalter
-- `scan_state.json`: Lesestand der Claude-Protokolle und die gelesenen Verbrauchsdaten. Ist die Datei nicht lesbar, wird sie als `scan_state.json.bad` zur Seite gelegt und das Fenster sagt es einmal.
-- `crash.log`: kleine Textdatei mit Zeit, Ort und Meldung bei Abstürzen
-- `prices.json` (optional): eigene Preisliste, überschreibt die eingebaute
+- `settings.json`: starting value, top-ups, monthly budget, alert threshold (amounts in nano-USD), update switch
+- `scan_state.json`: read position in Claude's logs and the usage data read so far. If the file cannot be read, it is moved aside as `scan_state.json.bad` and the window says so once.
+- `crash.log`: small text file with time, location and message on crashes
+- `prices.json` (optional): your own price list, overrides the built-in one
 
-Ist `settings.json` kaputt, zeigt die App eine Meldung mit dem Pfad und sperrt das Speichern, damit die Datei nicht überschrieben wird.
+If `settings.json` is broken, the app shows a message with the path and blocks saving, so that the file is not overwritten.
 
-## Andere Pfade
+## Other paths
 
-Liegt Obsidian oder der Claude-Protokollordner woanders, trägst du den Pfad in der Schublade unter „Pfade“ ein (Feld, „Durchsuchen“, „Speichern“; „Zurücksetzen“ geht zurück auf automatisch). Beide Felder stehen in `settings.json` (`obsidian_path`, `logs_root`).
+If Obsidian or Claude's log folder is somewhere else, enter the path in the drawer under "Pfade" (paths): field, "Durchsuchen" (browse), "Speichern" (save); "Zurücksetzen" (reset) goes back to automatic. Both fields are stored in `settings.json` (`obsidian_path`, `logs_root`).
 
-Suchreihenfolge Obsidian: eingestellter Pfad (muss auf eine vorhandene `.exe` zeigen), dann `%LOCALAPPDATA%\Programs\Obsidian\Obsidian.exe`, `%ProgramFiles%\Obsidian\Obsidian.exe`, `%ProgramFiles(x86)%\Obsidian\Obsidian.exe`. Eine Änderung gilt beim nächsten Start von Obsidian.
+Search order for Obsidian: the configured path (must point to an existing `.exe`), then `%LOCALAPPDATA%\Programs\Obsidian\Obsidian.exe`, `%ProgramFiles%\Obsidian\Obsidian.exe`, `%ProgramFiles(x86)%\Obsidian\Obsidian.exe`. A change applies the next time Obsidian starts.
 
-Suchreihenfolge Protokolle: eingestellter Ordner, dann `%CLAUDE_CONFIG_DIR%\projects`, dann `%USERPROFILE%\.claude\projects`. Eine Änderung gilt nach einem Neustart der App.
+Search order for logs: the configured folder, then `%CLAUDE_CONFIG_DIR%\projects`, then `%USERPROFILE%\.claude\projects`. A change applies after restarting the app.
 
-## Einschränkung: Einzelkonto
+## Limitation: individual accounts
 
-Die Kosten-API gibt es nur für Organisations-Konten. Bei einem Einzelkonto antwortet Anthropic mit „nicht verfügbar“. Die Karte „API-Kosten laut Anthropic“ sagt das dann offen, und das Guthaben wird ohne Kostenabzug gezeigt: Startwert plus Aufladungen. Ohne Kosten-API wird die Budget-Warnung nie ausgelöst.
+The cost API exists only for organization accounts. For an individual account, Anthropic answers "not available". The "API-Kosten laut Anthropic" card then says so openly, and the balance is shown without cost deduction: starting value plus top-ups. Without the cost API, the budget alert never fires.
 
-## Alle Kosten sind Schätzungen
+## All costs are estimates
 
-Lokale Kosten sind nach Listenpreis berechnet. Die Werte der Kosten-API können laut Anthropic mehrere Stunden hinterherhinken. Das Guthaben ist eine Rechnung aus Startwert, Aufladungen und Kosten, nicht der Kontostand der Console.
+Local costs are calculated at list price. According to Anthropic, cost API values can lag by several hours. The balance is a calculation from starting value, top-ups and costs, not the Console balance.
 
-## Fenster und Beenden
+## Window and quitting
 
-Das X-Symbol versteckt das Fenster im Tray. Ein Klick auf das Tray-Symbol holt es zurück. „Beenden“ im Tray-Menü wartet, falls gerade ein Start läuft, bis dieser fertig ist.
+The X button hides the window to the tray. Clicking the tray icon brings it back. "Beenden" (quit) in the tray menu waits until a launch in progress has finished.
 
-## Aus dem Quellcode bauen
+## Build from source
 
-Voraussetzungen: Windows 10/11 x86-64, Rust 1.95 oder neuer (stable; so hoch ist die Mindestversion der eingesetzten UI-Bibliothek egui 0.37, die Edition ist 2024) und die Visual-Studio-Build-Tools. In PowerShell (nicht in Git Bash, dessen `link.exe` stört das Linken):
+Requirements: Windows 10/11 x86-64, Rust 1.95 or newer (stable; that is the minimum of the UI library egui 0.37, the edition is 2024) and the Visual Studio Build Tools. In PowerShell (not in Git Bash, whose `link.exe` gets in the way of linking):
 
 ```powershell
 cargo test
 cargo build --release
 ```
 
-Die App liegt danach unter `target\release\cerberus-usage.exe`. Läuft gerade eine Kopie von dort, sperrt sie die Datei und der Build schlägt fehl: erst beenden.
+The app is then at `target\release\cerberus-usage.exe`. If a copy is running from there, it locks the file and the build fails: quit it first.
 
-## Release-Prozess
+## Release process
 
-Für Maintainer. Zusätzlich nötig: [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), die GitHub CLI (`gh`, angemeldet) und der Signaturschlüssel im Credential Store (einmalig mit `cargo run --release --bin sign-release -- keygen` erzeugt).
+For maintainers. Also required: [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), the GitHub CLI (`gh`, logged in) and the signing key in the Credential Manager (created once with `cargo run --release --bin sign-release -- keygen --print-private-once`; back up the printed private key straight away, it cannot be read out later).
 
-1. Version in `Cargo.toml` erhöhen, Abschnitt in `CHANGELOG.md` ergänzen. Nach jeder Änderung an `Cargo.lock` zusätzlich `python tools\third_party_licenses.py` ausführen (erzeugt `installer\THIRD-PARTY-LICENSES.txt`, nur Python-Standardbibliothek). Committen und pushen.
-2. `.\release.ps1 -DryRun` prüft Tests, Build und Installer, ohne zu signieren oder hochzuladen.
-3. `.\release.ps1` baut den Installer nach `dist\`, signiert das Manifest und fragt „Release v… auf GitHub veröffentlichen? (j/n)“. Erst bei „j“ wird das Release angelegt. Das Skript pusht nie Commits.
+1. Bump the version in `Cargo.toml` and add a section to `CHANGELOG.md`. After any change to `Cargo.lock`, also run `python tools\third_party_licenses.py` (generates `installer\THIRD-PARTY-LICENSES.txt`, Python standard library only). Commit and push.
+2. `.\release.ps1 -DryRun` checks tests, build and installer without signing or uploading.
+3. `.\release.ps1` builds the installer into `dist\`, signs the manifest and asks "Release v… auf GitHub veröffentlichen? (j/n)". The release is created only after "j". The script never pushes commits.
 
-Die CI (`.github/workflows/ci.yml`) führt bei jedem Push Tests und Release-Build aus. Sie signiert und veröffentlicht nichts.
+CI (`.github/workflows/ci.yml`) runs tests and a release build on every push. It signs and publishes nothing.
 
-## Lizenz
+## License
 
-[MIT](LICENSE), Copyright (c) 2026 Cerberus Lab. Die Lizenztexte der eingebauten Bibliotheken (inklusive der Schriften) stehen in `THIRD-PARTY-LICENSES.txt`; der Installer legt sie zusammen mit `LICENSE` in den Installationsordner.
+[MIT](LICENSE), Copyright (c) 2026 Cerberus Lab. The license texts of the bundled libraries (including the fonts) are in `THIRD-PARTY-LICENSES.txt`; the installer places them in the install folder together with `LICENSE`.
