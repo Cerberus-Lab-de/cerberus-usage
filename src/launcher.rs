@@ -193,6 +193,34 @@ impl WindowsSystem {
     }
 }
 
+/// The command that starts Obsidian: environment changes on the child only (this process's
+/// environment stays untouched), and the working directory is Obsidian's own folder, so the child
+/// does not hold our install folder (`{app}` after a self-update) open.
+fn obsidian_command(exe: &Path, api_key: Option<&str>) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new(exe);
+    let mode = if api_key.is_some() { Mode::ApiKey } else { Mode::Max };
+    for op in child_env_ops(mode, api_key) {
+        match op {
+            EnvOp::Set(name, value) => {
+                cmd.env(name, value);
+            }
+            EnvOp::Remove(name) => {
+                cmd.env_remove(name);
+            }
+        }
+    }
+    // A path without a parent keeps the old behaviour (inherit the working directory).
+    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.current_dir(dir);
+    }
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
 /// True if a `tasklist /fo csv /nh` line has exactly this image name as its first quoted field
 /// (case-insensitive, whole name). `Obsidian.exe` does not match `NotObsidian.exe`, and names
 /// longer than 25 characters are compared in full.
@@ -238,26 +266,8 @@ impl System for WindowsSystem {
     }
 
     fn spawn(&self, exe: &Path, api_key: Option<&str>) -> io::Result<()> {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new(exe);
-        // Set/removed on the child only; this process's environment stays untouched.
-        let mode = if api_key.is_some() { Mode::ApiKey } else { Mode::Max };
-        for op in child_env_ops(mode, api_key) {
-            match op {
-                EnvOp::Set(name, value) => {
-                    cmd.env(name, value);
-                }
-                EnvOp::Remove(name) => {
-                    cmd.env_remove(name);
-                }
-            }
-        }
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
         // Dropping the child handle does not kill it; we do not wait for Obsidian.
-        cmd.spawn().map(drop)
+        obsidian_command(exe, api_key).spawn().map(drop)
     }
 
     fn resolve_obsidian(&self) -> Result<PathBuf, PathError> {
@@ -510,6 +520,20 @@ mod tests {
         assert!(lists_image(&row(long), long));
         assert!(lists_image(&row(long), &long.to_uppercase()));
         assert!(!lists_image(&row(&long[..25]), long));
+    }
+
+    #[test]
+    fn obsidian_starts_in_its_own_folder_and_falls_back_without_a_parent() {
+        let cmd = obsidian_command(Path::new(r"C:\Apps\Obsidian\Obsidian.exe"), None);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new(r"C:\Apps\Obsidian")));
+        // No parent folder in the path: the working directory stays inherited (as before).
+        assert_eq!(obsidian_command(Path::new("Obsidian.exe"), None).get_current_dir(), None);
+        assert_eq!(obsidian_command(Path::new(""), None).get_current_dir(), None);
+        // The environment edits still apply to the child, and the key is only set in API-key mode.
+        let key = obsidian_command(Path::new(r"C:\Apps\Obsidian.exe"), Some("sk-ant-test"));
+        assert!(key.get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_some()));
+        let max = obsidian_command(Path::new(r"C:\Apps\Obsidian.exe"), None);
+        assert!(max.get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()));
     }
 
     #[test]
