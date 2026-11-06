@@ -152,6 +152,13 @@ impl AppState {
         }
     }
 
+    /// Reads both key states from the store again (after a save, a delete or a storage switch; never per
+    /// frame). The values are dropped at once.
+    pub fn refresh_keys(&mut self, store: &dyn SecretStore) {
+        (self.key_stored, self.key_undecryptable) = key_check(store, Slot::ApiKey);
+        (self.admin_key_stored, self.admin_key_undecryptable) = key_check(store, Slot::AdminKey);
+    }
+
     /// Shows `notice` until it is closed (or replaced). Only [`Self::apply_outcome`] sets a timer.
     pub fn set_notice(&mut self, notice: Option<Notice>) {
         self.notice = notice;
@@ -768,12 +775,6 @@ impl CerberusApp {
         }
     }
 
-    fn set_stored(&mut self, slot: Slot, stored: bool) {
-        match slot {
-            Slot::ApiKey => (self.state.key_stored, self.state.key_undecryptable) = (Some(stored), false),
-            Slot::AdminKey => (self.state.admin_key_stored, self.state.admin_key_undecryptable) = (Some(stored), false),
-        }
-    }
 }
 
 
@@ -1311,6 +1312,37 @@ mod tests {
         s.dismiss_notice();
         s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
         assert_eq!(s.notice.as_ref().unwrap().text, "alte Datei zur Seite gelegt");
+    }
+
+    #[test]
+    fn key_flags_follow_the_store_after_each_action() {
+        use std::cell::RefCell;
+        struct Scripted(RefCell<Result<Option<String>, SecretError>>);
+        impl SecretStore for Scripted {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                self.0.borrow().clone()
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        let store = Scripted(RefCell::new(Err(SecretError::NotDecryptable)));
+        let mut s = AppState::new();
+        s.refresh_keys(&store);
+        assert!(s.key_undecryptable && s.admin_key_undecryptable);
+        assert_eq!(s.key_stored, None);
+        // A new key was saved: the amber message must go.
+        *store.0.borrow_mut() = Ok(Some("x".to_string()));
+        s.refresh_keys(&store);
+        assert!(!s.key_undecryptable && !s.admin_key_undecryptable);
+        assert_eq!(s.key_stored, Some(true));
+        // Deleted.
+        *store.0.borrow_mut() = Ok(None);
+        s.refresh_keys(&store);
+        assert_eq!((s.key_stored, s.admin_key_stored), (Some(false), Some(false)));
     }
 
     #[test]

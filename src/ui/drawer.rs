@@ -6,7 +6,7 @@
 //! half-typed input never reaches `settings.json`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::{Local, Utc};
@@ -113,22 +113,41 @@ pub fn choose_language(settings_path: Option<&Path>, code: &str) -> Result<Setti
         .map_err(|e| format!("Die Sprache gilt nur bis zum Beenden der App, gespeichert wurde sie nicht. {e}"))
 }
 
-/// The command that opens a folder in Explorer. The folder is one plain argument, never a shell string.
-pub fn explorer_command(dir: &Path) -> Command {
-    let mut cmd = Command::new("explorer.exe");
+/// The command that opens a folder in Explorer. The program is `explorer.exe` in the Windows folder
+/// (never found through the app directory or PATH); the folder is one plain argument, never a shell
+/// string. `None` when the Windows folder is not known.
+pub fn explorer_command(system_root: Option<&Path>, dir: &Path) -> Option<Command> {
+    let mut cmd = Command::new(system_root?.join("explorer.exe"));
     cmd.arg(dir);
-    cmd
+    Some(cmd)
 }
 
-/// Creates the folder if it is missing and returns the command that opens it.
-pub fn open_folder_command(dir: &Path) -> Result<Command, String> {
+/// Creates the folder if it is missing and returns the command that opens it. Without a known Windows
+/// folder nothing is created or started.
+pub fn open_folder_command(system_root: Option<&Path>, dir: &Path) -> Result<Command, String> {
+    if system_root.is_none() {
+        return Err("Der Windows-Ordner ist nicht bekannt (SystemRoot fehlt), der Explorer wird nicht gestartet.".to_string());
+    }
     std::fs::create_dir_all(dir).map_err(|e| format!("Der Sprachordner lässt sich nicht anlegen ({}).", e.kind()))?;
-    Ok(explorer_command(dir))
+    explorer_command(system_root, dir).ok_or_else(|| "Der Explorer wird nicht gestartet.".to_string())
+}
+
+/// A pick in the language list changes nothing when it is both the saved choice and the language in
+/// use. A saved choice that did not take effect (or the other way round) must still be applied.
+pub fn language_pick_is_noop(saved: Option<&str>, current: &str, pick: &str) -> bool {
+    saved.is_some_and(|s| s.eq_ignore_ascii_case(pick)) && current.eq_ignore_ascii_case(pick)
+}
+
+/// "Löschen" is offered for a stored key, and also for one that is stored but cannot be decrypted
+/// here, so a foreign key can be removed. An unreadable store or file keeps it disabled.
+pub fn delete_enabled(stored: Option<bool>, undecryptable: bool) -> bool {
+    stored == Some(true) || undecryptable
 }
 
 fn open_lang_folder() -> Result<(), String> {
     let dir = crate::i18n::app_lang_dir().ok_or_else(|| "Der Sprachordner ist nicht bekannt.".to_string())?;
-    open_folder_command(&dir)?
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from);
+    open_folder_command(root.as_deref(), &dir)?
         .spawn()
         .map(drop)
         .map_err(|e| format!("Der Explorer lässt sich nicht starten ({}).", e.kind()))
@@ -203,7 +222,7 @@ impl CerberusApp {
         match super::save_key(&*self.store, slot, &input) {
             Ok(()) => {
                 wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
-                self.set_stored(slot, true);
+                self.state.refresh_keys(&*self.store);
                 self.set_note(slot_note(slot), NoticeKind::Info, format!("{} gespeichert.", key_label(slot)));
             }
             Err(msg) => {
@@ -217,7 +236,7 @@ impl CerberusApp {
         wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
         match self.store.delete(slot) {
             Ok(()) => {
-                self.set_stored(slot, false);
+                self.state.refresh_keys(&*self.store);
                 self.set_note(slot_note(slot), NoticeKind::Info, format!("{} gelöscht.", key_label(slot)));
             }
             Err(e) => self.set_note(slot_note(slot), NoticeKind::Error, e.to_string()),
@@ -277,6 +296,7 @@ impl CerberusApp {
         match crate::config_store::set_plaintext(&path, on) {
             Ok(settings) => {
                 self.state.settings = settings;
+                self.state.refresh_keys(&*self.store);
                 let text = if on {
                     "Die Keys stehen jetzt im Klartext in der Einstellungsdatei."
                 } else {
@@ -549,9 +569,9 @@ impl CerberusApp {
                 for lang in &self.languages {
                     let is_current = lang.code.eq_ignore_ascii_case(&current);
                     if ui.selectable_label(is_current, &lang.name).clicked() {
-                        // A pick of the language already saved is not a change; a pick of the one in use
-                        // that is not saved yet (system default) pins it.
-                        if !saved.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&lang.code)) {
+                        // Only a pick that is both saved and in use is a no-op; a failed save or the
+                        // system default in use is applied (and pinned) by the pick.
+                        if !language_pick_is_noop(saved.as_deref(), &current, &lang.code) {
                             chosen = Some(lang.code.clone());
                         }
                     }
@@ -604,7 +624,7 @@ impl CerberusApp {
         let empty = input.is_empty();
         ui.horizontal_wrapped(|ui| {
             save = ui.add_enabled(!empty, egui::Button::new("Speichern")).clicked();
-            delete = ui.add_enabled(stored == Some(true), egui::Button::new("Löschen")).clicked();
+            delete = ui.add_enabled(delete_enabled(stored, undecryptable), egui::Button::new("Löschen")).clicked();
         });
         field_note(ui, self.note(slot_note(slot)));
         if save {
@@ -756,17 +776,48 @@ mod tests {
     #[test]
     fn explorer_gets_the_folder_as_one_plain_argument() {
         let weird = PathBuf::from(r"C:\Users\a b\x & calc.exe\lang");
-        let cmd = explorer_command(&weird);
-        assert_eq!(cmd.get_program(), "explorer.exe");
+        let root = PathBuf::from(r"C:\Windows");
+        let cmd = explorer_command(Some(&root), &weird).unwrap();
+        // Absolute path in the Windows folder, not a bare name resolved from the app directory.
+        assert_eq!(Path::new(cmd.get_program()), root.join("explorer.exe"));
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, [weird.as_os_str()]);
+    }
+
+    #[test]
+    fn without_a_windows_folder_nothing_is_created_or_started() {
+        assert!(explorer_command(None, Path::new("x")).is_none());
+        let dir = temp_dir("noroot").join("lang");
+        let err = open_folder_command(None, &dir).unwrap_err();
+        assert!(err.contains("SystemRoot"), "{err}");
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_pick_is_a_noop_only_when_saved_and_in_use() {
+        assert!(language_pick_is_noop(Some("en"), "en", "en"));
+        assert!(language_pick_is_noop(Some("EN"), "en", "en"));
+        // Saved en, the save failed, session switched to de, user picks en again: must apply.
+        assert!(!language_pick_is_noop(Some("en"), "de", "en"));
+        // System default in use, nothing saved: the pick pins it.
+        assert!(!language_pick_is_noop(None, "de", "de"));
+        assert!(!language_pick_is_noop(Some("de"), "de", "en"));
+    }
+
+    #[test]
+    fn a_foreign_key_can_be_deleted_but_a_broken_store_cannot() {
+        assert!(delete_enabled(Some(true), false));
+        assert!(delete_enabled(None, true));
+        assert!(!delete_enabled(Some(false), false));
+        assert!(!delete_enabled(None, false));
     }
 
     #[test]
     fn opening_the_language_folder_creates_it_when_missing() {
         let dir = temp_dir("open").join("lang");
         assert!(!dir.exists());
-        let cmd = open_folder_command(&dir).unwrap();
+        let cmd = open_folder_command(Some(Path::new(r"C:\Windows")), &dir).unwrap();
         assert!(dir.is_dir());
         assert_eq!(cmd.get_args().count(), 1);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
