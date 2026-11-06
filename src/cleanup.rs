@@ -118,6 +118,25 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_a_config_that_holds_keys_and_still_clears_the_legacy_slots() {
+        use crate::secrets::SecretStore as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("CerberusUsage");
+        let path = data.join("settings.json");
+        let config = crate::config_store::ConfigStore::new(path.clone());
+        config.set(Slot::ApiKey, "sk-ant-test-NICHTECHT-1234").unwrap();
+        config.set(Slot::AdminKey, "sk-ant-admin01-NICHTECHT-5678").unwrap();
+        assert!(path.exists());
+
+        let legacy = FakeStore::default();
+        let problems = uninstall_cleanup(&legacy, &data);
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!data.exists(), "the config with the keys goes with the data folder");
+        assert_eq!(*legacy.deleted.borrow(), vec![Slot::ApiKey, Slot::AdminKey]);
+    }
+
+    #[test]
     fn exit_code_is_zero_only_without_problems() {
         assert_eq!(exit_code(&[]), 0);
         assert_eq!(exit_code(&["Datenordner konnte nicht gelöscht werden".to_string()]), 1);

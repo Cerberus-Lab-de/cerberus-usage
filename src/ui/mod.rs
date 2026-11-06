@@ -28,6 +28,7 @@ use crate::paths_ui::PathsPanel;
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
 use crate::settings::Settings;
+use crate::config_store::{ConfigStore, KeyStore, migrate_keys};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
@@ -290,6 +291,32 @@ pub fn save_api_key(store: &dyn SecretStore, input: &str) -> Result<(), String> 
     save_key(store, Slot::ApiKey, input)
 }
 
+/// The store the app reads and writes keys through: the settings file with the old credential-store
+/// entries as a fallback. Without a settings path there is no file to use, so the credential store stays.
+fn key_store(settings_path: Option<&Path>) -> Arc<dyn SecretStore + Send + Sync> {
+    match settings_path {
+        Some(path) => Arc::new(KeyStore::new(ConfigStore::new(path.to_path_buf()), Arc::new(KeyringStore::new()))),
+        None => Arc::new(KeyringStore::new()),
+    }
+}
+
+/// Runs the one-time key move for the settings file at `path`; returns the slots that did not move.
+fn migrate_at_start(path: &Path) -> Vec<Slot> {
+    migrate_keys(&KeyringStore::new(), &ConfigStore::new(path.to_path_buf()))
+}
+
+/// Notice for keys that could not be moved. Names the key type only, never a value.
+fn move_notice_text(failed: &[Slot]) -> Option<String> {
+    if failed.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = failed.iter().map(|&s| key_label(s)).collect();
+    Some(format!(
+        "Der Umzug von {} aus dem Windows-Tresor ist nicht vollständig gelungen. Der Schlüssel geht nicht verloren und wird weiter genutzt, der nächste Start versucht es erneut.",
+        names.join(" und ")
+    ))
+}
+
 /// Presence check only; the value is dropped immediately.
 fn key_stored(store: &dyn SecretStore, slot: Slot) -> Option<bool> {
     store.get(slot).ok().map(|v| v.is_some())
@@ -379,7 +406,7 @@ fn spawn_launch(mode: Mode, confirmed_close: bool, ctx: egui::Context) -> Receiv
         let msg = {
             let key = match mode {
                 Mode::Max => Ok(None),
-                Mode::ApiKey => KeyringStore::new().get(Slot::ApiKey),
+                Mode::ApiKey => key_store(crate::settings::default_path().ok().as_deref()).get(Slot::ApiKey),
             };
             match key {
                 Ok(key) => {
@@ -457,7 +484,7 @@ pub struct CerberusApp {
     launch_rx: Option<Receiver<LaunchMsg>>,
     paths: PathsPanel,
     control: Arc<WindowControl>,
-    store: KeyringStore,
+    store: Arc<dyn SecretStore + Send + Sync>,
     prices_as_of: String,
     tray: Option<Tray>,
     /// Names (never values) of routing variables that are set in this process's environment.
@@ -514,6 +541,8 @@ impl CerberusApp {
 
         let settings_path = crate::settings::default_path().ok();
         let (logs_root, logs_unavailable) = logs_target(settings_path.as_deref(), &real_env);
+        // Once per start, before anything reads a key: keys saved by v1.0.x move into the settings file.
+        let failed_moves = settings_path.as_deref().map(migrate_at_start).unwrap_or_default();
 
         let notify_ctx = ctx.clone();
         let snapshots = spawn_worker(
@@ -523,7 +552,7 @@ impl CerberusApp {
                 state_path: data_dir.join("scan_state.json"),
                 prices_path,
                 interval: DEFAULT_INTERVAL,
-                secrets: Arc::new(KeyringStore::new()),
+                secrets: key_store(settings_path.as_deref()),
                 http: Arc::new(UreqHttp::new()),
                 api_interval: DEFAULT_API_INTERVAL,
                 settings_path: crate::settings::default_path().ok(),
@@ -543,11 +572,15 @@ impl CerberusApp {
         );
         let obsidian_running = spawn_mode_poller(ctx);
 
-        let store = KeyringStore::new();
+        // Read once here; the per-frame code only looks at the cached flags.
+        let store = key_store(settings_path.as_deref());
         let mut state = AppState::new();
-        state.key_stored = key_stored(&store, Slot::ApiKey);
-        state.admin_key_stored = key_stored(&store, Slot::AdminKey);
-        state.settings_path = crate::settings::default_path().ok();
+        state.key_stored = key_stored(&*store, Slot::ApiKey);
+        state.admin_key_stored = key_stored(&*store, Slot::AdminKey);
+        state.settings_path = settings_path.clone();
+        if let Some(text) = move_notice_text(&failed_moves) {
+            state.set_notice(Some(Notice { kind: NoticeKind::Error, text }));
+        }
         state.reload_settings();
         let paths = PathsPanel::new(&state.settings);
         let logo = cc.egui_ctx.load_texture(
@@ -1214,6 +1247,15 @@ mod tests {
         assert_eq!(key_status_text(Some(true)), "gespeichert");
         assert_eq!(key_status_text(Some(false)), "nicht gespeichert");
         assert_eq!(key_status_text(None), "Speicher nicht lesbar");
+    }
+
+    #[test]
+    fn move_notice_names_the_key_type_only() {
+        assert_eq!(move_notice_text(&[]), None);
+        let one = move_notice_text(&[Slot::AdminKey]).unwrap();
+        assert!(one.contains("Admin-Key") && !one.contains("API-Key") && !one.contains("sk-ant"));
+        let both = move_notice_text(&[Slot::ApiKey, Slot::AdminKey]).unwrap();
+        assert!(both.contains("API-Key und Admin-Key"));
     }
 
     #[test]

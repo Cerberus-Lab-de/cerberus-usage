@@ -18,7 +18,7 @@ use super::{CerberusApp, Notice, NoticeKind, amount_input, key_field_id, key_lab
 use crate::cards::{inert_limits_hint, should_commit, update_settings, with_baseline, with_limits, with_topup, without_topup};
 use crate::paths_ui::{PathsAction, RowNote};
 use crate::pricing::format_usd;
-use crate::secrets::{SecretStore, Slot};
+use crate::secrets::Slot;
 use crate::settings::TopUp;
 use crate::view::drawer_width;
 
@@ -154,7 +154,7 @@ impl CerberusApp {
     fn save_key(&mut self, ctx: &egui::Context, slot: Slot) {
         // Take the text out of the field while saving; on failure it goes back so the user can fix it.
         let input = std::mem::take(self.input_mut(slot));
-        match super::save_key(&self.store, slot, &input) {
+        match super::save_key(&*self.store, slot, &input) {
             Ok(()) => {
                 wipe_key_field(ctx, key_field_id(slot), self.input_mut(slot));
                 self.set_stored(slot, true);

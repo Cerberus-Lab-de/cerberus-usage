@@ -104,7 +104,8 @@ pub fn default_path() -> io::Result<PathBuf> {
 /// file yields defaults plus a fixed user-facing message; the file itself is never touched,
 /// so the user can repair it.
 pub fn load(path: &Path) -> (Settings, Option<String>) {
-    let bytes = match std::fs::read(path) {
+    // A read that lands inside the rename of a save fails for a moment; retry instead of reporting a broken file.
+    let bytes = match crate::io_retry::retry_transient(|| std::fs::read(path)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return (Settings::default(), None),
         Err(_) => {
@@ -280,5 +281,27 @@ mod tests {
         } else {
             assert!(default_path().is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_read_during_a_brief_exclusive_lock_still_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        save(&path, &Settings { monthly_budget_nano: Some(9), ..Settings::default() }).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let held = path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().read(true).share_mode(0).open(&held).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+        let (s, err) = load(&path);
+        holder.join().unwrap();
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(s.monthly_budget_nano, Some(9));
     }
 }

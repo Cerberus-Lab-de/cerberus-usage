@@ -202,6 +202,105 @@ impl SecretStore for KeyStore {
     }
 }
 
+/// What happened to one key while moving it.
+enum Move {
+    /// Nothing to do: no legacy entry, or the config already has a key for the slot.
+    Skipped,
+    Moved,
+    Failed,
+}
+
+/// Moves keys from the old credential-store entries into the settings file, once per key.
+/// Returns the slots whose move did not complete; their legacy entries are kept and the next start
+/// tries again. Quiet (empty result, no write) when there is nothing to move.
+///
+/// Per slot: a key already in the config wins and the legacy entry stays untouched. Otherwise the
+/// legacy value is written in the form `keys_plaintext` asks for, read back from the file and
+/// compared, and only then is the legacy entry deleted. A broken config means no move at all (the
+/// broken file is reported on its own) and returns an empty list.
+pub fn migrate_keys(legacy: &dyn SecretStore, config: &ConfigStore) -> Vec<Slot> {
+    migrate_with(legacy, config, verified_in_file)
+}
+
+/// Re-reads the file from disk and checks that `slot` decrypts to `expected`.
+fn verified_in_file(path: &Path, slot: Slot, expected: &str) -> bool {
+    let (mut settings, error) = settings::load(path);
+    if error.is_some() {
+        return false;
+    }
+    match slot_of(&mut settings, slot).as_ref().map(decode) {
+        Some(Ok(found)) => *found == *expected,
+        _ => false,
+    }
+}
+
+fn migrate_with(
+    legacy: &dyn SecretStore,
+    config: &ConfigStore,
+    verify: impl Fn(&Path, Slot, &str) -> bool,
+) -> Vec<Slot> {
+    if settings::load(&config.path).1.is_some() {
+        return Vec::new();
+    }
+    let mut failed = Vec::new();
+    for slot in [Slot::ApiKey, Slot::AdminKey] {
+        if let Move::Failed = migrate_slot(legacy, config, slot, &verify) {
+            failed.push(slot);
+        }
+    }
+    failed
+}
+
+fn migrate_slot(
+    legacy: &dyn SecretStore,
+    config: &ConfigStore,
+    slot: Slot,
+    verify: &impl Fn(&Path, Slot, &str) -> bool,
+) -> Move {
+    // The cheap check first: an existing config key means the legacy store is not even read.
+    let (mut current, error) = settings::load(&config.path);
+    if error.is_some() {
+        return Move::Failed;
+    }
+    if slot_of(&mut current, slot).is_some() {
+        return Move::Skipped;
+    }
+    let value = match legacy.get(slot) {
+        Ok(Some(v)) => Zeroizing::new(v),
+        Ok(None) => return Move::Skipped,
+        Err(_) => return Move::Failed,
+    };
+
+    // Write only into a still empty slot, inside the one locked save.
+    let raced = Cell::new(false);
+    let written = update_settings(&config.path, |current| {
+        let mut next = current.clone();
+        let target = slot_of(&mut next, slot);
+        if target.is_some() {
+            raced.set(true);
+            return Ok(next);
+        }
+        *target = Some(encode(&value, current.keys_plaintext).map_err(|_| String::new())?);
+        Ok(next)
+    });
+    if written.is_err() {
+        return Move::Failed;
+    }
+    if raced.get() {
+        return Move::Skipped;
+    }
+
+    if !verify(&config.path, slot, &value) {
+        // Leave no unproven entry behind: it would win over the legacy key on the next start.
+        let _ = config.delete(slot);
+        return Move::Failed;
+    }
+    match legacy.delete(slot) {
+        Ok(()) => Move::Moved,
+        Err(_) => Move::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +574,193 @@ mod tests {
             let shown = format!("{e} {e:?}");
             assert!(!shown.contains("sk-ant") && !shown.contains("NICHTECHT"));
         }
+    }
+
+    // --- migrate_keys ---------------------------------------------------------------------
+
+    /// A legacy store with optionally failing reads or deletes for one slot.
+    #[derive(Default)]
+    struct ScriptedLegacy {
+        inner: FakeLegacy,
+        fail_get: Option<Slot>,
+        fail_delete: Option<Slot>,
+    }
+
+    impl SecretStore for ScriptedLegacy {
+        fn get(&self, s: Slot) -> Result<Option<String>, SecretError> {
+            if self.fail_get == Some(s) {
+                return Err(SecretError::StoreUnavailable);
+            }
+            self.inner.get(s)
+        }
+        fn set(&self, s: Slot, v: &str) -> Result<(), SecretError> {
+            self.inner.set(s, v)
+        }
+        fn delete(&self, s: Slot) -> Result<(), SecretError> {
+            if self.fail_delete == Some(s) {
+                return Err(SecretError::StoreUnavailable);
+            }
+            self.inner.delete(s)
+        }
+    }
+
+    fn legacy_with_both() -> ScriptedLegacy {
+        let l = ScriptedLegacy::default();
+        l.inner.set(Slot::ApiKey, KEY).unwrap();
+        l.inner.set(Slot::AdminKey, ADMIN).unwrap();
+        l
+    }
+
+    #[test]
+    fn migrates_and_only_then_deletes() {
+        let (_d, path) = temp();
+        let legacy = legacy_with_both();
+        let config = ConfigStore::new(path.clone());
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+        assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
+        assert!(!legacy.inner.has(Slot::ApiKey) && !legacy.inner.has(Slot::AdminKey));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("NICHTECHT") && text.contains("\"dpapi\""), "encrypted by default: {text}");
+    }
+
+    #[test]
+    fn migration_follows_the_plaintext_setting() {
+        let (_d, path) = temp();
+        settings::save(&path, &Settings { keys_plaintext: true, ..Settings::default() }).unwrap();
+        let legacy = legacy_with_both();
+        let config = ConfigStore::new(path.clone());
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        assert!(std::fs::read_to_string(&path).unwrap().contains(KEY));
+        assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn verification_failure_keeps_legacy() {
+        let (dir, path) = temp();
+        // A directory where the temporary file would go: every save fails.
+        std::fs::create_dir(dir.path().join("settings.json.tmp")).unwrap();
+        let legacy = legacy_with_both();
+        let failed = migrate_keys(&legacy, &ConfigStore::new(path.clone()));
+        assert_eq!(failed, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_failed_comparison_keeps_legacy_and_removes_the_unproven_entry() {
+        let (_d, path) = temp();
+        let legacy = legacy_with_both();
+        let config = ConfigStore::new(path.clone());
+        let failed = migrate_with(&legacy, &config, |_, _, _| false);
+        assert_eq!(failed, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
+        let (s, err) = settings::load(&path);
+        assert!(err.is_none() && s.api_key.is_none() && s.admin_key.is_none());
+        // The next start still finds the legacy keys and moves them.
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn the_real_verification_catches_a_wrong_or_missing_value() {
+        let (_d, path) = temp();
+        let config = ConfigStore::new(path.clone());
+        config.set(Slot::ApiKey, KEY).unwrap();
+        assert!(verified_in_file(&path, Slot::ApiKey, KEY));
+        assert!(!verified_in_file(&path, Slot::ApiKey, "sk-ant-test-OTHER"));
+        assert!(!verified_in_file(&path, Slot::AdminKey, KEY));
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(!verified_in_file(&path, Slot::ApiKey, KEY));
+    }
+
+    #[test]
+    fn existing_config_key_wins_and_legacy_stays() {
+        let (_d, path) = temp();
+        let config = ConfigStore::new(path);
+        config.set(Slot::ApiKey, KEY).unwrap();
+        let legacy = ScriptedLegacy::default();
+        legacy.inner.set(Slot::ApiKey, "sk-ant-test-OLD").unwrap();
+        legacy.inner.set(Slot::AdminKey, ADMIN).unwrap();
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        assert_eq!(config.get(Slot::ApiKey).unwrap().as_deref(), Some(KEY));
+        assert!(legacy.inner.has(Slot::ApiKey), "the old entry stays untouched");
+        // The other slot has no config key and still moves.
+        assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
+        assert!(!legacy.inner.has(Slot::AdminKey));
+    }
+
+    #[test]
+    fn a_config_key_that_cannot_be_decrypted_still_wins() {
+        let (_d, path) = temp();
+        settings::save(&path, &foreign_blob_settings()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let legacy = ScriptedLegacy::default();
+        legacy.inner.set(Slot::ApiKey, KEY).unwrap();
+        assert!(migrate_keys(&legacy, &ConfigStore::new(path.clone())).is_empty());
+        assert!(legacy.inner.has(Slot::ApiKey));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_read_error_keeps_going_for_the_other_slot() {
+        let (_d, path) = temp();
+        let legacy = ScriptedLegacy { fail_get: Some(Slot::ApiKey), ..legacy_with_both() };
+        let config = ConfigStore::new(path);
+        assert_eq!(migrate_keys(&legacy, &config), vec![Slot::ApiKey]);
+        assert!(legacy.inner.has(Slot::ApiKey));
+        assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
+        assert!(!legacy.inner.has(Slot::AdminKey));
+        assert_eq!(config.get(Slot::ApiKey).unwrap(), None);
+    }
+
+    #[test]
+    fn a_failing_legacy_delete_is_reported_and_loses_nothing() {
+        let (_d, path) = temp();
+        let legacy = ScriptedLegacy { fail_delete: Some(Slot::AdminKey), ..legacy_with_both() };
+        let config = ConfigStore::new(path);
+        assert_eq!(migrate_keys(&legacy, &config), vec![Slot::AdminKey]);
+        assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
+        assert!(legacy.inner.has(Slot::AdminKey));
+    }
+
+    #[test]
+    fn broken_config_migrates_nothing() {
+        let (_d, path) = temp();
+        std::fs::write(&path, "{ broken").unwrap();
+        let legacy = legacy_with_both();
+        assert!(migrate_keys(&legacy, &ConfigStore::new(path.clone())).is_empty());
+        assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+    }
+
+    #[test]
+    fn second_run_is_quiet() {
+        let (_d, path) = temp();
+        let legacy = legacy_with_both();
+        let config = ConfigStore::new(path.clone());
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        let after_first = std::fs::read(&path).unwrap();
+        assert!(migrate_keys(&legacy, &config).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), after_first, "no rewrite when nothing is to do");
+    }
+
+    #[test]
+    fn nothing_to_move_writes_no_file() {
+        let (_d, path) = temp();
+        let legacy = ScriptedLegacy::default();
+        assert!(migrate_keys(&legacy, &ConfigStore::new(path.clone())).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn migration_keeps_other_settings() {
+        let (_d, path) = temp();
+        settings::save(&path, &Settings { monthly_budget_nano: Some(5), language: Some("de".into()), ..Settings::default() })
+            .unwrap();
+        let legacy = legacy_with_both();
+        assert!(migrate_keys(&legacy, &ConfigStore::new(path.clone())).is_empty());
+        let (s, _) = settings::load(&path);
+        assert_eq!((s.monthly_budget_nano, s.language.as_deref()), (Some(5), Some("de")));
     }
 }
