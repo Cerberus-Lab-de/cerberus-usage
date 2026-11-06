@@ -9,7 +9,7 @@ pub mod theme;
 mod updates;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,7 +77,8 @@ pub struct AppState {
     pub snapshot: Option<Snapshot>,
     pub mode: ModeDisplay,
     started_by_app: Option<Mode>,
-    running: bool,
+    /// Whether Obsidian runs. `None` until the process check has given its first real answer.
+    running: Option<bool>,
     ignore_closed_until: Option<Instant>,
     /// A launch is in flight: mode and whether closing Obsidian was confirmed.
     pub launching: Option<(Mode, bool)>,
@@ -115,9 +116,9 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             snapshot: None,
-            mode: ModeDisplay::Closed,
+            mode: ModeDisplay::Unknown,
             started_by_app: None,
-            running: false,
+            running: None,
             ignore_closed_until: None,
             launching: None,
             confirm: None,
@@ -182,30 +183,43 @@ impl AppState {
     }
 
     fn recompute_mode(&mut self) {
-        self.mode = mode_display(self.started_by_app, self.running);
+        self.mode = match self.running {
+            // No real answer yet (check blocked, settings unreadable): never claim "geschlossen".
+            None => ModeDisplay::Unknown,
+            Some(running) => mode_display(self.started_by_app, running),
+        };
     }
 
-    /// Latest answer of the Obsidian process check.
+    /// Latest answer of the Obsidian process check: `None` while it has never answered. Once there
+    /// was a real answer, `None` changes nothing.
+    pub fn apply_answer(&mut self, answer: Option<bool>, now: Instant) {
+        match answer {
+            Some(running) => self.apply_running(running, now),
+            None => self.recompute_mode(),
+        }
+    }
+
+    /// A real answer of the Obsidian process check.
     pub fn apply_running(&mut self, running: bool, now: Instant) {
         if running {
-            self.running = true;
+            self.running = Some(true);
         } else {
             if self.ignore_closed_until.is_some_and(|until| now < until) {
                 return;
             }
             self.ignore_closed_until = None;
-            if self.running {
+            if self.running == Some(true) {
                 // Obsidian was closed: whoever starts it next, we no longer know the mode.
                 self.started_by_app = None;
             }
-            self.running = false;
+            self.running = Some(false);
         }
         self.recompute_mode();
     }
 
     fn apply_started(&mut self, mode: Mode, now: Instant) {
         self.started_by_app = Some(mode);
-        self.running = true;
+        self.running = Some(true);
         self.ignore_closed_until = Some(now + START_GRACE);
         self.recompute_mode();
     }
@@ -356,9 +370,31 @@ fn poll_answer(check: std::io::Result<bool>, previous: Option<bool>) -> Option<b
     }
 }
 
-/// Polls `obsidian_running()` in the background; the latest answer is in the returned flag.
-fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(false));
+/// The shared process-check state is three-valued: no answer yet, running, not running.
+const PROC_UNKNOWN: u8 = 0;
+const PROC_RUNNING: u8 = 1;
+const PROC_CLOSED: u8 = 2;
+
+fn proc_code(answer: Option<bool>) -> u8 {
+    match answer {
+        None => PROC_UNKNOWN,
+        Some(true) => PROC_RUNNING,
+        Some(false) => PROC_CLOSED,
+    }
+}
+
+fn proc_answer(code: u8) -> Option<bool> {
+    match code {
+        PROC_RUNNING => Some(true),
+        PROC_CLOSED => Some(false),
+        _ => None,
+    }
+}
+
+/// Polls `obsidian_running()` in the background; the latest answer is in the returned state
+/// (see [`proc_answer`]). It stays "unknown" until a check really answers.
+fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicU8> {
+    let running = Arc::new(AtomicU8::new(PROC_UNKNOWN));
     let shared = running.clone();
     std::thread::spawn(move || {
         let sys = WindowsSystem { settings_path: crate::settings::default_path().ok() };
@@ -369,9 +405,7 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
             if let Some(image) = sys.current_image_name() {
                 // A failed check keeps the last answer instead of showing "geschlossen".
                 let answer = poll_answer(sys.obsidian_running(&image), last);
-                if let Some(now_running) = answer {
-                    shared.store(now_running, Ordering::Relaxed);
-                }
+                shared.store(proc_code(answer), Ordering::Relaxed);
                 if last != answer {
                     last = answer;
                     ctx.request_repaint();
@@ -386,7 +420,7 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicBool> {
 pub struct CerberusApp {
     state: AppState,
     snapshots: Receiver<Snapshot>,
-    obsidian_running: Arc<AtomicBool>,
+    obsidian_running: Arc<AtomicU8>,
     launch_rx: Option<Receiver<LaunchMsg>>,
     paths: PathsPanel,
     control: Arc<WindowControl>,
@@ -546,7 +580,7 @@ impl CerberusApp {
             self.control.quit(ctx);
         }
         let now = Instant::now();
-        self.state.apply_running(self.obsidian_running.load(Ordering::Relaxed), now);
+        self.state.apply_answer(proc_answer(self.obsidian_running.load(Ordering::Relaxed)), now);
         if let (Some(tray), Some(snapshot)) = (self.tray.as_mut(), &self.state.snapshot) {
             tray.update(tooltip(snapshot, self.state.mode, !self.routing_names.is_empty()), icon_state(&snapshot.alerts));
         }
@@ -988,6 +1022,7 @@ mod tests {
     fn needs_confirmation_opens_dialog_and_failures_set_error_notice() {
         let now = Instant::now();
         let mut s = AppState::new();
+        s.apply_running(false, now);
         s.launching = Some((Mode::Max, false));
         s.apply_outcome(Mode::Max, LaunchOutcome::NeedsConfirmation, now);
         assert_eq!(s.confirm, Some(Mode::Max));
@@ -1006,6 +1041,44 @@ mod tests {
         assert_eq!(poll_answer(err(), Some(true)), Some(true), "no forgetting the mode on one failed check");
         assert_eq!(poll_answer(err(), Some(false)), Some(false));
         assert_eq!(poll_answer(err(), None), None);
+    }
+
+    #[test]
+    fn no_answer_from_the_process_check_is_unknown_not_closed() {
+        let now = Instant::now();
+        let err = || Err(std::io::Error::other("blocked"));
+        let mut s = AppState::new();
+        assert_eq!(s.mode, ModeDisplay::Unknown, "before the first poll");
+        // The check keeps failing, or the image name is unknown (nothing was stored at all).
+        for _ in 0..3 {
+            let answer = poll_answer(err(), None);
+            s.apply_answer(proc_answer(proc_code(answer)), now);
+            assert_eq!(s.mode, ModeDisplay::Unknown);
+        }
+        s.apply_answer(proc_answer(PROC_UNKNOWN), now);
+        assert_eq!(s.mode, ModeDisplay::Unknown);
+        // The first real answer decides.
+        let answer = poll_answer(Ok(false), None);
+        s.apply_answer(proc_answer(proc_code(answer)), now);
+        assert_eq!(s.mode, ModeDisplay::Closed);
+        // A later failed check keeps that answer (v1 C2 behaviour).
+        let answer = poll_answer(err(), answer);
+        s.apply_answer(proc_answer(proc_code(answer)), now);
+        assert_eq!(s.mode, ModeDisplay::Closed);
+        let running = poll_answer(Ok(true), answer);
+        s.apply_answer(proc_answer(proc_code(running)), now);
+        assert_eq!(s.mode, ModeDisplay::Unknown, "running, not started by the app");
+        let answer = poll_answer(err(), running);
+        s.apply_answer(proc_answer(proc_code(answer)), now);
+        assert_eq!(s.mode, ModeDisplay::Unknown);
+    }
+
+    #[test]
+    fn process_state_code_round_trips() {
+        for a in [None, Some(true), Some(false)] {
+            assert_eq!(proc_answer(proc_code(a)), a);
+        }
+        assert_eq!(proc_answer(99), None);
     }
 
     #[test]
