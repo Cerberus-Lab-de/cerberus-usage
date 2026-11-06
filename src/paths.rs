@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{tr, tr_args};
 use crate::settings::Settings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,38 +25,38 @@ pub enum PathError {
     NoHome,
 }
 
-const SETTINGS_HINT: &str = "Bitte den Pfad in den Einstellungen unter „Pfade“ festlegen.";
+/// Placeholder values shared by the texts that point at the settings drawer, plus `extra`.
+fn with_names<'a>(settings: &'a str, paths: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut args = vec![("settings", settings), ("paths", paths)];
+    args.extend_from_slice(extra);
+    args
+}
 
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        // The names of the settings drawer and of its section, so the sentence points at what the window shows.
+        let (settings, paths) = (tr("ui.settings"), tr("ui.paths"));
+        let text = match self {
             PathError::ObsidianNotFound { searched } => {
                 let list: Vec<String> = searched.iter().map(|p| p.display().to_string()).collect();
-                write!(f, "Obsidian wurde nicht gefunden. Gesucht: {}. {SETTINGS_HINT}", list.join("; "))
+                tr_args("paths.error.obsidian_not_found", &with_names(&settings, &paths, &[("searched", &list.join("; "))]))
             }
             PathError::ConfiguredMissing(p) => {
-                write!(f, "Die eingestellte Obsidian-Datei gibt es nicht: {}. {SETTINGS_HINT}", p.display())
+                tr_args("paths.error.configured_missing", &with_names(&settings, &paths, &[("path", &p.display().to_string())]))
             }
             PathError::NotAnExe(p) => {
-                write!(f, "Der eingestellte Obsidian-Pfad ist keine .exe-Datei: {}. {SETTINGS_HINT}", p.display())
+                tr_args("paths.error.not_an_exe", &with_names(&settings, &paths, &[("path", &p.display().to_string())]))
             }
             PathError::NotAbsolute(p) => {
-                write!(f, "Der eingestellte Obsidian-Pfad ist kein vollständiger Pfad: {}. {SETTINGS_HINT}", p.display())
+                tr_args("paths.error.not_absolute", &with_names(&settings, &paths, &[("path", &p.display().to_string())]))
             }
-            PathError::SettingsUnreadable(p) => write!(
-                f,
-                "Die Einstellungsdatei ist nicht lesbar: {}. Es wurde nichts geschlossen oder gestartet. Bitte die Datei prüfen oder löschen.",
-                p.display()
-            ),
-            PathError::UnsafeImageName(n) => write!(
-                f,
-                "Der Dateiname der Obsidian-Datei ist nicht zulässig: {n}. Es wurde nichts geschlossen oder gestartet. {SETTINGS_HINT}"
-            ),
-            PathError::NoHome => write!(
-                f,
-                "Der Protokollordner lässt sich nicht bestimmen (weder CLAUDE_CONFIG_DIR noch USERPROFILE gesetzt). {SETTINGS_HINT}"
-            ),
-        }
+            PathError::SettingsUnreadable(p) => {
+                tr_args("paths.error.settings_unreadable", &with_names(&settings, &paths, &[("path", &p.display().to_string())]))
+            }
+            PathError::UnsafeImageName(n) => tr_args("paths.error.unsafe_image_name", &with_names(&settings, &paths, &[("name", n)])),
+            PathError::NoHome => tr_args("paths.error.no_home", &with_names(&settings, &paths, &[])),
+        };
+        f.write_str(&text)
     }
 }
 
@@ -149,12 +150,12 @@ pub fn with_obsidian_path(s: &Settings, input: &str) -> Result<Settings, String>
     if let Some(p) = &path
         && !p.is_absolute()
     {
-        return Err("Der Obsidian-Pfad muss ein vollständiger Pfad sein. Es wurde nichts geändert.".to_string());
+        return Err(tr("paths.error.obsidian_relative"));
     }
     if let Some(p) = &path
         && !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
     {
-        return Err("Der Obsidian-Pfad muss auf eine .exe-Datei zeigen. Es wurde nichts geändert.".to_string());
+        return Err(tr("paths.error.obsidian_not_exe"));
     }
     Ok(Settings { obsidian_path: path, ..s.clone() })
 }
@@ -163,7 +164,7 @@ pub fn with_obsidian_path(s: &Settings, input: &str) -> Result<Settings, String>
 pub fn with_logs_root(s: &Settings, input: &str) -> Result<Settings, String> {
     let path = typed_path(input);
     if path.as_ref().is_some_and(|p| !p.is_absolute()) {
-        return Err("Der Protokollordner muss ein vollständiger Pfad sein. Es wurde nichts geändert.".to_string());
+        return Err(tr("paths.error.logs_relative"));
     }
     Ok(Settings { logs_root: path, ..s.clone() })
 }

@@ -6,27 +6,29 @@
 
 use std::path::Path;
 
+use crate::i18n::{tr, tr_args};
 use crate::secrets::{SecretStore, Slot};
 
-/// Deletes both key slots and the data folder. Returns German problem lines; never panics.
+/// Deletes both key slots and the data folder. Returns problem lines (they only go to `crash.log`);
+/// never panics.
 ///
 /// Refuses a `data_dir` that is relative, a drive root, or not named exactly `CerberusUsage`.
 pub fn uninstall_cleanup(store: &dyn SecretStore, data_dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
     let dir_ok = is_app_data_dir(data_dir);
     if !dir_ok {
-        problems.push("Datenordner wurde nicht gelöscht: Pfad ist kein gültiger CerberusUsage-Ordner.".to_string());
+        problems.push(tr("cleanup.dir_refused"));
     }
-    for (slot, name) in [(Slot::ApiKey, "API-Key"), (Slot::AdminKey, "Admin-Key")] {
+    for (slot, key) in [(Slot::ApiKey, "cleanup.api_key_failed"), (Slot::AdminKey, "cleanup.admin_key_failed")] {
         if let Err(e) = store.delete(slot) {
-            problems.push(format!("{name} konnte nicht entfernt werden: {e}"));
+            problems.push(tr_args(key, &[("error", &e.to_string())]));
         }
     }
     if dir_ok {
         match std::fs::remove_dir_all(data_dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => problems.push(format!("Datenordner konnte nicht gelöscht werden: {e}")),
+            Err(e) => problems.push(tr_args("cleanup.dir_failed", &[("error", &e.to_string())])),
         }
     }
     problems
@@ -115,6 +117,25 @@ mod tests {
         assert!(!data.exists());
         assert!(sibling.exists(), "sibling directory must stay");
         assert_eq!(*store.deleted.borrow(), vec![Slot::ApiKey, Slot::AdminKey]);
+    }
+
+    #[test]
+    fn cleanup_removes_a_config_that_holds_keys_and_still_clears_the_legacy_slots() {
+        use crate::secrets::SecretStore as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("CerberusUsage");
+        let path = data.join("settings.json");
+        let config = crate::config_store::ConfigStore::new(path.clone());
+        config.set(Slot::ApiKey, "sk-ant-test-NICHTECHT-1234").unwrap();
+        config.set(Slot::AdminKey, "sk-ant-admin01-NICHTECHT-5678").unwrap();
+        assert!(path.exists());
+
+        let legacy = FakeStore::default();
+        let problems = uninstall_cleanup(&legacy, &data);
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!data.exists(), "the config with the keys goes with the data folder");
+        assert_eq!(*legacy.deleted.borrow(), vec![Slot::ApiKey, Slot::AdminKey]);
     }
 
     #[test]

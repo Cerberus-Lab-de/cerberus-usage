@@ -24,3 +24,6 @@ pub mod update_worker;
 pub mod update_key;
 pub mod release_sign;
 pub mod io_retry;
+pub mod i18n;
+pub mod dpapi;
+pub mod config_store;

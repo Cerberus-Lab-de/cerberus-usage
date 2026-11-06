@@ -1,12 +1,15 @@
 //! User settings (`%LOCALAPPDATA%\CerberusUsage\settings.json`): credit baseline, top-ups, alert limits.
 //!
-//! All amounts are nano-USD (`u64`), timestamps are RFC 3339. No keys are stored here.
+//! All amounts are nano-USD (`u64`), timestamps are RFC 3339. API and admin keys live here too,
+//! encrypted with DPAPI by default (see `config_store`).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::i18n::{tr, tr_args};
 
 /// Credit balance at a known point in time (read from the Console by the user).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +25,29 @@ pub struct TopUp {
     pub at: DateTime<Utc>,
 }
 
+/// How a stored key value is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyForm {
+    /// Base64 of a DPAPI blob (current Windows user).
+    Dpapi,
+    /// The key itself, readable in the file.
+    Plain,
+}
+
+/// A key as stored in `settings.json`. `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredKey {
+    pub form: KeyForm,
+    pub value: String,
+}
+
+impl std::fmt::Debug for StoredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredKey").field("form", &self.form).field("value", &"<redacted>").finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -34,9 +60,15 @@ pub struct Settings {
     /// Claude projects folder; `None` uses `CLAUDE_CONFIG_DIR` or `%USERPROFILE%\.claude\projects`.
     pub logs_root: Option<PathBuf>,
     /// Look for new releases on GitHub (at start and every 24 h). Off: no request to GitHub unless the
-    /// user clicks "Jetzt prüfen" or installs.
+    /// user asks for a check or installs.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Interface language code; `None` follows the system.
+    pub language: Option<String>,
+    /// Keys are written readable instead of DPAPI-encrypted.
+    pub keys_plaintext: bool,
+    pub api_key: Option<StoredKey>,
+    pub admin_key: Option<StoredKey>,
 }
 
 fn default_true() -> bool {
@@ -53,6 +85,10 @@ impl Default for Settings {
             obsidian_path: None,
             logs_root: None,
             check_updates: true,
+            language: None,
+            keys_plaintext: false,
+            api_key: None,
+            admin_key: None,
         }
     }
 }
@@ -70,13 +106,14 @@ pub fn default_path() -> io::Result<PathBuf> {
 /// file yields defaults plus a fixed user-facing message; the file itself is never touched,
 /// so the user can repair it.
 pub fn load(path: &Path) -> (Settings, Option<String>) {
-    let bytes = match std::fs::read(path) {
+    // A read that lands inside the rename of a save fails for a moment; retry instead of reporting a broken file.
+    let bytes = match crate::io_retry::retry_transient(|| std::fs::read(path)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return (Settings::default(), None),
         Err(_) => {
             return (
                 Settings::default(),
-                Some("Einstellungen konnten nicht gelesen werden".to_string()),
+                Some(tr("settings.read_failed")),
             );
         }
     };
@@ -84,10 +121,9 @@ pub fn load(path: &Path) -> (Settings, Option<String>) {
         Ok(s) => (s, None),
         Err(e) => (
             Settings::default(),
-            Some(format!(
-                "Einstellungen sind ungültig (Zeile {}, Spalte {}); die Datei wurde nicht verändert",
-                e.line(),
-                e.column()
+            Some(tr_args(
+                "settings.invalid",
+                &[("line", &e.line().to_string()), ("column", &e.column().to_string())],
             )),
         ),
     }
@@ -143,6 +179,10 @@ mod tests {
             obsidian_path: None,
             logs_root: None,
             check_updates: false,
+            language: Some("de".to_string()),
+            keys_plaintext: true,
+            api_key: Some(StoredKey { form: KeyForm::Plain, value: "x".to_string() }),
+            admin_key: None,
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path), (s, None));
@@ -160,6 +200,37 @@ mod tests {
         assert!(empty.check_updates && Settings::default().check_updates);
         let off: Settings = serde_json::from_str(r#"{"check_updates": false}"#).unwrap();
         assert!(!off.check_updates);
+    }
+
+    #[test]
+    fn old_config_loads_with_defaults() {
+        // The v1.0.1 file shape: no language, no keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"baseline": null, "topups": [], "monthly_budget_nano": 7, "low_balance_nano": null,
+                "obsidian_path": null, "logs_root": null, "check_updates": true}"#,
+        )
+        .unwrap();
+        let (s, err) = load(&path);
+        assert!(err.is_none());
+        assert!(!s.keys_plaintext && s.api_key.is_none() && s.admin_key.is_none() && s.language.is_none());
+        assert_eq!(s.monthly_budget_nano, Some(7));
+    }
+
+    #[test]
+    fn debug_never_shows_a_key() {
+        let s = Settings {
+            api_key: Some(StoredKey { form: KeyForm::Plain, value: "sk-ant-test-SECRET".to_string() }),
+            admin_key: Some(StoredKey { form: KeyForm::Dpapi, value: "sk-ant-test-SECRET".to_string() }),
+            ..Settings::default()
+        };
+        let shown = format!("{s:?} {:#?}", s.api_key);
+        assert!(!shown.contains("SECRET"), "leaked: {shown}");
+        assert!(shown.contains("<redacted>"));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""form":"plain""#) && json.contains(r#""form":"dpapi""#));
     }
 
     #[test]
@@ -211,5 +282,27 @@ mod tests {
         } else {
             assert!(default_path().is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_read_during_a_brief_exclusive_lock_still_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        save(&path, &Settings { monthly_budget_nano: Some(9), ..Settings::default() }).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let held = path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().read(true).share_mode(0).open(&held).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(file);
+        });
+        locked_rx.recv().unwrap();
+        let (s, err) = load(&path);
+        holder.join().unwrap();
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(s.monthly_budget_nano, Some(9));
     }
 }

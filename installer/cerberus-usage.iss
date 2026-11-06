@@ -45,10 +45,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 german.TaskAutostart=Cerberus Usage mit Windows starten
 german.RunApp=Cerberus Usage starten
-german.AskRemoveData=Einstellungen, Zählerstand und gespeicherte Keys ebenfalls entfernen?
+german.AskRemoveData=Einstellungen, Zählerstand, gespeicherte Keys und eigene Sprachdateien ebenfalls entfernen?
 english.TaskAutostart=Start Cerberus Usage with Windows
 english.RunApp=Start Cerberus Usage
-english.AskRemoveData=Also remove settings, balance data and stored keys?
+english.AskRemoveData=Also remove settings, balance data, stored keys and your own language files?
 german.CleanupFailed=Einstellungen oder gespeicherte Keys konnten nicht vollständig entfernt werden. Bitte prüfen: Ordner AppData\Local\CerberusUsage und im Windows-Anmeldeinformationsspeicher die Einträge „cerberus-usage“.
 english.CleanupFailed=Settings or stored keys could not be removed completely. Please check the folder AppData\Local\CerberusUsage and the "cerberus-usage" entries in the Windows Credential Manager.
 
@@ -61,6 +61,9 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Add
 Source: "{#ExeDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "THIRD-PARTY-LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Language files. Updates overwrite these two; a custom language lives in its own file with its own code.
+Source: "..\lang\de.json"; DestDir: "{app}\lang"; Flags: ignoreversion
+Source: "..\lang\en.json"; DestDir: "{app}\lang"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Cerberus Usage"; Filename: "{app}\{#AppExe}"
@@ -138,6 +141,8 @@ begin
         if not (Exec(ExpandConstant('{app}\{#AppExe}'), '--uninstall-cleanup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
                 and (ResultCode = 0)) then
           MsgBox(ExpandConstant('{cm:CleanupFailed}'), mbError, MB_OK);
+        // Language files (the shipped ones and any the user added).
+        DelTree(ExpandConstant('{app}\lang'), True, True, True);
       end;
     end;
   end;

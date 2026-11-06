@@ -39,7 +39,7 @@ pub fn acquire_app() -> bool {
 
 /// Message box for the second instance.
 pub fn show_already_running_notice() {
-    let text = wide("Cerberus Usage läuft bereits.");
+    let text = wide(&crate::i18n::tr("single_instance.running"));
     let title = wide("Cerberus Usage");
     // SAFETY: both strings are valid NUL-terminated UTF-16; no owner window.
     unsafe {

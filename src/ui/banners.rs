@@ -9,6 +9,7 @@ use super::{Notice, NoticeKind};
 use crate::balance::Alert;
 use crate::cards::alert_banner_text;
 use crate::format::routing_warning;
+use crate::i18n::{tr, tr_args};
 use crate::view::Tone;
 
 /// Everything that can raise a banner. Texts that need the clock (the pause) arrive already formatted.
@@ -29,17 +30,13 @@ pub struct BannerInput<'a> {
 pub fn banner_items(input: &BannerInput) -> Vec<(Tone, String)> {
     let mut items = Vec::new();
     if input.quit_waiting {
-        items.push((Tone::Neutral, "Der Start läuft noch. Die App beendet sich danach.".to_string()));
+        items.push((Tone::Neutral, tr("banner.quit_waiting")));
     }
     if let Some(text) = routing_warning(input.routing_names) {
         items.push((Tone::AmberOutline, text));
     }
     if input.worker_gone {
-        items.push((
-            Tone::Amber,
-            "Der Hintergrunddienst ist ausgefallen. Die Zahlen werden nicht mehr aktualisiert. Bitte die App neu starten."
-                .to_string(),
-        ));
+        items.push((Tone::Amber, tr("banner.worker_gone")));
     }
     if let Some(text) = &input.pause_text {
         items.push((Tone::Amber, text.clone()));
@@ -48,12 +45,18 @@ pub fn banner_items(input: &BannerInput) -> Vec<(Tone, String)> {
         items.push((Tone::Amber, scan_error_text(err)));
     }
     if let Some(err) = input.settings_error {
-        let place = input.settings_path.map(|p| format!(". Datei: {}", p.display())).unwrap_or_default();
-        items.push((Tone::Amber, format!("{}{place}", err.trim_end_matches('.'))));
+        let err = err.trim_end_matches('.');
+        items.push((
+            Tone::Amber,
+            match input.settings_path {
+                Some(p) => tr_args("cards.file_error", &[("error", err), ("path", &p.display().to_string())]),
+                None => err.to_string(),
+            },
+        ));
     }
     for alert in input.alerts {
         if let Some(text) = alert_banner_text(alert) {
-            items.push((Tone::AmberOutline, text.to_string()));
+            items.push((Tone::AmberOutline, text));
         }
     }
     if let Some(notice) = input.notice {
@@ -69,10 +72,13 @@ pub fn banner_items(input: &BannerInput) -> Vec<(Tone, String)> {
 /// Banner text for the worker's error. Reading problems get the reading prefix; a failed save
 /// already says what failed and must not be called a reading error.
 fn scan_error_text(err: &str) -> String {
-    if err.starts_with("Zustand konnte nicht gespeichert werden") {
+    // The start of the save-failure text in the language in use (everything before its placeholder).
+    let template = tr("worker.save_failed");
+    let save_prefix = template.split("{error}").next().unwrap_or_default();
+    if !save_prefix.is_empty() && err.starts_with(save_prefix) {
         err.to_string()
     } else {
-        format!("Fehler beim Lesen der Protokolle: {err}")
+        tr_args("banner.scan_error", &[("error", err)])
     }
 }
 
@@ -116,7 +122,7 @@ pub fn banner_strip(ui: &mut egui::Ui, items: &[(Tone, String)], closable: Optio
                             },
                             |ui| {
                                 let close = egui::Button::new(RichText::new("✕").size(13.0).color(text_color)).frame(false);
-                                if ui.add(close).on_hover_text("Schließen").clicked() {
+                                if ui.add(close).on_hover_text(tr("button.close")).clicked() {
                                     closed = true;
                                 }
                             },
@@ -195,7 +201,7 @@ mod tests {
 
     #[test]
     fn only_a_lasting_notice_gets_a_close_button() {
-        // The notice is the last item; a self-removing "gestartet" notice has no button.
+        // The notice is the last item; a self-removing "started" notice has no button.
         assert_eq!(closable_index(3, true, false), Some(2));
         assert_eq!(closable_index(3, true, true), None);
         assert_eq!(closable_index(3, false, false), None);

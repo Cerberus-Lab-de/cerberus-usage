@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 
+use crate::i18n::tr;
 use crate::log_scan::{ScanState, UsageRecord};
 use crate::pricing::PriceTable;
 
@@ -130,7 +131,7 @@ pub fn build<Tz: TimeZone>(state: &ScanState, prices: &PriceTable, now: DateTime
         .max_by_key(|(e, t)| (e.ts, *t))
         .map(|(e, t)| Pause {
             until: t,
-            limit_type: e.limit_type.clone().unwrap_or_else(|| "unbekannt".to_string()),
+            limit_type: e.limit_type.clone().unwrap_or_else(|| tr("report.limit_unknown")),
         });
 
     report

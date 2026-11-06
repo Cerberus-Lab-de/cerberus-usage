@@ -1,9 +1,11 @@
-//! API keys in the Windows credential store (via `keyring` 4).
+//! Secret-store interface, the Windows credential store (via `keyring` 4) and the old v1.0.x entries.
 //!
 //! Keys never appear in errors: `SecretError` carries no payload, and the underlying
 //! `keyring` errors (some of which embed the raw secret bytes) are mapped, never forwarded.
 
 use std::fmt;
+
+use crate::i18n::tr;
 
 /// Service name under which all entries are stored.
 const SERVICE: &str = "cerberus-usage";
@@ -33,17 +35,26 @@ pub enum SecretError {
     StoreUnavailable,
     /// The stored value could not be read in the expected format.
     BadData,
+    /// A key in settings.json cannot be decrypted (other user or machine, or damaged).
+    NotDecryptable,
+    /// settings.json is unreadable or broken, so keys can be neither read nor saved.
+    ConfigUnreadable,
+    /// settings.json could not be written (disk full, file locked), so a key was not saved.
+    ConfigWriteFailed,
     /// Any other store failure.
     Other,
 }
 
 impl fmt::Display for SecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SecretError::StoreUnavailable => "Windows-Anmeldeinformationsspeicher nicht verfügbar",
-            SecretError::BadData => "Gespeicherter Schlüssel ist nicht lesbar",
-            SecretError::Other => "Zugriff auf den Anmeldeinformationsspeicher fehlgeschlagen",
-        })
+        f.write_str(&tr(match self {
+            SecretError::StoreUnavailable => "secrets.error.store_unavailable",
+            SecretError::BadData => "secrets.error.bad_data",
+            SecretError::NotDecryptable => "secrets.error.not_decryptable",
+            SecretError::ConfigUnreadable => "secrets.error.config_unreadable",
+            SecretError::ConfigWriteFailed => "secrets.error.config_write_failed",
+            SecretError::Other => "secrets.error.other",
+        }))
     }
 }
 
@@ -117,24 +128,24 @@ impl SecretStore for KeyringStore {
 }
 
 /// Format check only (no network). Returned messages are fixed strings, never the value.
-pub fn validate_key(s: Slot, v: &str) -> Result<(), &'static str> {
+pub fn validate_key(s: Slot, v: &str) -> Result<(), String> {
     // Control characters too: a NUL would make the process start fail after Obsidian was already closed.
     if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("Der Schlüssel darf keine Leer- oder Steuerzeichen enthalten.");
+        return Err(tr("secrets.key.whitespace"));
     }
     match s {
         Slot::ApiKey => {
             if v.starts_with("sk-ant-admin") {
-                return Err("Das ist ein Admin-Key. Bitte hier einen normalen API-Key eintragen.");
+                return Err(tr("secrets.key.is_admin"));
             }
             if !v.starts_with("sk-ant-") || v.len() <= "sk-ant-".len() {
-                return Err("Ein API-Key beginnt mit sk-ant-.");
+                return Err(tr("secrets.key.api_prefix"));
             }
         }
         Slot::AdminKey => {
             const PREFIX: &str = "sk-ant-admin01-";
             if !v.starts_with(PREFIX) || v.len() <= PREFIX.len() {
-                return Err("Ein Admin-Key beginnt mit sk-ant-admin01-.");
+                return Err(tr("secrets.key.admin_prefix"));
             }
         }
     }

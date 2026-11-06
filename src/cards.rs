@@ -7,13 +7,15 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::analytics::{ApiError, ApiStatus};
 use crate::balance::{Alert, BalanceStatus};
+use crate::format::format_time_by;
+use crate::i18n::{tr, tr_args};
 use crate::pricing::format_usd;
 use crate::settings::{self, Baseline, Settings, TopUp};
 
 const NANO_PER_USD: u64 = 1_000_000_000;
 const MAX_DECIMALS: usize = 9;
 
-/// German text of an API error. One source: the error's `Display`.
+/// Text of an API error. One source: the error's `Display`.
 pub fn api_error_text(error: &ApiError) -> String {
     error.to_string()
 }
@@ -25,18 +27,18 @@ pub fn format_usd_signed(nano: i128) -> String {
 }
 
 fn date_text(t: DateTime<Utc>) -> String {
-    t.with_timezone(&Local).format("%d.%m.%Y").to_string()
+    format_time_by(&t.with_timezone(&Local), "format.date", "%Y-%m-%d")
 }
 
 fn datetime_text(t: DateTime<Local>) -> String {
-    t.format("%d.%m.%Y %H:%M").to_string()
+    format_time_by(&t, "format.datetime_short", "%Y-%m-%d %H:%M")
 }
 
 // ---- amounts -------------------------------------------------------------------------------------
 
 /// Parses "65", "65,03", "65.03", "$65.03" into nano-USD with integer math only.
 pub fn parse_usd_nano(input: &str) -> Result<u64, String> {
-    const INVALID: &str = "Ungültiger Betrag. Erlaubt sind Zahlen wie 65, 65,03 oder 65.03.";
+    let invalid = || tr("cards.amount.invalid");
     let trimmed = input.trim();
     let text = trimmed
         .strip_prefix('$')
@@ -44,26 +46,26 @@ pub fn parse_usd_nano(input: &str) -> Result<u64, String> {
         .unwrap_or(trimmed)
         .trim();
     if text.is_empty() {
-        return Err("Bitte einen Betrag eingeben.".to_string());
+        return Err(tr("cards.amount.empty"));
     }
     if text.starts_with('-') {
-        return Err("Der Betrag darf nicht negativ sein.".to_string());
+        return Err(tr("cards.amount.negative"));
     }
     let (whole, frac) = text.split_once([',', '.']).unwrap_or((text, ""));
     let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
     if (whole.is_empty() && frac.is_empty()) || !digits(whole) || !digits(frac) {
-        return Err(INVALID.to_string());
+        return Err(invalid());
     }
     // "1.000" could be one thousand (German) or exactly one (English): never guess with money.
     if frac.len() == 3 {
-        return Err("Mehrdeutiger Betrag. Bitte mit zwei Nachkommastellen eingeben, z. B. 65,03.".to_string());
+        return Err(tr("cards.amount.ambiguous"));
     }
     if frac.len() > MAX_DECIMALS {
-        return Err("Zu viele Nachkommastellen (höchstens 9).".to_string());
+        return Err(tr("cards.amount.decimals"));
     }
-    let too_big = || "Der Betrag ist zu groß.".to_string();
+    let too_big = || tr("cards.amount.too_big");
     let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| too_big())? };
-    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<9}").parse().map_err(|_| INVALID.to_string())? };
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<9}").parse().map_err(|_| invalid())? };
     whole.checked_mul(NANO_PER_USD).and_then(|w| w.checked_add(frac)).ok_or_else(too_big)
 }
 
@@ -86,7 +88,11 @@ pub enum ApiCard {
     Data { today: String, month: String, updated: String, error: Option<String> },
 }
 
-pub fn api_card(admin_key_stored: Option<bool>, api: Option<&ApiStatus>) -> ApiCard {
+pub fn api_card(admin_key_stored: Option<bool>, undecryptable: bool, api: Option<&ApiStatus>) -> ApiCard {
+    // A stored key that cannot be decrypted here is not "no key": say so, whatever an older snapshot holds.
+    if undecryptable {
+        return ApiCard::Error(tr("secrets.error.not_decryptable"));
+    }
     // A deleted key wins over a stale snapshot; an unreadable store without any status counts as no key.
     if admin_key_stored == Some(false) || (admin_key_stored.is_none() && api.is_none()) {
         return ApiCard::NoKey;
@@ -101,7 +107,7 @@ pub fn api_card(admin_key_stored: Option<bool>, api: Option<&ApiStatus>) -> ApiC
             error,
         }
     } else {
-        ApiCard::Error(error.unwrap_or_else(|| "Noch keine Daten von der API.".to_string()))
+        ApiCard::Error(error.unwrap_or_else(|| tr("cards.api.no_data")))
     }
 }
 
@@ -123,27 +129,33 @@ pub fn balance_card(balance: Option<&BalanceStatus>, settings: &Settings) -> Bal
     let base = settings.baseline.as_ref();
     let mut details = Vec::new();
     if let Some(base) = base {
-        details.push(format!("Startwert {} vom {}", format_usd(base.amount_nano), date_text(base.at)));
+        details.push(tr_args(
+            "cards.balance.baseline",
+            &[("amount", &format_usd(base.amount_nano)), ("date", &date_text(base.at))],
+        ));
         let added: u64 = settings
             .topups
             .iter()
             .filter(|t| t.at >= base.at)
             .fold(0u64, |acc, t| acc.saturating_add(t.amount_nano));
         if added > 0 {
-            details.push(format!("Aufladungen seit Startwert: {}", format_usd(added)));
+            details.push(tr_args("cards.balance.topups", &[("amount", &format_usd(added))]));
         }
     }
     if let Some(cost) = balance.cost_since_nano {
-        details.push(format!("API-Kosten seit Startwert: {}", format_usd(cost)));
+        details.push(tr_args("cards.balance.cost", &[("amount", &format_usd(cost))]));
     }
     let note = (!balance.cost_deducted).then(|| {
-        let date = base.map_or_else(|| balance.updated.format("%d.%m.%Y").to_string(), |b| date_text(b.at));
-        let reason = match &balance.error {
-            None | Some(ApiError::NotAvailable) => "Kosten-API nicht verfügbar".to_string(),
-            Some(ApiError::BaselineTooOld) => return format!("Stand vom {date}, ohne Kostenabzug: {}.", ApiError::BaselineTooOld),
-            Some(_) => "Kosten seit dem Startwert nicht abrufbar".to_string(),
+        let date = base.map_or_else(
+            || format_time_by(&balance.updated, "format.date", "%Y-%m-%d"),
+            |b| date_text(b.at),
+        );
+        let key = match &balance.error {
+            None | Some(ApiError::NotAvailable) => "cards.balance.note.not_available",
+            Some(ApiError::BaselineTooOld) => "cards.balance.note.baseline_too_old",
+            Some(_) => "cards.balance.note.failed",
         };
-        format!("Stand vom {date}, ohne Kostenabzug: {reason}. Startwert bei Bedarf neu eintragen.")
+        tr_args(key, &[("date", &date)])
     });
     BalanceCard::Estimate {
         value: format_usd_signed(balance.estimate_nano),
@@ -155,22 +167,24 @@ pub fn balance_card(balance: Option<&BalanceStatus>, settings: &Settings) -> Bal
 
 /// Shown next to the limit fields while no Cost API answers: the budget warning compares the API
 /// month cost with the limit, so without it nothing can ever fire.
-pub const INERT_LIMITS_HINT: &str = "Ohne Kosten-API wird die Budget-Warnung nicht ausgelöst; die Guthaben-Warnung sieht nur Startwert und Aufladungen.";
+pub fn inert_limits_text() -> String {
+    tr("cards.inert_limits_hint")
+}
 
 /// `Some` when the Cost API is absent or not available, i.e. the budget warning is inert.
-pub fn inert_limits_hint(api: Option<&ApiStatus>) -> Option<&'static str> {
+pub fn inert_limits_hint(api: Option<&ApiStatus>) -> Option<String> {
     match api {
-        None => Some(INERT_LIMITS_HINT),
-        Some(a) if a.error == Some(ApiError::NotAvailable) => Some(INERT_LIMITS_HINT),
+        None => Some(inert_limits_text()),
+        Some(a) if a.error == Some(ApiError::NotAvailable) => Some(inert_limits_text()),
         Some(_) => None,
     }
 }
 
 /// Banner text for an alert. The Max pause has its own banner and returns `None`.
-pub fn alert_banner_text(alert: &Alert) -> Option<&'static str> {
+pub fn alert_banner_text(alert: &Alert) -> Option<String> {
     match alert {
-        Alert::BudgetExceeded => Some("Monatsbudget erreicht: Die API-Kosten laut Anthropic liegen über deiner Grenze."),
-        Alert::LowBalance => Some("Guthaben (geschätzt) unter deiner Warngrenze."),
+        Alert::BudgetExceeded => Some(tr("cards.alert.budget")),
+        Alert::LowBalance => Some(tr("cards.alert.low_balance")),
         Alert::MaxPaused(_) => None,
     }
 }
@@ -195,7 +209,7 @@ fn same_amount(input: &str, current: &str) -> bool {
 fn parse_committed_nano(input: &str) -> Result<u64, String> {
     let text = input.trim().trim_end_matches('$').trim_end();
     if text.ends_with([',', '.']) {
-        return Err("Unvollständiger Betrag. Bitte die Nachkommastellen ergänzen, z. B. 12,00.".to_string());
+        return Err(tr("cards.amount.incomplete"));
     }
     parse_usd_nano(input)
 }
@@ -215,11 +229,16 @@ pub fn with_baseline(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Se
 pub fn with_topup(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Settings, String> {
     let amount_nano = parse_committed_nano(input)?;
     if amount_nano == 0 {
-        return Err("Eine Aufladung muss größer als 0 sein.".to_string());
+        return Err(tr("cards.topup_zero"));
     }
     let mut out = s.clone();
     out.topups.push(TopUp { amount_nano, at: now });
     Ok(out)
+}
+
+/// The settings with the language the user picked in the drawer. Nothing else changes.
+pub fn with_chosen_language(s: &Settings, code: &str) -> Settings {
+    Settings { language: Some(code.to_string()), ..s.clone() }
 }
 
 /// Removes the first top-up equal to `entry`. `None` when the file no longer has it (changed meanwhile).
@@ -235,32 +254,49 @@ pub fn without_topup(s: &Settings, entry: &TopUp) -> Option<Settings> {
 pub fn with_limits(s: &Settings, budget: Option<&str>, low_balance: Option<&str>) -> Result<Settings, String> {
     let mut out = s.clone();
     if let Some(text) = budget {
-        out.monthly_budget_nano = parse_committed_optional(text).map_err(|e| format!("Monatsbudget: {e}"))?;
+        out.monthly_budget_nano = parse_committed_optional(text).map_err(|e| tr_args("cards.limits.budget_error", &[("error", &e)]))?;
     }
     if let Some(text) = low_balance {
-        out.low_balance_nano = parse_committed_optional(text).map_err(|e| format!("Guthaben-Grenze: {e}"))?;
+        out.low_balance_nano = parse_committed_optional(text).map_err(|e| tr_args("cards.limits.balance_error", &[("error", &e)]))?;
     }
     Ok(out)
 }
+
+/// Serialises every load-edit-save cycle in this process, so two writers cannot lose each other's change.
+static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Re-reads the file, applies `edit` and saves. A broken file is never overwritten; the error names the file.
 pub fn update_settings(
     path: &Path,
     edit: impl FnOnce(&Settings) -> Result<Settings, String>,
 ) -> Result<Settings, String> {
+    // Poison is harmless here: the guarded data is `()`, and the file is only replaced atomically.
+    let _guard = SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (current, error) = settings::load(path);
     if let Some(error) = error {
-        return Err(format!("{error}. Datei: {}", path.display()));
+        return Err(tr_args("cards.file_error", &[("error", &error), ("path", &path.display().to_string())]));
     }
     let updated = edit(&current)?;
     settings::save(path, &updated)
-        .map_err(|_| format!("Einstellungen konnten nicht gespeichert werden. Datei: {}", path.display()))?;
+        .map_err(|_| tr_args("cards.save_failed", &[("path", &path.display().to_string())]))?;
     Ok(updated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choosing_a_language_stores_its_code() {
+        let before = Settings { keys_plaintext: true, monthly_budget_nano: Some(5), ..Settings::default() };
+        let after = with_chosen_language(&before, "en");
+        assert_eq!(after.language.as_deref(), Some("en"));
+        // Everything else is carried over untouched.
+        assert!(after.keys_plaintext);
+        assert_eq!(after.monthly_budget_nano, Some(5));
+        assert_eq!(with_chosen_language(&after, "de").language.as_deref(), Some("de"));
+        assert_eq!(before.language, None, "the input is not changed");
+    }
     use crate::analytics::{ApiError, ApiStatus};
     use crate::balance::{Alert, BalanceStatus};
     use crate::settings::{Baseline, Settings, TopUp};
@@ -348,26 +384,38 @@ mod tests {
 
     #[test]
     fn api_card_states() {
-        assert_eq!(api_card(Some(false), None), ApiCard::NoKey);
-        assert_eq!(api_card(None, None), ApiCard::NoKey);
-        assert_eq!(api_card(Some(true), None), ApiCard::Pending);
+        assert_eq!(api_card(Some(false), false, None), ApiCard::NoKey);
+        assert_eq!(api_card(None, false, None), ApiCard::NoKey);
+        assert_eq!(api_card(Some(true), false, None), ApiCard::Pending);
 
         // Never succeeded: only the error text, never figures.
         for e in [ApiError::NotAvailable, ApiError::Server(500), ApiError::Unauthorized] {
-            assert_eq!(api_card(Some(true), Some(&status(false, Some(e.clone())))), ApiCard::Error(e.to_string()));
+            assert_eq!(api_card(Some(true), false, Some(&status(false, Some(e.clone())))), ApiCard::Error(e.to_string()));
         }
 
-        match api_card(Some(true), Some(&status(true, None))) {
+        match api_card(Some(true), false, Some(&status(true, None))) {
             ApiCard::Data { today, month, error, .. } => {
                 assert_eq!((today.as_str(), month.as_str()), ("$1.23", "$45.00"));
                 assert!(error.is_none());
             }
             other => panic!("{other:?}"),
         }
-        match api_card(Some(true), Some(&status(true, Some(ApiError::RateLimited)))) {
+        match api_card(Some(true), false, Some(&status(true, Some(ApiError::RateLimited)))) {
             ApiCard::Data { error, .. } => assert_eq!(error, Some(ApiError::RateLimited.to_string())),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stored_key_that_cannot_be_decrypted_is_not_reported_as_missing() {
+        let expected = ApiCard::Error(tr("secrets.error.not_decryptable"));
+        assert_ne!(expected, ApiCard::NoKey);
+        // The flags of an undecryptable key: presence unknown, undecryptable set.
+        assert_eq!(api_card(None, true, None), expected);
+        // Also over an older snapshot, and over a presence flag that is still true.
+        assert_eq!(api_card(Some(true), true, Some(&status(true, None))), expected);
+        let en = crate::i18n::with_language("en", || api_card(None, true, None));
+        assert_eq!(en, ApiCard::Error("The stored key cannot be decrypted".to_string()));
     }
 
     fn bal(nano: i128, deducted: bool) -> BalanceStatus {
@@ -434,11 +482,11 @@ mod tests {
 
     #[test]
     fn limit_hint_only_while_the_cost_api_is_absent_or_unavailable() {
-        assert_eq!(inert_limits_hint(None), Some(INERT_LIMITS_HINT));
-        assert_eq!(inert_limits_hint(Some(&status(false, Some(ApiError::NotAvailable)))), Some(INERT_LIMITS_HINT));
+        assert_eq!(inert_limits_hint(None), Some(inert_limits_text()));
+        assert_eq!(inert_limits_hint(Some(&status(false, Some(ApiError::NotAvailable)))), Some(inert_limits_text()));
         assert_eq!(inert_limits_hint(Some(&status(true, None))), None);
         assert_eq!(inert_limits_hint(Some(&status(true, Some(ApiError::RateLimited)))), None);
-        assert!(INERT_LIMITS_HINT.contains("Budget-Warnung") && INERT_LIMITS_HINT.contains("Guthaben-Warnung"));
+        assert!(inert_limits_text().contains("Budget-Warnung") && inert_limits_text().contains("Guthaben-Warnung"));
     }
 
     #[test]

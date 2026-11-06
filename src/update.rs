@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::analytics::{Http, NetError};
+use crate::i18n::{tr, tr_args};
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,7 +32,7 @@ impl Manifest {
     /// Parses manifest JSON. The error never echoes the input.
     pub fn parse(json: &str) -> Result<Manifest, UpdateError> {
         serde_json::from_str(json)
-            .map_err(|_| UpdateError::Malformed("Manifest ist ungültig".to_string()))
+            .map_err(|_| UpdateError::Malformed(tr("update.manifest_invalid")))
     }
 }
 
@@ -53,16 +54,14 @@ pub enum UpdateError {
 impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadSignature => write!(f, "Die Signatur des Updates ist ungültig."),
-            Self::ChecksumMismatch => write!(f, "Die Prüfsumme des Installers stimmt nicht."),
-            Self::NotNewer => {
-                write!(f, "Das Update ist nicht neuer als die installierte Version.")
-            }
-            Self::PreRelease => write!(f, "Vorabversionen werden nicht automatisch installiert."),
-            Self::BadFileName => write!(f, "Der Dateiname des Updates ist ungültig."),
-            Self::Malformed(m) => write!(f, "Update-Daten fehlerhaft: {m}"),
-            Self::Network(m) => write!(f, "Netzwerkfehler beim Update: {m}"),
-            Self::NoKey => write!(f, "In dieser Version ist kein Update-Schlüssel hinterlegt."),
+            Self::BadSignature => f.write_str(&tr("update.error.bad_signature")),
+            Self::ChecksumMismatch => f.write_str(&tr("update.error.checksum_mismatch")),
+            Self::NotNewer => f.write_str(&tr("update.error.not_newer")),
+            Self::PreRelease => f.write_str(&tr("update.error.pre_release")),
+            Self::BadFileName => f.write_str(&tr("update.error.bad_file_name")),
+            Self::Malformed(m) => f.write_str(&tr_args("update.error.malformed", &[("message", m)])),
+            Self::Network(m) => f.write_str(&tr_args("update.error.network", &[("message", m)])),
+            Self::NoKey => f.write_str(&tr("update.error.no_key")),
         }
     }
 }
@@ -124,7 +123,7 @@ pub fn verify(
         return Err(UpdateError::BadFileName);
     }
     if !sha_format_ok(&m.sha256) {
-        return Err(UpdateError::Malformed("Prüfsumme im Manifest ist ungültig".to_string()));
+        return Err(UpdateError::Malformed(tr("update.checksum_invalid")));
     }
     if !m.version.pre.is_empty() {
         return Err(UpdateError::PreRelease);
@@ -133,7 +132,7 @@ pub fn verify(
         return Err(UpdateError::NotNewer);
     }
     let key = VerifyingKey::from_bytes(public_key)
-        .map_err(|_| UpdateError::Malformed("Update-Schlüssel ungültig".to_string()))?;
+        .map_err(|_| UpdateError::Malformed(tr("update.key_invalid")))?;
     let sig_bytes = hex_decode(&m.signature)
         .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
         .ok_or(UpdateError::BadSignature)?;
@@ -253,7 +252,7 @@ impl Default for UpdateHttp {
 impl Http for UpdateHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), NetError> {
         let (status, bytes) = self.get_bytes(url, headers, MAX_JSON_BYTES)?;
-        let text = String::from_utf8(bytes).map_err(|_| NetError("Netzwerkfehler".to_string()))?;
+        let text = String::from_utf8(bytes).map_err(|_| NetError(tr("net.error")))?;
         Ok((status, text))
     }
 
@@ -280,7 +279,7 @@ impl Http for UpdateHttp {
             .limit(max_bytes as u64)
             .read_to_vec()
             .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => NetError("Antwort zu groß".to_string()),
+                ureq::Error::BodyExceedsLimit(_) => NetError(tr("net.too_large")),
                 other => crate::analytics::net_error(other),
             })?;
         Ok((status, bytes))
@@ -329,7 +328,7 @@ struct AssetDto {
 }
 
 fn bad_release() -> UpdateError {
-    UpdateError::Malformed("Release-Daten ungültig".to_string())
+    UpdateError::Malformed(tr("update.release_invalid"))
 }
 
 /// Asks GitHub for the latest release. `Ok(None)` when there is none, it is a draft or
@@ -345,11 +344,11 @@ pub fn latest_release(http: &dyn Http, current: &Version) -> Result<Option<Relea
         404 => return Ok(None),
         // The transport does not expose headers, so every 403/429 counts as the rate limit.
         403 | 429 => {
-            return Err(UpdateError::Network(
-                "GitHub-Limit erreicht, später erneut versuchen".to_string(),
-            ));
+            return Err(UpdateError::Network(tr("update.github_limit")));
         }
-        code => return Err(UpdateError::Network(format!("GitHub antwortet mit HTTP {code}"))),
+        code => {
+            return Err(UpdateError::Network(tr_args("update.github_http", &[("code", &code.to_string())])));
+        }
     }
     let dto: ReleaseDto = serde_json::from_slice(&body).map_err(|_| bad_release())?;
     if dto.draft || dto.prerelease {
@@ -435,7 +434,7 @@ pub fn download_verified_with_hash(
 ) -> Result<(PathBuf, String), UpdateError> {
     let key = key.ok_or(UpdateError::NoKey)?;
     if !dir.is_absolute() {
-        return Err(UpdateError::Malformed("Download-Ordner ungültig".to_string()));
+        return Err(UpdateError::Malformed(tr("update.dir_invalid")));
     }
     if !r.installer_url.starts_with(DOWNLOAD_PREFIX) || !r.manifest_url.starts_with(DOWNLOAD_PREFIX)
     {
@@ -445,24 +444,24 @@ pub fn download_verified_with_hash(
 
     let (status, body) = http.get_bytes(&r.manifest_url, &headers, MAX_JSON_BYTES).map_err(net)?;
     if status != 200 {
-        return Err(UpdateError::Network(format!("Manifest nicht abrufbar (HTTP {status})")));
+        return Err(UpdateError::Network(tr_args("update.manifest_http", &[("code", &status.to_string())])));
     }
     let text = std::str::from_utf8(&body)
-        .map_err(|_| UpdateError::Malformed("Manifest ist ungültig".to_string()))?;
+        .map_err(|_| UpdateError::Malformed(tr("update.manifest_invalid")))?;
     let manifest = Manifest::parse(text)?;
     if manifest.version != r.version || manifest.file != r.installer_name() {
-        return Err(UpdateError::Malformed("Manifest passt nicht zum Release".to_string()));
+        return Err(UpdateError::Malformed(tr("update.manifest_mismatch")));
     }
 
     let (status, installer) =
         http.get_bytes(&r.installer_url, &headers, MAX_INSTALLER_BYTES).map_err(net)?;
     if status != 200 {
-        return Err(UpdateError::Network(format!("Installer nicht abrufbar (HTTP {status})")));
+        return Err(UpdateError::Network(tr_args("update.installer_http", &[("code", &status.to_string())])));
     }
     verify(&manifest, &installer, current, &key)?;
 
     // Verified; only now touch the disk. `verify` has checked the file name.
-    let io_err = |_: io::Error| UpdateError::Malformed("Installer konnte nicht gespeichert werden".to_string());
+    let io_err = |_: io::Error| UpdateError::Malformed(tr("update.save_failed"));
     std::fs::create_dir_all(dir).map_err(io_err)?;
     remove_old_installers(dir);
     let target = dir.join(&manifest.file);
@@ -512,7 +511,7 @@ fn installer_log_path() -> PathBuf {
 pub fn run_installer(path: &Path) -> io::Result<()> {
     let name_ok = path.file_name().and_then(|n| n.to_str()).is_some_and(file_name_ok);
     if !path.is_absolute() || !name_ok {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "ungültiger Installer-Pfad"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid installer path"));
     }
     use std::os::windows::process::CommandExt;
     let log = installer_log_path();

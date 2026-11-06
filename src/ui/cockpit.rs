@@ -8,7 +8,8 @@ use super::details::figure_value;
 use super::theme::{BIG, palette::*};
 use crate::analytics::ApiError;
 use crate::cards::{ApiCard, BalanceCard};
-use crate::format::{COST_NOTE, format_count, progress_text, unpriced_text};
+use crate::format::{cost_note, progress_text, requests_text, unpriced_text};
+use crate::i18n::{tr, tr_args};
 use crate::launcher::Mode;
 use crate::report::{Bucket, Report};
 use crate::view::{DetailKind, ModeCard, Tone};
@@ -31,7 +32,7 @@ pub fn top_bar(ui: &mut egui::Ui, logo: &egui::TextureHandle, drawer_open: &mut 
             let gear = egui::Button::new(RichText::new("⚙").size(15.0).color(color))
                 .min_size(vec2(28.0, 28.0))
                 .stroke(Stroke::new(1.0, if *drawer_open { CYAN_DARK } else { LINE }));
-            if ui.add(gear).on_hover_text("Einstellungen").on_hover_cursor(CursorIcon::PointingHand).clicked() {
+            if ui.add(gear).on_hover_text(tr("ui.settings")).on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 *drawer_open = !*drawer_open;
             }
         });
@@ -66,14 +67,14 @@ pub fn mode_card_ui(
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new("AKTUELLER MODUS").small().color(MUTED));
+            ui.label(RichText::new(tr("cockpit.mode_heading")).small().color(MUTED));
             ui.label(big(card.title).color(title_color));
             ui.label(RichText::new(card.hint).color(MUTED));
             ui.add_space(4.0);
             let idle = launching.is_none() && blocked.is_none();
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             ui.horizontal(|ui| {
-                let max = egui::Button::new(RichText::new("Mit Max starten").strong().color(TEXT))
+                let max = egui::Button::new(RichText::new(tr("button.start_max")).strong().color(TEXT))
                     .fill(PANEL2)
                     .stroke(Stroke::new(1.0, LINE))
                     .min_size(vec2(width, 36.0));
@@ -85,7 +86,7 @@ pub fn mode_card_ui(
                 if max.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     start = Some(Mode::Max);
                 }
-                let api = egui::Button::new(RichText::new("Mit API-Key starten").strong().color(AMBER))
+                let api = egui::Button::new(RichText::new(tr("button.start_api")).strong().color(AMBER))
                     .fill(PANEL2)
                     .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.5)))
                     .min_size(vec2(width, 36.0));
@@ -101,7 +102,7 @@ pub fn mode_card_ui(
             if let Some((_, confirmed)) = launching {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(if confirmed { "Obsidian wird geschlossen …" } else { "Obsidian wird gestartet …" });
+                    ui.label(tr(if confirmed { "cockpit.launch.closing" } else { "cockpit.launch.starting" }));
                 });
             }
         });
@@ -112,7 +113,7 @@ pub fn mode_card_ui(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Figure {
     pub kind: DetailKind,
-    pub label: &'static str,
+    pub label: String,
     pub value: String,
     /// The value in amber (a pause).
     pub value_warn: bool,
@@ -121,7 +122,7 @@ pub struct Figure {
 }
 
 fn bucket_lines(b: &Bucket) -> Vec<(String, bool)> {
-    let mut lines = vec![(format!("{} Anfragen", format_count(b.requests)), false), (COST_NOTE.to_string(), false)];
+    let mut lines = vec![(requests_text(b.requests), false), (cost_note(), false)];
     if let Some(text) = unpriced_text(b.unpriced_requests) {
         lines.push((text, true));
     }
@@ -143,49 +144,58 @@ pub fn figures(report: &Report, balance: &BalanceCard, balance_issue: bool) -> V
     let balance_figure = match balance {
         BalanceCard::NoBaseline => Figure {
             kind: DetailKind::Balance,
-            label: "GUTHABEN",
+            label: tr("cockpit.label.balance"),
             value: "–".to_string(),
             value_warn: false,
-            lines: vec![("Noch kein Startwert".to_string(), false)],
+            lines: vec![(tr("cockpit.balance.no_baseline"), false)],
         },
         BalanceCard::Estimate { value, deducted, .. } => {
             // One short line; the opened area has the full explanation.
             let line = match (*deducted, balance_issue) {
-                (false, _) => ("geschätzt · ohne Kostenabzug", true),
-                (true, true) => ("geschätzt · Hinweis", true),
-                (true, false) => ("geschätzt", false),
+                (false, _) => ("cockpit.balance.estimated_no_deduction", true),
+                (true, true) => ("cockpit.balance.estimated_note", true),
+                (true, false) => ("cockpit.balance.estimated", false),
             };
-            let lines = vec![(line.0.to_string(), line.1)];
-            Figure { kind: DetailKind::Balance, label: "GUTHABEN", value: value.clone(), value_warn: false, lines }
+            let lines = vec![(tr(line.0), line.1)];
+            Figure {
+                kind: DetailKind::Balance,
+                label: tr("cockpit.label.balance"),
+                value: value.clone(),
+                value_warn: false,
+                lines,
+            }
         }
     };
     let max_figure = match &report.pause {
         Some(_) => Figure {
             kind: DetailKind::Max,
-            label: "MAX",
-            value: "pausiert".to_string(),
+            label: tr("cockpit.label.max"),
+            value: tr("cockpit.max.paused"),
             value_warn: true,
-            lines: last_5h_lines(&report.last_5h, format!("letzte 5 Std. {}", figure_value(&report.last_5h))),
+            lines: last_5h_lines(
+                &report.last_5h,
+                tr_args("cockpit.max.last5h", &[("value", &figure_value(&report.last_5h))]),
+            ),
         },
         None => Figure {
             kind: DetailKind::Max,
-            label: "LETZTE 5 STD.",
+            label: tr("cockpit.label.last5h"),
             value: figure_value(&report.last_5h),
             value_warn: false,
-            lines: last_5h_lines(&report.last_5h, format!("{} Anfragen", format_count(report.last_5h.requests))),
+            lines: last_5h_lines(&report.last_5h, requests_text(report.last_5h.requests)),
         },
     };
     vec![
         Figure {
             kind: DetailKind::Today,
-            label: "HEUTE",
+            label: tr("cockpit.label.today"),
             value: figure_value(&report.today),
             value_warn: false,
             lines: bucket_lines(&report.today),
         },
         Figure {
             kind: DetailKind::Month,
-            label: "MONAT",
+            label: tr("cockpit.label.month"),
             value: figure_value(&report.month),
             value_warn: false,
             lines: bucket_lines(&report.month),
@@ -200,18 +210,18 @@ fn columns_for(width: f32) -> usize {
     if width >= WIDE { 4 } else { 2 }
 }
 
-fn kind_name(kind: DetailKind) -> &'static str {
-    match kind {
-        DetailKind::Today => "Heute",
-        DetailKind::Month => "Monat",
-        DetailKind::Balance => "Guthaben",
-        DetailKind::Max => "Max",
-    }
+fn kind_name(kind: DetailKind) -> String {
+    tr(match kind {
+        DetailKind::Today => "cockpit.card.today",
+        DetailKind::Month => "cockpit.card.month",
+        DetailKind::Balance => "cockpit.card.balance",
+        DetailKind::Max => "cockpit.card.max",
+    })
 }
 
 /// Screen-reader label of a figure card.
 pub fn card_accessible_label(kind: DetailKind, open: bool) -> String {
-    format!("{}, Details {}", kind_name(kind), if open { "schließen" } else { "öffnen" })
+    tr_args(if open { "cockpit.card.close" } else { "cockpit.card.open" }, &[("name", &kind_name(kind))])
 }
 
 /// A rounded, clickable card of exactly `width`. Label on top, big number below, short muted lines
@@ -249,7 +259,8 @@ fn figure_card(ui: &mut egui::Ui, width: f32, figure: &Figure, open: bool) -> eg
         })
         .inner;
     let rect = inner.response.rect;
-    let id = egui::Id::unique(("figure", figure.label));
+    // The id follows the card, not its label, so a language change keeps the widget state.
+    let id = egui::Id::unique(("figure", format!("{:?}", figure.kind)));
     let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Button, true, card_accessible_label(figure.kind, open))
@@ -297,14 +308,11 @@ fn wrapped(ui: &mut egui::Ui, text: RichText) {
 /// The API cost line or card under the figures. No key, nothing yet and errors are one dim line.
 pub fn api_line(ui: &mut egui::Ui, view: &ApiCard) {
     match view {
-        ApiCard::NoKey => wrapped(
-            ui,
-            RichText::new("Laut Anthropic: Kein Admin-Key gespeichert. Kosten-API nur mit Organisations-Konto.").color(MUTED),
-        ),
-        ApiCard::Pending => wrapped(ui, RichText::new("Laut Anthropic: Warte auf die erste Abfrage …").color(MUTED)),
+        ApiCard::NoKey => wrapped(ui, RichText::new(tr("api.no_key")).color(MUTED)),
+        ApiCard::Pending => wrapped(ui, RichText::new(tr("api.pending")).color(MUTED)),
         ApiCard::Error(text) => {
             let color = if api_error_is_dim(text) { MUTED } else { AMBER };
-            wrapped(ui, RichText::new(format!("Laut Anthropic: {text}")).color(color));
+            wrapped(ui, RichText::new(tr_args("api.error", &[("error", text.as_str())])).color(color));
         }
         ApiCard::Data { today, month, updated, error } => {
             egui::Frame::new()
@@ -315,16 +323,11 @@ pub fn api_line(ui: &mut egui::Ui, view: &ApiCard) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    wrapped(ui, RichText::new("API-KOSTEN LAUT ANTHROPIC").small().color(MUTED));
-                    wrapped(ui, RichText::new(format!("Heute {today}")).size(16.0).strong());
-                    wrapped(ui, RichText::new(format!("Dieser Monat {month}")));
-                    wrapped(ui, RichText::new(format!("Stand: {updated}")).small().color(MUTED));
-                    wrapped(
-                        ui,
-                        RichText::new("Die Daten können mehrere Stunden hinterherhinken (laut Anthropic etwa 4 Std., bis zu 24 Std.).")
-                            .small()
-                            .color(MUTED),
-                    );
+                    wrapped(ui, RichText::new(tr("api.title")).small().color(MUTED));
+                    wrapped(ui, RichText::new(tr_args("api.today", &[("amount", today.as_str())])).size(16.0).strong());
+                    wrapped(ui, RichText::new(tr_args("api.month", &[("amount", month.as_str())])));
+                    wrapped(ui, RichText::new(tr_args("api.updated", &[("time", updated.as_str())])).small().color(MUTED));
+                    wrapped(ui, RichText::new(tr("api.lag")).small().color(MUTED));
                     if let Some(text) = error {
                         let color = if api_error_is_dim(text) { MUTED } else { AMBER };
                         wrapped(ui, RichText::new(text).color(color));
@@ -367,7 +370,7 @@ mod tests {
     #[test]
     fn local_figures_keep_the_estimate_note_and_unpriced_hint() {
         let f = figures(&report(), &estimate(true), false);
-        assert!(f[0].lines.iter().any(|(t, _)| t == COST_NOTE));
+        assert!(f[0].lines.iter().any(|(t, _)| *t == cost_note()));
         assert!(!f[0].lines.iter().any(|(_, warn)| *warn), "today had every request priced");
         assert!(f[1].lines.iter().any(|(t, warn)| *warn && t == "2 Anfragen nicht bewertet"));
     }
@@ -395,7 +398,7 @@ mod tests {
         let no_deduction = figures(&report(), &estimate(false), true);
         assert_eq!(no_deduction[2].lines, [("geschätzt · ohne Kostenabzug".to_string(), true)]);
         let hint = figures(&report(), &estimate(true), true);
-        assert_eq!(hint[2].lines, [("geschätzt · Hinweis".to_string(), true)]);
+        assert_eq!(hint[2].lines, [("geschätzt · siehe Details".to_string(), true)]);
         assert_eq!(figures(&report(), &estimate(true), false)[2].lines, [("geschätzt".to_string(), false)]);
     }
 
@@ -451,7 +454,7 @@ mod tests {
             error: Some(ApiError::NotAvailable),
             since_error: None,
         };
-        match crate::cards::api_card(Some(true), Some(&status)) {
+        match crate::cards::api_card(Some(true), false, Some(&status)) {
             ApiCard::Error(text) => assert!(api_error_is_dim(&text)),
             other => panic!("{other:?}"),
         }

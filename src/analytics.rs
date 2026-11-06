@@ -19,6 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::Deserialize;
 
+use crate::i18n::{tr, tr_args};
 use crate::secrets::{SecretStore, Slot};
 
 const BASE_URL: &str = "https://api.anthropic.com/v1/organizations/analytics/cost";
@@ -86,7 +87,7 @@ pub trait Http {
     ) -> Result<(u16, Vec<u8>), NetError> {
         let (status, body) = self.get(url, headers)?;
         if body.len() > max_bytes {
-            return Err(NetError("Antwort zu groß".to_string()));
+            return Err(NetError(tr("net.too_large")));
         }
         Ok((status, body.into_bytes()))
     }
@@ -119,13 +120,12 @@ impl Default for UreqHttp {
 pub(crate) fn net_error(e: ureq::Error) -> NetError {
     NetError(
         match e {
-            ureq::Error::Timeout(_) => "Zeitüberschreitung",
+            ureq::Error::Timeout(_) => tr("net.timeout"),
             ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_) => {
-                "Server nicht erreichbar"
+                tr("net.unreachable")
             }
-            _ => "Netzwerkfehler",
-        }
-        .to_string(),
+            _ => tr("net.error"),
+        },
     )
 }
 
@@ -170,18 +170,16 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApiError::Unauthorized => {
-                f.write_str("Admin-Key wurde abgelehnt. Bitte den Key in den Einstellungen prüfen.")
+                f.write_str(&tr_args("analytics.error.unauthorized", &[("settings", &tr("ui.settings"))]))
             }
-            ApiError::NotAvailable => f.write_str(
-                "Kosten-API nicht verfügbar: nur für Organisations-Konten mit Admin-Key (Einzelkonto oder fehlende Berechtigung)",
-            ),
-            ApiError::RateLimited => {
-                f.write_str("Anfragelimit der API erreicht. Der nächste Versuch folgt später.")
+            ApiError::NotAvailable => f.write_str(&tr("analytics.error.not_available")),
+            ApiError::RateLimited => f.write_str(&tr("analytics.error.rate_limited")),
+            ApiError::Network(m) => f.write_str(&tr_args("analytics.error.network", &[("message", m)])),
+            ApiError::Server(code) => {
+                f.write_str(&tr_args("analytics.error.server", &[("code", &code.to_string())]))
             }
-            ApiError::Network(m) => write!(f, "Netzwerkfehler: {m}"),
-            ApiError::Server(code) => write!(f, "Serverfehler der API (HTTP {code})"),
-            ApiError::Parse(m) => write!(f, "Antwort der API nicht lesbar: {m}"),
-            ApiError::BaselineTooOld => f.write_str("Startwert zu alt, bitte neu eintragen"),
+            ApiError::Parse(m) => f.write_str(&tr_args("analytics.error.parse", &[("message", m)])),
+            ApiError::BaselineTooOld => f.write_str(&tr("analytics.error.baseline_too_old")),
         }
     }
 }
@@ -230,7 +228,7 @@ struct CostDto {
 /// Parses an API amount (cents, up to 6 decimals, e.g. `"41280.000000"`) into nano-USD.
 /// Digits only: no sign, exponent or whitespace. Overflow is a parse error.
 pub fn parse_amount_nano(s: &str) -> Result<u64, ApiError> {
-    let bad = || ApiError::Parse("ungültiger Betrag".to_string());
+    let bad = || ApiError::Parse(tr("analytics.parse.invalid_amount"));
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
         None => (s, ""),
@@ -341,7 +339,7 @@ fn fetch_chunk(
     let mut page: Option<String> = None;
     for _ in 0..MAX_PAGES {
         if Instant::now() >= deadline {
-            return Err(ApiError::Network("Zeitüberschreitung".to_string()));
+            return Err(ApiError::Network(tr("net.timeout")));
         }
         let url = request_url(start, end, width, page.as_deref());
         let (status, body) = http
@@ -356,7 +354,10 @@ fn fetch_chunk(
         }
         // Fixed text with position only: serde's own message can echo parts of the body.
         let parsed: PageDto = serde_json::from_str(&body).map_err(|e| {
-            ApiError::Parse(format!("unerwartetes Format (Zeile {}, Spalte {})", e.line(), e.column()))
+            ApiError::Parse(tr_args(
+                "analytics.parse.format",
+                &[("line", &e.line().to_string()), ("column", &e.column().to_string())],
+            ))
         })?;
         for row in parsed.data {
             rows.push(CostRow {
@@ -371,10 +372,10 @@ fn fetch_chunk(
         }
         match parsed.next_page {
             Some(token) if !token.is_empty() => page = Some(token),
-            _ => return Err(ApiError::Parse("Folgeseite fehlt".to_string())),
+            _ => return Err(ApiError::Parse(tr("analytics.parse.next_page"))),
         }
     }
-    Err(ApiError::Parse("zu viele Seiten".to_string()))
+    Err(ApiError::Parse(tr("analytics.parse.too_many_pages")))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1298,15 +1299,17 @@ mod tests {
         assert_eq!(http.request_count(), 0);
     }
 
-    /// Needs a stored admin key and network. Run manually (save the key via the app first):
+    /// Needs a stored admin key (in the settings file, saved via the app) and network. Run manually:
     /// `cargo test live_cost_today -- --ignored --nocapture`. Prints amounts only.
     #[test]
     #[ignore]
     fn live_cost_today() {
+        use crate::config_store::{ConfigStore, KeyStore};
         use crate::secrets::KeyringStore;
-        let key = KeyringStore::new()
+        let path = crate::settings::default_path().expect("settings path");
+        let key = KeyStore::new(ConfigStore::new(path), std::sync::Arc::new(KeyringStore::new()))
             .get(Slot::AdminKey)
-            .expect("credential store")
+            .expect("key store")
             .expect("no admin key stored: save one in the app first");
         let now = Utc::now();
         let rows = fetch_cost(&UreqHttp::new(), &key, now - Duration::days(2), now + Duration::days(1), "1d")

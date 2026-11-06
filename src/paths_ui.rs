@@ -11,6 +11,7 @@ use eframe::egui::{self, RichText};
 use crate::ui::theme::palette::{AMBER, CYAN, MUTED};
 
 use crate::cards::update_settings;
+use crate::i18n::{tr, tr_args};
 use crate::paths::{real_env, resolve_logs_root, resolve_obsidian, with_logs_root, with_obsidian_path};
 use crate::settings::Settings;
 
@@ -44,7 +45,7 @@ fn obsidian_used(settings: &Settings) -> Used {
 fn logs_used(settings: &Settings) -> Used {
     match resolve_logs_root(settings.logs_root.as_deref(), &real_env) {
         Ok(p) if p.is_dir() => Used::Ok(p),
-        Ok(p) => Used::Problem(format!("Protokollordner nicht gefunden: {}", p.display())),
+        Ok(p) => Used::Problem(tr_args("paths_ui.logs_not_found", &[("path", &p.display().to_string())])),
         Err(e) => Used::Problem(e.to_string()),
     }
 }
@@ -92,7 +93,7 @@ impl PathsPanel {
         let (field, reset) = match action {
             PathsAction::Save(f) => (f, false),
             PathsAction::Reset(f) => (f, true),
-            PathsAction::Browse(_) => return Err("Kein Speichern".to_string()),
+            PathsAction::Browse(_) => return Err("not a save action".to_string()),
         };
         let input = match (field, reset) {
             (_, true) => "",
@@ -118,13 +119,16 @@ impl PathsPanel {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
+        // Texts are read here, on the calling thread; the dialog thread only shows them.
+        let (title_obsidian, filter, title_logs) =
+            (tr("paths_ui.pick_obsidian"), tr("paths_ui.program_filter"), tr("paths_ui.pick_logs"));
         std::thread::spawn(move || {
             let picked = match field {
                 Field::Obsidian => rfd::FileDialog::new()
-                    .set_title("Obsidian.exe auswählen")
-                    .add_filter("Programm (*.exe)", &["exe"])
+                    .set_title(title_obsidian)
+                    .add_filter(filter, &["exe"])
                     .pick_file(),
-                Field::Logs => rfd::FileDialog::new().set_title("Protokollordner auswählen").pick_folder(),
+                Field::Logs => rfd::FileDialog::new().set_title(title_logs).pick_folder(),
             };
             let _ = tx.send(picked);
             ctx.request_repaint();
@@ -165,17 +169,17 @@ impl PathsPanel {
         let busy = self.dialog.is_some();
         let [obsidian_note, logs_note] = notes;
         ui.add_enabled_ui(can_save, |ui| {
-            ui.label("Obsidian (leer: automatisch suchen)");
+            ui.label(tr("paths_ui.obsidian_label"));
             let (input, edited) = (&mut self.obsidian_input, &mut self.obsidian_edited);
             row(ui, Field::Obsidian, input, edited, busy, r"…\Obsidian\Obsidian.exe", &mut action);
             used_line(ui, &self.obsidian, None);
             row_note(ui, obsidian_note);
 
             ui.add_space(6.0);
-            ui.label("Claude-Protokolle (leer: automatisch suchen)");
+            ui.label(tr("paths_ui.logs_label"));
             let (input, edited) = (&mut self.logs_input, &mut self.logs_edited);
             row(ui, Field::Logs, input, edited, busy, r"…\.claude\projects", &mut action);
-            used_line(ui, &self.logs, Some("Wird nach einem Neustart der App wirksam."));
+            used_line(ui, &self.logs, Some(tr("paths_ui.restart_note").as_str()));
             row_note(ui, logs_note);
         });
         action
@@ -212,13 +216,13 @@ fn row(
     let r = ui.add(egui::TextEdit::singleline(input).hint_text(hint).desired_width(ui.available_width()));
     *edited |= r.changed();
     ui.horizontal_wrapped(|ui| {
-        if ui.add_enabled(!busy, egui::Button::new("Durchsuchen")).clicked() {
+        if ui.add_enabled(!busy, egui::Button::new(tr("button.browse"))).clicked() {
             *action = Some(PathsAction::Browse(field));
         }
-        if ui.button("Speichern").clicked() {
+        if ui.button(tr("button.save")).clicked() {
             *action = Some(PathsAction::Save(field));
         }
-        if ui.button("Zurücksetzen").clicked() {
+        if ui.button(tr("button.reset")).clicked() {
             *action = Some(PathsAction::Reset(field));
         }
     });
@@ -227,7 +231,8 @@ fn row(
 fn used_line(ui: &mut egui::Ui, used: &Used, note: Option<&str>) {
     match used {
         Used::Ok(p) => {
-            ui.label(RichText::new(format!("Verwendet: {}", p.display())).color(MUTED).size(12.0));
+            let text = tr_args("paths_ui.used", &[("path", &p.display().to_string())]);
+            ui.label(RichText::new(text).color(MUTED).size(12.0));
         }
         Used::Problem(text) => {
             ui.label(RichText::new(text).color(AMBER));

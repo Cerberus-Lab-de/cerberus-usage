@@ -21,13 +21,15 @@ use crate::analytics::{DEFAULT_API_INTERVAL, UreqHttp};
 use crate::update::UpdateHttp;
 use crate::update_worker::spawn_update_checker;
 use crate::cards::{BalanceCard, api_card, balance_card};
-use crate::format::{COST_NOTE, outcome_message, pause_text, unpriced_text};
+use crate::format::{cost_note, format_time_by, outcome_message, pause_text, unpriced_text};
+use crate::i18n::{tr, tr_args};
 use crate::launcher::{LaunchOutcome, Mode, System, WindowsSystem, launch, routing_env_names};
 use crate::paths::{Env, real_env, resolve_logs_root};
 use crate::paths_ui::PathsPanel;
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
 use crate::settings::Settings;
+use crate::config_store::{ConfigStore, KeyStore, MigrationResult, migrate_keys};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
@@ -44,7 +46,7 @@ use crate::worker::{DEFAULT_INTERVAL, Snapshot, WorkerConfig, spawn_worker};
 const MODE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// After a successful start, "not running" polls are ignored for this long (the process may not show up yet).
 const START_GRACE: Duration = Duration::from_secs(15);
-/// The "Obsidian wurde im Modus … gestartet" notice goes away on its own after this long.
+/// The "Obsidian was started in … mode" notice goes away on its own after this long.
 const STARTED_NOTICE_TTL: Duration = Duration::from_secs(8);
 
 pub use crate::view::ModeDisplay;
@@ -73,8 +75,9 @@ pub struct Notice {
     pub text: String,
 }
 
-/// Everything the window shows. The only key material is the typed text in `key_input` until it is saved
-/// (or deleted); a stored key is never kept here.
+/// Everything the window shows. Typed key text lives in `key_input` until it is saved (or deleted).
+/// `settings` is a copy of the settings file, so it also holds the stored keys as `StoredKey`: DPAPI
+/// blobs by default, the readable key itself in plain-text mode. No code path displays those values.
 pub struct AppState {
     pub snapshot: Option<Snapshot>,
     pub mode: ModeDisplay,
@@ -87,7 +90,7 @@ pub struct AppState {
     /// Waiting for the user to confirm closing Obsidian before starting in this mode.
     pub confirm: Option<Mode>,
     pub notice: Option<Notice>,
-    /// When the current notice removes itself (only the "gestartet" notice does).
+    /// When the current notice removes itself (only the "started" notice does).
     notice_expires: Option<Instant>,
     /// Content of the masked key field; cleared after a successful save.
     pub key_input: String,
@@ -96,6 +99,9 @@ pub struct AppState {
     /// Content of the masked admin-key field; same rules as `key_input`.
     pub admin_key_input: String,
     pub admin_key_stored: Option<bool>,
+    /// The stored key is in the settings file but cannot be decrypted here (other PC or user).
+    pub key_undecryptable: bool,
+    pub admin_key_undecryptable: bool,
     /// Last settings read from the file (for the cards and the lists in the settings panel).
     pub settings: Settings,
     pub settings_path: Option<PathBuf>,
@@ -114,6 +120,8 @@ pub struct AppState {
     pub worker_gone: bool,
     /// The note about an unreadable saved state is shown once.
     state_note_shown: bool,
+    /// The settings problem of the last snapshot, to notice when the file breaks or is repaired.
+    seen_settings_error: Option<String>,
 }
 
 impl AppState {
@@ -132,6 +140,8 @@ impl AppState {
             key_stored: None,
             admin_key_input: String::new(),
             admin_key_stored: None,
+            key_undecryptable: false,
+            admin_key_undecryptable: false,
             settings: Settings::default(),
             settings_path: None,
             baseline_input: String::new(),
@@ -143,7 +153,28 @@ impl AppState {
             baseline_edited: false,
             worker_gone: false,
             state_note_shown: false,
+            seen_settings_error: None,
         }
+    }
+
+    /// Reads the key states again when the settings problem reported by the worker has changed (the
+    /// file broke or was repaired while the app runs), so the flags follow without a restart. Compares
+    /// with the previous snapshot only, so it reads nothing on frames where nothing changed. Returns
+    /// whether it read.
+    pub fn refresh_keys_if_settings_error_changed(&mut self, error: Option<&str>, store: &dyn SecretStore) -> bool {
+        if self.seen_settings_error.as_deref() == error {
+            return false;
+        }
+        self.seen_settings_error = error.map(str::to_string);
+        self.refresh_keys(store);
+        true
+    }
+
+    /// Reads both key states from the store again (after a save, a delete or a storage switch; never per
+    /// frame). The values are dropped at once.
+    pub fn refresh_keys(&mut self, store: &dyn SecretStore) {
+        (self.key_stored, self.key_undecryptable) = key_check(store, Slot::ApiKey);
+        (self.admin_key_stored, self.admin_key_undecryptable) = key_check(store, Slot::AdminKey);
     }
 
     /// Shows `notice` until it is closed (or replaced). Only [`Self::apply_outcome`] sets a timer.
@@ -162,7 +193,7 @@ impl AppState {
         self.notice.is_some() && self.notice_expires.is_some()
     }
 
-    /// Drops the "gestartet" notice once its time is up.
+    /// Drops the "started" notice once its time is up.
     pub fn tick_notice(&mut self, now: Instant) {
         if self.notice_expires.is_some_and(|at| now >= at) {
             self.set_notice(None);
@@ -174,13 +205,15 @@ impl AppState {
         self.launching = None;
         self.set_notice(Some(Notice {
             kind: NoticeKind::Error,
-            text: "Der Startvorgang wurde unerwartet beendet. Ob Obsidian läuft, zeigt die Anzeige oben.".to_string(),
+            text: tr("ui.launch_lost"),
         }));
     }
 
     /// Shows the one-time note from loading the saved state, unless a notice is already up.
     pub fn show_state_note_once(&mut self, note: Option<&str>) {
-        if self.state_note_shown {
+        // An existing notice (for example "move failed, key not lost") is never replaced; the note
+        // waits and is shown once the notice is gone.
+        if self.state_note_shown || self.notice.is_some() {
             return;
         }
         if let Some(text) = note {
@@ -212,7 +245,7 @@ impl AppState {
 
     fn recompute_mode(&mut self) {
         self.mode = match self.running {
-            // No real answer yet (check blocked, settings unreadable): never claim "geschlossen".
+            // No real answer yet (check blocked, settings unreadable): never claim "closed".
             None => ModeDisplay::Unknown,
             Some(running) => mode_display(self.started_by_app, running),
         };
@@ -241,7 +274,7 @@ impl AppState {
                 self.started_by_app = None;
             }
             if self.running != Some(false) && self.notice_expires.is_some() {
-                // The running state changed: the "gestartet" notice no longer describes it.
+                // The running state changed: the "started" notice no longer describes it.
                 self.set_notice(None);
             }
             self.running = Some(false);
@@ -282,7 +315,7 @@ impl Default for AppState {
 /// Validate and store a key. Errors are fixed messages, never the value.
 pub fn save_key(store: &dyn SecretStore, slot: Slot, input: &str) -> Result<(), String> {
     let value = input.trim();
-    validate_key(slot, value).map_err(str::to_string)?;
+    validate_key(slot, value)?;
     store.set(slot, value).map_err(|e| e.to_string())
 }
 
@@ -290,9 +323,46 @@ pub fn save_api_key(store: &dyn SecretStore, input: &str) -> Result<(), String> 
     save_key(store, Slot::ApiKey, input)
 }
 
-/// Presence check only; the value is dropped immediately.
+/// The store the app reads and writes keys through: the settings file with the old credential-store
+/// entries as a fallback. Without a settings path there is no file to use, so the credential store stays.
+fn key_store(settings_path: Option<&Path>) -> Arc<dyn SecretStore + Send + Sync> {
+    match settings_path {
+        Some(path) => Arc::new(KeyStore::new(ConfigStore::new(path.to_path_buf()), Arc::new(KeyringStore::new()))),
+        None => Arc::new(KeyringStore::new()),
+    }
+}
+
+/// Runs the one-time key move for the settings file at `path`; returns what did not move cleanly.
+fn migrate_at_start(path: &Path) -> MigrationResult {
+    migrate_keys(&KeyringStore::new(), &ConfigStore::new(path.to_path_buf()))
+}
+
+/// Notice for keys that did not move cleanly. Names the key type only, never a value.
+fn move_notice_text(result: &MigrationResult) -> Option<String> {
+    let names = |slots: &[Slot]| slots.iter().map(|&s| key_label(s)).collect::<Vec<_>>().join(&tr("ui.and"));
+    let mut parts = Vec::new();
+    if !result.not_moved.is_empty() {
+        parts.push(tr_args("move.not_moved", &[("names", &names(&result.not_moved))]));
+    }
+    if !result.old_entry_left.is_empty() {
+        parts.push(tr_args("move.old_left", &[("names", &names(&result.old_entry_left))]));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+}
+
+/// Presence check only; the value is dropped immediately. (The app uses [`key_check`]; tests use this.)
+#[cfg(test)]
 fn key_stored(store: &dyn SecretStore, slot: Slot) -> Option<bool> {
     store.get(slot).ok().map(|v| v.is_some())
+}
+
+/// Presence check plus whether the key is there but cannot be decrypted. The value is dropped at once.
+fn key_check(store: &dyn SecretStore, slot: Slot) -> (Option<bool>, bool) {
+    match store.get(slot) {
+        Ok(v) => (Some(v.is_some()), false),
+        Err(SecretError::NotDecryptable) => (None, true),
+        Err(_) => (None, false),
+    }
 }
 
 /// Fixed id of a key field, so its widget state can be found again.
@@ -311,11 +381,12 @@ fn wipe_key_field(ctx: &egui::Context, id: egui::Id, input: &mut String) {
     ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
 }
 
-fn key_label(slot: Slot) -> &'static str {
-    match slot {
-        Slot::ApiKey => "API-Key",
-        Slot::AdminKey => "Admin-Key",
-    }
+/// Name of a key inside a sentence ("API key", "admin key").
+fn key_label(slot: Slot) -> String {
+    tr(match slot {
+        Slot::ApiKey => "key.name.api",
+        Slot::AdminKey => "key.name.admin",
+    })
 }
 
 /// An optional limit as it is typed into its field (`65.03`, empty for none).
@@ -324,12 +395,21 @@ fn amount_input(nano: Option<u64>) -> String {
 }
 
 /// Status line of a key slot. An unreadable store must not look like "no key".
-pub fn key_status_text(stored: Option<bool>) -> &'static str {
-    match stored {
-        Some(true) => "gespeichert",
-        Some(false) => "nicht gespeichert",
-        None => "Speicher nicht lesbar",
+pub fn key_status_text(stored: Option<bool>) -> String {
+    key_status_line(stored, false)
+}
+
+/// Like [`key_status_text`], but a key that is stored and cannot be decrypted on this PC or user says so
+/// and asks for a new input instead of looking like an unreadable store.
+pub fn key_status_line(stored: Option<bool>, undecryptable: bool) -> String {
+    if undecryptable {
+        return tr("key.status.undecryptable");
     }
+    tr(match stored {
+        Some(true) => "key.status.stored",
+        Some(false) => "key.status.not_stored",
+        None => "key.status.unreadable",
+    })
 }
 
 /// Cost cell of a table row. A row where no request had a price shows only the note, not "$0.00".
@@ -351,10 +431,7 @@ pub fn logs_target(settings_path: Option<&Path>, env: Env) -> (PathBuf, Option<S
         if error.is_some() {
             return (
                 PathBuf::new(),
-                Some(format!(
-                    "Die Einstellungsdatei ist nicht lesbar, deshalb werden die Protokolle nicht gelesen. Bitte die Datei prüfen: {}",
-                    path.display()
-                )),
+                Some(tr_args("ui.logs_settings_unreadable", &[("path", &path.display().to_string())])),
             );
         }
         configured = settings.logs_root;
@@ -379,7 +456,7 @@ fn spawn_launch(mode: Mode, confirmed_close: bool, ctx: egui::Context) -> Receiv
         let msg = {
             let key = match mode {
                 Mode::Max => Ok(None),
-                Mode::ApiKey => KeyringStore::new().get(Slot::ApiKey),
+                Mode::ApiKey => key_store(crate::settings::default_path().ok().as_deref()).get(Slot::ApiKey),
             };
             match key {
                 Ok(key) => {
@@ -436,7 +513,7 @@ fn spawn_mode_poller(ctx: egui::Context) -> Arc<AtomicU8> {
             // The image name follows the Obsidian path from the settings.
             // Unknown image name (unreadable settings): keep the last answer.
             if let Some(image) = sys.current_image_name() {
-                // A failed check keeps the last answer instead of showing "geschlossen".
+                // A failed check keeps the last answer instead of showing "closed".
                 let answer = poll_answer(sys.obsidian_running(&image), last);
                 shared.store(proc_code(answer), Ordering::Relaxed);
                 if last != answer {
@@ -457,7 +534,7 @@ pub struct CerberusApp {
     launch_rx: Option<Receiver<LaunchMsg>>,
     paths: PathsPanel,
     control: Arc<WindowControl>,
-    store: KeyringStore,
+    store: Arc<dyn SecretStore + Send + Sync>,
     prices_as_of: String,
     tray: Option<Tray>,
     /// Names (never values) of routing variables that are set in this process's environment.
@@ -492,6 +569,13 @@ pub struct CerberusApp {
     grow: GrowState,
     /// Last state of the update checker and its dialogs.
     update: updates::UpdateUi,
+    /// The warning before keys are stored as plain text is open.
+    plaintext_confirm_open: bool,
+    /// Languages offered in the drawer and files that were skipped; read when the drawer opens.
+    languages: Vec<crate::i18n::LangInfo>,
+    lang_problems: Vec<crate::i18n::LangProblem>,
+    /// The drawer was open in the previous frame (a change to open triggers the folder scan).
+    drawer_was_open: bool,
 }
 
 /// A request younger than this may not have reached the window yet.
@@ -514,6 +598,8 @@ impl CerberusApp {
 
         let settings_path = crate::settings::default_path().ok();
         let (logs_root, logs_unavailable) = logs_target(settings_path.as_deref(), &real_env);
+        // Once per start, before anything reads a key: keys saved by v1.0.x move into the settings file.
+        let failed_moves = settings_path.as_deref().map(migrate_at_start).unwrap_or_default();
 
         let notify_ctx = ctx.clone();
         let snapshots = spawn_worker(
@@ -523,7 +609,7 @@ impl CerberusApp {
                 state_path: data_dir.join("scan_state.json"),
                 prices_path,
                 interval: DEFAULT_INTERVAL,
-                secrets: Arc::new(KeyringStore::new()),
+                secrets: key_store(settings_path.as_deref()),
                 http: Arc::new(UreqHttp::new()),
                 api_interval: DEFAULT_API_INTERVAL,
                 settings_path: crate::settings::default_path().ok(),
@@ -543,12 +629,18 @@ impl CerberusApp {
         );
         let obsidian_running = spawn_mode_poller(ctx);
 
-        let store = KeyringStore::new();
+        // Read once here; the per-frame code only looks at the cached flags.
+        let store = key_store(settings_path.as_deref());
         let mut state = AppState::new();
-        state.key_stored = key_stored(&store, Slot::ApiKey);
-        state.admin_key_stored = key_stored(&store, Slot::AdminKey);
-        state.settings_path = crate::settings::default_path().ok();
+        (state.key_stored, state.key_undecryptable) = key_check(&*store, Slot::ApiKey);
+        (state.admin_key_stored, state.admin_key_undecryptable) = key_check(&*store, Slot::AdminKey);
+        state.settings_path = settings_path.clone();
+        if let Some(text) = move_notice_text(&failed_moves) {
+            state.set_notice(Some(Notice { kind: NoticeKind::Error, text }));
+        }
         state.reload_settings();
+        // `main` already picked the language and scanned the folder; only the skipped files are taken over.
+        let lang_problems = crate::i18n::take_startup_problems();
         let paths = PathsPanel::new(&state.settings);
         let logo = cc.egui_ctx.load_texture(
             "logo",
@@ -583,6 +675,10 @@ impl CerberusApp {
             requested_at: None,
             grow: GrowState::default(),
             update: updates::UpdateUi::new(update_tx, update_rx, launch_flag),
+            plaintext_confirm_open: false,
+            languages: crate::i18n::available(),
+            lang_problems,
+            drawer_was_open: false,
         }
     }
 
@@ -609,6 +705,8 @@ impl CerberusApp {
             self.state.show_state_note_once(note.as_deref());
             self.state.reload_settings();
             self.paths.refresh(&self.state.settings);
+            let error = self.state.snapshot.as_ref().and_then(|s| s.settings_error.clone());
+            self.state.refresh_keys_if_settings_error_changed(error.as_deref(), &*self.store);
         }
         self.paths.poll_dialog();
         if self.update.poll() {
@@ -631,7 +729,7 @@ impl CerberusApp {
             };
             if let Some(msg) = received {
                 self.launch_rx = None;
-                // A waiting "Beenden" goes through now.
+                // A waiting "Quit" goes through now.
                 self.control.set_launch_busy(ctx, false);
                 let Some(msg) = msg else {
                     self.state.apply_launch_lost();
@@ -644,7 +742,7 @@ impl CerberusApp {
                         if started {
                             // Re-check once the grace period is over (the poller only reports changes).
                             ctx.request_repaint_after(START_GRACE + Duration::from_secs(1));
-                            // And once more for the "gestartet" notice to go away.
+                            // And once more for the "started" notice to go away.
                             ctx.request_repaint_after(STARTED_NOTICE_TTL + Duration::from_millis(200));
                         }
                     }
@@ -680,12 +778,6 @@ impl CerberusApp {
         }
     }
 
-    fn set_stored(&mut self, slot: Slot, stored: bool) {
-        match slot {
-            Slot::ApiKey => self.state.key_stored = Some(stored),
-            Slot::AdminKey => self.state.admin_key_stored = Some(stored),
-        }
-    }
 }
 
 
@@ -745,6 +837,7 @@ impl eframe::App for CerberusApp {
         self.draw_confirm(&ctx);
         let launch_running = self.launch_running();
         self.update.draw_confirm(&ctx, launch_running);
+        self.draw_plaintext_confirm(&ctx);
         self.text_focused_last_frame = ctx.egui_wants_keyboard_input();
     }
 }
@@ -796,11 +889,13 @@ impl CerberusApp {
             return;
         }
         match esc_target(
+            self.plaintext_confirm_open,
             self.update.confirm_is_open(),
             self.state.confirm.is_some(),
             self.drawer_open,
             self.detail.is_some(),
         ) {
+            EscTarget::PlaintextConfirm => self.plaintext_confirm_open = false,
             EscTarget::UpdateConfirm => self.update.cancel_confirm(),
             EscTarget::Confirm => self.state.confirm = None,
             EscTarget::Drawer => self.drawer_open = false,
@@ -892,7 +987,7 @@ impl CerberusApp {
             ui,
             mode_card_with_routing(self.state.mode, !self.routing_names.is_empty()),
             self.state.launching,
-            self.update.start_block_reason(),
+            self.update.start_block_reason().as_deref(),
         ) {
             self.start_launch(ctx, mode, false);
         }
@@ -910,7 +1005,7 @@ impl CerberusApp {
         let mut area_out = None;
         match self.state.snapshot.as_ref() {
             None => {
-                ui.label("Lese Protokolle …");
+                ui.label(tr("ui.reading_logs"));
             }
             Some(snapshot) => match &snapshot.report {
                 None => cockpit::scan_progress(ui, snapshot.scanned_files, snapshot.total_files),
@@ -945,14 +1040,17 @@ impl CerberusApp {
         }
 
         let api = self.state.snapshot.as_ref().and_then(|s| s.api.as_ref());
-        cockpit::api_line(ui, &api_card(self.state.admin_key_stored, api));
+        cockpit::api_line(ui, &api_card(self.state.admin_key_stored, self.state.admin_key_undecryptable, api));
         if let Some(snapshot) = self.state.snapshot.as_ref().filter(|s| s.report.is_some()) {
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!(
-                        "Stand: {} · Preisliste vom {} · Kosten sind {COST_NOTE}",
-                        format_time(snapshot.updated),
-                        self.prices_as_of
+                    RichText::new(tr_args(
+                        "ui.status_line",
+                        &[
+                            ("time", &format_time(snapshot.updated)),
+                            ("prices", &self.prices_as_of),
+                            ("note", &cost_note()),
+                        ],
                     ))
                     .small()
                     .color(MUTED),
@@ -969,14 +1067,14 @@ impl CerberusApp {
         let mut answer: Option<bool> = None;
         egui::Modal::new(egui::Id::unique("confirm-close")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Obsidian schließen?");
-            ui.label("Obsidian läuft und muss geschlossen werden. Laufende Claudian-Antworten brechen ab. Jetzt schließen?");
+            ui.heading(tr("confirm.close.title"));
+            ui.label(tr("confirm.close.body"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Ja, schließen").clicked() {
+                if ui.button(tr("confirm.close.yes")).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(tr("button.cancel")).clicked() {
                     answer = Some(false);
                 }
             });
@@ -993,7 +1091,7 @@ impl CerberusApp {
 }
 
 fn format_time(t: DateTime<Local>) -> String {
-    t.format("%d.%m.%Y %H:%M:%S").to_string()
+    format_time_by(&t, "format.datetime", "%Y-%m-%d %H:%M:%S")
 }
 
 // ---- startup -------------------------------------------------------------------------------------
@@ -1002,7 +1100,7 @@ fn data_dir() -> PathBuf {
     crate::cleanup::data_dir()
 }
 
-/// Opens the window and the tray icon and runs until "Beenden".
+/// Opens the window and the tray icon and runs until "Quit".
 pub fn run() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
         .expect("embedded icon is a valid PNG");
@@ -1210,10 +1308,160 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_notice_is_not_replaced_by_the_state_note() {
+        let mut s = AppState::new();
+        s.set_notice(Some(Notice { kind: NoticeKind::Error, text: "Umzug nicht gelungen, Key geht nicht verloren".to_string() }));
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "Umzug nicht gelungen, Key geht nicht verloren");
+        assert_eq!(s.notice.as_ref().unwrap().kind, NoticeKind::Error);
+        // The note was not used up: it shows once the notice is gone.
+        s.dismiss_notice();
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "alte Datei zur Seite gelegt");
+    }
+
+    #[test]
+    fn key_flags_follow_the_store_after_each_action() {
+        use std::cell::RefCell;
+        struct Scripted(RefCell<Result<Option<String>, SecretError>>);
+        impl SecretStore for Scripted {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                self.0.borrow().clone()
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        let store = Scripted(RefCell::new(Err(SecretError::NotDecryptable)));
+        let mut s = AppState::new();
+        s.refresh_keys(&store);
+        assert!(s.key_undecryptable && s.admin_key_undecryptable);
+        assert_eq!(s.key_stored, None);
+        // A new key was saved: the amber message must go.
+        *store.0.borrow_mut() = Ok(Some("x".to_string()));
+        s.refresh_keys(&store);
+        assert!(!s.key_undecryptable && !s.admin_key_undecryptable);
+        assert_eq!(s.key_stored, Some(true));
+        // Deleted.
+        *store.0.borrow_mut() = Ok(None);
+        s.refresh_keys(&store);
+        assert_eq!((s.key_stored, s.admin_key_stored), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn key_flags_are_read_again_only_when_the_settings_problem_changes() {
+        use std::cell::Cell;
+        struct Counting(Cell<u32>, Cell<bool>);
+        impl SecretStore for Counting {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                self.0.set(self.0.get() + 1);
+                if self.1.get() { Err(SecretError::ConfigUnreadable) } else { Ok(Some("x".to_string())) }
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        let store = Counting(Cell::new(0), Cell::new(false));
+        let mut s = AppState::new();
+        // Snapshots without a problem: nothing to read, however many arrive.
+        for _ in 0..5 {
+            assert!(!s.refresh_keys_if_settings_error_changed(None, &store));
+        }
+        assert_eq!(store.0.get(), 0);
+        // The file breaks: one read of both slots, then quiet while the same problem stays.
+        store.1.set(true);
+        assert!(s.refresh_keys_if_settings_error_changed(Some("kaputt"), &store));
+        assert_eq!((s.key_stored, s.admin_key_stored), (None, None));
+        let reads = store.0.get();
+        assert_eq!(reads, 2);
+        for _ in 0..5 {
+            assert!(!s.refresh_keys_if_settings_error_changed(Some("kaputt"), &store));
+        }
+        assert_eq!(store.0.get(), reads);
+        // The file is repaired: the flags follow at once, without a restart.
+        store.1.set(false);
+        assert!(s.refresh_keys_if_settings_error_changed(None, &store));
+        assert_eq!((s.key_stored, s.admin_key_stored), (Some(true), Some(true)));
+        assert_eq!(store.0.get(), reads + 2);
+    }
+
+    #[test]
+    fn key_field_says_when_a_key_cannot_be_read() {
+        let text = key_status_line(None, true);
+        assert!(text.contains("nicht entschlüsselbar") && text.contains("neu eingeben"), "{text}");
+        assert_ne!(text, key_status_text(None), "not the generic unreadable-store text");
+        assert_eq!(key_status_line(Some(true), false), "gespeichert");
+        assert_eq!(key_status_line(None, false), "Speicher nicht lesbar");
+    }
+
+    #[test]
+    fn a_foreign_key_is_told_apart_from_an_unreadable_store() {
+        struct Scripted(SecretError);
+        impl SecretStore for Scripted {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                Err(self.0)
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        assert_eq!(key_check(&Scripted(SecretError::NotDecryptable), Slot::ApiKey), (None, true));
+        assert_eq!(key_check(&Scripted(SecretError::ConfigUnreadable), Slot::ApiKey), (None, false));
+    }
+
+    #[test]
+    fn missing_language_file_leaves_the_config_alone() {
+        crate::i18n::isolate();
+        let dir = std::env::temp_dir().join(format!("cu-startup-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let raw = br#"{"language":"xx","check_updates":false}"#;
+        std::fs::write(&path, raw).unwrap();
+        let (settings, error) = crate::settings::load(&path);
+        assert!(error.is_none());
+        assert_eq!(settings.language.as_deref(), Some("xx"));
+
+        // No lang folder next to the test either.
+        let problems = crate::i18n::apply_startup(settings.language.as_deref(), Some(&dir.join("lang")));
+        assert!(problems.is_empty());
+        // Falls back to a shipped language and keeps answering.
+        let code = crate::i18n::current_code();
+        assert!(code == "de" || code == "en", "{code}");
+        assert!(!crate::i18n::tr("format.date").is_empty());
+        assert_ne!(crate::i18n::tr("format.date"), "format.date");
+        // The choice stays in the file, byte for byte, so it returns with the language file.
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn key_status_distinguishes_unreadable_from_missing() {
         assert_eq!(key_status_text(Some(true)), "gespeichert");
         assert_eq!(key_status_text(Some(false)), "nicht gespeichert");
         assert_eq!(key_status_text(None), "Speicher nicht lesbar");
+    }
+
+    #[test]
+    fn move_notice_names_the_key_type_only_and_tells_the_two_cases_apart() {
+        assert_eq!(move_notice_text(&MigrationResult::default()), None);
+        let unmoved = move_notice_text(&MigrationResult { not_moved: vec![Slot::AdminKey], old_entry_left: vec![] }).unwrap();
+        assert!(unmoved.contains("Admin-Key") && !unmoved.contains("API-Key") && !unmoved.contains("sk-ant"));
+        assert!(unmoved.contains("versucht es erneut") && !unmoved.contains("Deinstallation"));
+        let left = move_notice_text(&MigrationResult { not_moved: vec![], old_entry_left: vec![Slot::ApiKey] }).unwrap();
+        assert!(left.contains("API-Key") && left.contains("übernommen") && left.contains("Deinstallation"));
+        assert!(!left.contains("erneut"), "no retry is promised for a leftover: {left}");
+        let both = move_notice_text(&MigrationResult { not_moved: vec![Slot::ApiKey, Slot::AdminKey], old_entry_left: vec![] }).unwrap();
+        assert!(both.contains("API-Key und Admin-Key"));
     }
 
     #[test]
