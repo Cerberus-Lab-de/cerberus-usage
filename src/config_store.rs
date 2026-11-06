@@ -207,18 +207,36 @@ enum Move {
     /// Nothing to do: no legacy entry, or the config already has a key for the slot.
     Skipped,
     Moved,
+    /// The key is safely in the config, but the old entry could not be deleted.
+    OldEntryLeft,
     Failed,
 }
 
+/// Outcome of [`migrate_keys`]. Both lists are empty when everything moved or there was nothing to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MigrationResult {
+    /// Keys that could not be moved; the old entry is still the one in use and the next start retries.
+    pub not_moved: Vec<Slot>,
+    /// Keys that were moved and verified, but whose old entry could not be removed. No retry; the
+    /// leftover goes away on uninstall.
+    pub old_entry_left: Vec<Slot>,
+}
+
+impl MigrationResult {
+    pub fn is_empty(&self) -> bool {
+        self.not_moved.is_empty() && self.old_entry_left.is_empty()
+    }
+}
+
 /// Moves keys from the old credential-store entries into the settings file, once per key.
-/// Returns the slots whose move did not complete; their legacy entries are kept and the next start
-/// tries again. Quiet (empty result, no write) when there is nothing to move.
+/// Reports slots whose move did not complete (legacy entry kept, the next start tries again) apart
+/// from slots that moved but left the old entry behind. Quiet (empty result, no write) when there is nothing to move.
 ///
 /// Per slot: a key already in the config wins and the legacy entry stays untouched. Otherwise the
 /// legacy value is written in the form `keys_plaintext` asks for, read back from the file and
 /// compared, and only then is the legacy entry deleted. A broken config means no move at all (the
 /// broken file is reported on its own) and returns an empty list.
-pub fn migrate_keys(legacy: &dyn SecretStore, config: &ConfigStore) -> Vec<Slot> {
+pub fn migrate_keys(legacy: &dyn SecretStore, config: &ConfigStore) -> MigrationResult {
     migrate_with(legacy, config, verified_in_file)
 }
 
@@ -238,17 +256,19 @@ fn migrate_with(
     legacy: &dyn SecretStore,
     config: &ConfigStore,
     verify: impl Fn(&Path, Slot, &str) -> bool,
-) -> Vec<Slot> {
+) -> MigrationResult {
+    let mut result = MigrationResult::default();
     if settings::load(&config.path).1.is_some() {
-        return Vec::new();
+        return result;
     }
-    let mut failed = Vec::new();
     for slot in [Slot::ApiKey, Slot::AdminKey] {
-        if let Move::Failed = migrate_slot(legacy, config, slot, &verify) {
-            failed.push(slot);
+        match migrate_slot(legacy, config, slot, &verify) {
+            Move::Failed => result.not_moved.push(slot),
+            Move::OldEntryLeft => result.old_entry_left.push(slot),
+            Move::Skipped | Move::Moved => {}
         }
     }
-    failed
+    result
 }
 
 fn migrate_slot(
@@ -297,7 +317,7 @@ fn migrate_slot(
     }
     match legacy.delete(slot) {
         Ok(()) => Move::Moved,
-        Err(_) => Move::Failed,
+        Err(_) => Move::OldEntryLeft,
     }
 }
 
@@ -642,7 +662,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("settings.json.tmp")).unwrap();
         let legacy = legacy_with_both();
         let failed = migrate_keys(&legacy, &ConfigStore::new(path.clone()));
-        assert_eq!(failed, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert_eq!(failed.not_moved, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert!(failed.old_entry_left.is_empty());
         assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
         assert!(!path.exists());
     }
@@ -653,7 +674,8 @@ mod tests {
         let legacy = legacy_with_both();
         let config = ConfigStore::new(path.clone());
         let failed = migrate_with(&legacy, &config, |_, _, _| false);
-        assert_eq!(failed, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert_eq!(failed.not_moved, vec![Slot::ApiKey, Slot::AdminKey]);
+        assert!(failed.old_entry_left.is_empty());
         assert!(legacy.inner.has(Slot::ApiKey) && legacy.inner.has(Slot::AdminKey));
         let (s, err) = settings::load(&path);
         assert!(err.is_none() && s.api_key.is_none() && s.admin_key.is_none());
@@ -707,7 +729,8 @@ mod tests {
         let (_d, path) = temp();
         let legacy = ScriptedLegacy { fail_get: Some(Slot::ApiKey), ..legacy_with_both() };
         let config = ConfigStore::new(path);
-        assert_eq!(migrate_keys(&legacy, &config), vec![Slot::ApiKey]);
+        let result = migrate_keys(&legacy, &config);
+        assert_eq!((result.not_moved, result.old_entry_left), (vec![Slot::ApiKey], vec![]));
         assert!(legacy.inner.has(Slot::ApiKey));
         assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
         assert!(!legacy.inner.has(Slot::AdminKey));
@@ -715,11 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_legacy_delete_is_reported_and_loses_nothing() {
+    fn a_failing_legacy_delete_is_reported_as_leftover_not_as_unmoved() {
         let (_d, path) = temp();
         let legacy = ScriptedLegacy { fail_delete: Some(Slot::AdminKey), ..legacy_with_both() };
         let config = ConfigStore::new(path);
-        assert_eq!(migrate_keys(&legacy, &config), vec![Slot::AdminKey]);
+        assert_eq!(
+            migrate_keys(&legacy, &config),
+            MigrationResult { not_moved: vec![], old_entry_left: vec![Slot::AdminKey] }
+        );
         assert_eq!(config.get(Slot::AdminKey).unwrap().as_deref(), Some(ADMIN));
         assert!(legacy.inner.has(Slot::AdminKey));
     }

@@ -28,7 +28,7 @@ use crate::paths_ui::PathsPanel;
 use crate::pricing::{PriceTable, format_usd};
 use crate::report::Bucket;
 use crate::settings::Settings;
-use crate::config_store::{ConfigStore, KeyStore, migrate_keys};
+use crate::config_store::{ConfigStore, KeyStore, MigrationResult, migrate_keys};
 use crate::secrets::{KeyringStore, SecretError, SecretStore, Slot, validate_key};
 use crate::tray::{CloseAction, Tray, WindowControl, icon_state, tooltip};
 use crate::view::{
@@ -300,21 +300,28 @@ fn key_store(settings_path: Option<&Path>) -> Arc<dyn SecretStore + Send + Sync>
     }
 }
 
-/// Runs the one-time key move for the settings file at `path`; returns the slots that did not move.
-fn migrate_at_start(path: &Path) -> Vec<Slot> {
+/// Runs the one-time key move for the settings file at `path`; returns what did not move cleanly.
+fn migrate_at_start(path: &Path) -> MigrationResult {
     migrate_keys(&KeyringStore::new(), &ConfigStore::new(path.to_path_buf()))
 }
 
-/// Notice for keys that could not be moved. Names the key type only, never a value.
-fn move_notice_text(failed: &[Slot]) -> Option<String> {
-    if failed.is_empty() {
-        return None;
+/// Notice for keys that did not move cleanly. Names the key type only, never a value.
+fn move_notice_text(result: &MigrationResult) -> Option<String> {
+    let names = |slots: &[Slot]| slots.iter().map(|&s| key_label(s)).collect::<Vec<_>>().join(" und ");
+    let mut parts = Vec::new();
+    if !result.not_moved.is_empty() {
+        parts.push(format!(
+            "Der Umzug von {} aus dem Windows-Tresor ist nicht gelungen. Der Schlüssel geht nicht verloren und wird weiter genutzt, der nächste Start versucht es erneut.",
+            names(&result.not_moved)
+        ));
     }
-    let names: Vec<&str> = failed.iter().map(|&s| key_label(s)).collect();
-    Some(format!(
-        "Der Umzug von {} aus dem Windows-Tresor ist nicht vollständig gelungen. Der Schlüssel geht nicht verloren und wird weiter genutzt, der nächste Start versucht es erneut.",
-        names.join(" und ")
-    ))
+    if !result.old_entry_left.is_empty() {
+        parts.push(format!(
+            "{} wurde übernommen, der alte Eintrag im Windows-Tresor ließ sich aber nicht entfernen. Er bleibt ungenutzt liegen und verschwindet bei der Deinstallation.",
+            names(&result.old_entry_left)
+        ));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
 /// Presence check only; the value is dropped immediately.
@@ -1250,11 +1257,15 @@ mod tests {
     }
 
     #[test]
-    fn move_notice_names_the_key_type_only() {
-        assert_eq!(move_notice_text(&[]), None);
-        let one = move_notice_text(&[Slot::AdminKey]).unwrap();
-        assert!(one.contains("Admin-Key") && !one.contains("API-Key") && !one.contains("sk-ant"));
-        let both = move_notice_text(&[Slot::ApiKey, Slot::AdminKey]).unwrap();
+    fn move_notice_names_the_key_type_only_and_tells_the_two_cases_apart() {
+        assert_eq!(move_notice_text(&MigrationResult::default()), None);
+        let unmoved = move_notice_text(&MigrationResult { not_moved: vec![Slot::AdminKey], old_entry_left: vec![] }).unwrap();
+        assert!(unmoved.contains("Admin-Key") && !unmoved.contains("API-Key") && !unmoved.contains("sk-ant"));
+        assert!(unmoved.contains("versucht es erneut") && !unmoved.contains("Deinstallation"));
+        let left = move_notice_text(&MigrationResult { not_moved: vec![], old_entry_left: vec![Slot::ApiKey] }).unwrap();
+        assert!(left.contains("API-Key") && left.contains("übernommen") && left.contains("Deinstallation"));
+        assert!(!left.contains("erneut"), "no retry is promised for a leftover: {left}");
+        let both = move_notice_text(&MigrationResult { not_moved: vec![Slot::ApiKey, Slot::AdminKey], old_entry_left: vec![] }).unwrap();
         assert!(both.contains("API-Key und Admin-Key"));
     }
 
