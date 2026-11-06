@@ -45,10 +45,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 german.TaskAutostart=Cerberus Usage mit Windows starten
 german.RunApp=Cerberus Usage starten
-german.AskRemoveData=Einstellungen, Zählerstand und gespeicherte Keys ebenfalls entfernen?
+german.AskRemoveData=Einstellungen, Zählerstand, gespeicherte Keys und eigene Sprachdateien ebenfalls entfernen?
 english.TaskAutostart=Start Cerberus Usage with Windows
 english.RunApp=Start Cerberus Usage
-english.AskRemoveData=Also remove settings, balance data and stored keys?
+english.AskRemoveData=Also remove settings, balance data, stored keys and your own language files?
 german.CleanupFailed=Einstellungen oder gespeicherte Keys konnten nicht vollständig entfernt werden. Bitte prüfen: Ordner AppData\Local\CerberusUsage und im Windows-Anmeldeinformationsspeicher die Einträge „cerberus-usage“.
 english.CleanupFailed=Settings or stored keys could not be removed completely. Please check the folder AppData\Local\CerberusUsage and the "cerberus-usage" entries in the Windows Credential Manager.
 

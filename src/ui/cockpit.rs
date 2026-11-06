@@ -398,7 +398,7 @@ mod tests {
         let no_deduction = figures(&report(), &estimate(false), true);
         assert_eq!(no_deduction[2].lines, [("geschätzt · ohne Kostenabzug".to_string(), true)]);
         let hint = figures(&report(), &estimate(true), true);
-        assert_eq!(hint[2].lines, [("geschätzt · Hinweis".to_string(), true)]);
+        assert_eq!(hint[2].lines, [("geschätzt · siehe Details".to_string(), true)]);
         assert_eq!(figures(&report(), &estimate(true), false)[2].lines, [("geschätzt".to_string(), false)]);
     }
 

@@ -25,7 +25,7 @@ Windows 10/11 x86-64 only, MIT licensed, no telemetry. The interface comes in En
 
 **SmartScreen:** the installer is not signed with a Windows certificate (that costs money and is a separate decision). Windows therefore shows "Windows protected your PC" on first run. Click **More info → Run anyway**. If you want to check what you are running, build the app from source (see below).
 
-**Uninstall:** Windows → Apps → Cerberus Usage. The uninstaller asks whether the settings (`settings.json`, which also holds your stored keys), the scan state and the `lang` folder should be removed too. If you answer "Yes", it also deletes the old Credential Manager entries `cerberus-usage` that version 1.0.x may have left. If you answer "No" (and on a silent uninstall), all of this stays. The developer's release signing key (see below) is never touched.
+**Uninstall:** Windows → Apps → Cerberus Usage. The uninstaller asks whether the settings (`settings.json`, which also holds your stored keys), the scan state and the `lang` folder should be removed too (including language files you added yourself). If you answer "Yes", it also deletes the old Credential Manager entries `cerberus-usage` that version 1.0.x may have left. If you answer "No" (and on a silent uninstall), the settings, the keys and your own language files stay; the shipped language files (`de.json`, `en.json`) go with the app. The developer's release signing key (see below) is never touched.
 
 ## Updates and signature
 
@@ -54,10 +54,11 @@ If you want to take your keys to another PC, or want a file you can read yoursel
 1. On the old PC, turn on "Store keys as plain text".
 2. Copy `settings.json` to `%LOCALAPPDATA%\CerberusUsage\` on the new PC.
 3. On the new PC, turn "Store keys as plain text" off again.
+4. On the old PC, turn it off again too, otherwise the keys stay readable there.
 
 A file with encrypted keys from another PC or user cannot be decrypted. The app then marks the key as unusable and asks you to enter it again; nothing is overwritten.
 
-**Moving from version 1.0.x:** on the first start of 1.1.0, the app moves your keys from the Windows Credential Manager (service `cerberus-usage`) into `settings.json` on its own, encrypted. The old entry is deleted only after the new one was read back and matched. If a step fails, the old entry stays, a banner says so, and the next start tries again. If `settings.json` itself is broken, nothing is moved. The release signing key is a different thing: it belongs to the developer, stays in the Credential Manager under `cerberus-usage-release` and has nothing to do with these settings.
+**Moving from version 1.0.x:** on the first start of 1.1.0, the app moves your keys from the Windows Credential Manager (service `cerberus-usage`) into `settings.json` on its own, encrypted. The old entry is deleted only after the new one was read back and matched. If a step fails, the old entry stays, a banner says so, and the next start tries again. If a key could not be moved, the next start tries again. If only the old entry could not be removed, the key is already moved: the old entry stays unused and goes away when the data is removed on uninstall. If `settings.json` itself is broken, nothing is moved. The release signing key is a different thing: it belongs to the developer, stays in the Credential Manager under `cerberus-usage-release` and has nothing to do with these settings.
 
 ### Where is the data?
 
@@ -68,7 +69,7 @@ Under `%LOCALAPPDATA%\CerberusUsage\`:
 - `crash.log`: small text file with time, location and message on crashes
 - `prices.json` (optional): your own price list, overrides the built-in one
 
-If `settings.json` is broken, the app shows a message with the path, blocks saving so that the file is not overwritten, and has no keys available until the file is repaired. The keys are not lost in that case.
+If `settings.json` is broken, the app shows a message with the path, blocks saving so that the file is not overwritten, and has no keys available until the file is repaired. The keys are not lost in that case, but deleting the file would delete them too: repair it instead.
 
 The language files are not in this folder but in `lang` next to the app, see [Languages](#languages).
 
@@ -90,15 +91,17 @@ German and English ship with the app. Further languages are plain files: the app
 - A text may contain `{placeholders}` in curly braces; the app fills them in. Keep them as in the original.
 - Keys starting with `format.` hold patterns and separators (date and time patterns, the thousands separator), not texts. Amounts stay in USD with a decimal point in every language.
 - A text can have the endings `.one` and `.other` for singular and plural; without `.one`, `.other` is used.
-- A missing key falls back to English, and a key missing there is shown as its name.
+- A missing key falls back to English, and a key missing there is shown as its name. A text that is empty (or only blanks) counts as missing; only `format.thousands` may be a blank on purpose.
 
 **Add a language:** copy `en.json` in the `lang` folder, give the copy a new name, set a new `_meta.code` and `_meta.name`, translate the values, and reopen the settings drawer. The new language appears in the choice without a restart of the app.
 
 **Updates overwrite `de.json` and `en.json`.** The installer replaces these two files on every update, so changes you make to them are lost. For a lasting custom version, make a copy with its own code (for example `de-custom`) and edit that one. Your own files are left alone by updates.
 
-**Broken files never stop the app.** A file that is not valid JSON, has no valid `_meta`, is not UTF-8 or is larger than 1 MB is skipped, and the settings drawer says which file and why. A language code that two files provide is loaded once, from the first file. The built-in German and English keep working without the folder.
+**Only use language files you trust.** A language file controls every text of the app, including warnings, security notes and cost hints, and the app cannot tell whether a translation is faithful. A file from someone else can, for example, swap the labels of two buttons or leave out the note that costs are estimates.
 
-**Fonts:** Latin scripts with umlauts are covered; languages using other scripts may show empty boxes.
+**Broken files never stop the app.** The app reads at most 100 files from the folder and says so in the settings drawer if there are more. A file that is not valid JSON, has no valid `_meta`, is not UTF-8, is larger than 1 MB or has a single text longer than 4 KB is skipped, and the settings drawer says which file and why. A language code that two files provide is loaded once, from the first file. The built-in German and English keep working without the folder.
+
+**Fonts:** Latin, Cyrillic, Greek, Chinese, Japanese and Korean display correctly if Windows has a matching font. Right-to-left scripts such as Arabic and Hebrew and scripts that need letter shaping such as Hindi do not display correctly yet.
 
 ## Other paths
 
