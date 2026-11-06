@@ -45,7 +45,7 @@ pub fn banner_items(input: &BannerInput) -> Vec<(Tone, String)> {
         items.push((Tone::Amber, text.clone()));
     }
     if let Some(err) = input.scan_error {
-        items.push((Tone::Amber, format!("Fehler beim Lesen der Protokolle: {err}")));
+        items.push((Tone::Amber, scan_error_text(err)));
     }
     if let Some(err) = input.settings_error {
         let place = input.settings_path.map(|p| format!(". Datei: {}", p.display())).unwrap_or_default();
@@ -64,6 +64,16 @@ pub fn banner_items(input: &BannerInput) -> Vec<(Tone, String)> {
         items.push((tone, notice.text.clone()));
     }
     items
+}
+
+/// Banner text for the worker's error. Reading problems get the reading prefix; a failed save
+/// already says what failed and must not be called a reading error.
+fn scan_error_text(err: &str) -> String {
+    if err.starts_with("Zustand konnte nicht gespeichert werden") {
+        err.to_string()
+    } else {
+        format!("Fehler beim Lesen der Protokolle: {err}")
+    }
 }
 
 /// Fill, stroke and text colour of a banner; the text has at least 4.5:1 against its fill.
@@ -148,6 +158,15 @@ mod tests {
         assert!(texts[6].starts_with("Monatsbudget erreicht"));
         assert!(texts[7].starts_with("Guthaben (geschätzt) unter"));
         assert_eq!(texts[8], "gestartet");
+    }
+
+    #[test]
+    fn a_failed_save_is_not_called_a_reading_error() {
+        let save = "Zustand konnte nicht gespeichert werden: Zugriff verweigert (os error 5)";
+        let items = banner_items(&BannerInput { scan_error: Some(save), ..empty() });
+        assert_eq!(items[0].1, save);
+        let read = banner_items(&BannerInput { scan_error: Some("Ordner fehlt"), ..empty() });
+        assert_eq!(read[0].1, "Fehler beim Lesen der Protokolle: Ordner fehlt");
     }
 
     #[test]

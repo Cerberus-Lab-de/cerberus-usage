@@ -784,6 +784,8 @@ mod tests {
 
         // Once the gap is over, it is written (all records, not just the new one).
         assert!(tick(&cfg, &mut core, &tx, &|| {}, t0 + SAVE_INTERVAL + Duration::from_secs(1)));
+        let last = drain(&rx).into_iter().last().unwrap();
+        assert_eq!(last.scan_error, None, "saving the state must not come back with an error");
         assert!(!core.state.dirty);
         assert_eq!(load_state(&cfg.state_path).records.len(), 2);
     }

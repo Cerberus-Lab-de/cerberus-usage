@@ -103,11 +103,11 @@ pub fn save(path: &Path, settings: &Settings) -> io::Result<()> {
     let tmp = PathBuf::from(tmp);
     let result = (|| {
         let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::io_retry::retry_transient(|| std::fs::File::create(&tmp))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        crate::io_retry::retry_transient(|| std::fs::rename(&tmp, path))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

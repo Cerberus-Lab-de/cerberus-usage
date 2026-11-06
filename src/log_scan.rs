@@ -445,7 +445,7 @@ pub struct LoadedState {
 /// rebuilds from the logs; the note tells the user, since records of already deleted logs are
 /// only in the `.bad` copy. An older version is upgraded (see [`STATE_VERSION`]).
 pub fn load_state_checked(path: &Path) -> LoadedState {
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::io_retry::retry_transient(|| std::fs::read(path)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return LoadedState { state: ScanState::default(), note: None };
@@ -492,12 +492,13 @@ pub fn save_state(path: &Path, state: &ScanState) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let result = (|| {
-        let file = std::fs::File::create(&tmp)?;
+        let file = crate::io_retry::retry_transient(|| std::fs::File::create(&tmp))?;
         let mut writer = io::BufWriter::new(file);
         serde_json::to_writer(&mut writer, state).map_err(io::Error::other)?;
         let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        drop(file);
+        crate::io_retry::retry_transient(|| std::fs::rename(&tmp, path))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

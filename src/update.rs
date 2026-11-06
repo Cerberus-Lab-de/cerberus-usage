@@ -447,7 +447,8 @@ pub fn download_verified_with_hash(
     remove_old_installers(dir);
     let target = dir.join(&manifest.file);
     let tmp = dir.join(format!("{}.part", manifest.file));
-    let written = std::fs::write(&tmp, &installer).and_then(|()| std::fs::rename(&tmp, &target));
+    let written = std::fs::write(&tmp, &installer)
+        .and_then(|()| crate::io_retry::retry_transient(|| std::fs::rename(&tmp, &target)));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(io_err(e));
