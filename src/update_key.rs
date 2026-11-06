@@ -1,7 +1,12 @@
 //! Public half of the release signing key, compiled into the app.
 //!
-//! The release process sets this to the key printed by `sign-release keygen`.
-//! While it is `None`, `update::verify_with_compiled_key` refuses every update
-//! with `UpdateError::NoKey`. Only the PUBLIC key belongs here.
+//! The value printed by `sign-release keygen`. Without a key, `update::verify_with_compiled_key`
+//! refuses every update with `UpdateError::NoKey`, and `sign-release sign` refuses to sign with
+//! a key that does not match this one. Only the PUBLIC key belongs here.
 
-pub const RELEASE_PUBLIC_KEY: Option<[u8; 32]> = None;
+pub const RELEASE_PUBLIC_KEY: Option<[u8; 32]> = Some([
+    0x33, 0x75, 0xcc, 0x88, 0x15, 0xbf, 0xfd, 0x69,
+    0x19, 0xc1, 0xb0, 0xd0, 0xaa, 0x8b, 0x66, 0xab,
+    0x1c, 0xf8, 0xf0, 0xcc, 0xb6, 0xee, 0xb7, 0x5f,
+    0x35, 0x60, 0x06, 0xd4, 0xb7, 0x72, 0x1b, 0xa6,
+]);
