@@ -185,8 +185,7 @@ function Invoke-RemappedCargo([string[]]$cargoArgs) {
         else { $env:CARGO_ENCODED_RUSTFLAGS = $saved }
     }
 }
-# A running copy from target
-elease locks the exe and makes this step fail: quit it first.
+# A running copy from target\release locks the exe and makes this step fail: quit it first.
 Invoke-RemappedCargo @('build', '--release', '--locked')
 $exe = Join-Path $targetDir 'release\cerberus-usage.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Build-Ergebnis fehlt: $exe" }
