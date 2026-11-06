@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 
 use chrono::{Local, Utc};
 use eframe::egui::{
@@ -14,12 +15,15 @@ use eframe::egui::{
 };
 
 use super::theme::palette::{AMBER, BG, CYAN, MUTED, TEXT};
-use super::{CerberusApp, Notice, NoticeKind, amount_input, key_field_id, key_label, key_status_text, wipe_key_field};
-use crate::cards::{inert_limits_hint, should_commit, update_settings, with_baseline, with_limits, with_topup, without_topup};
+use super::{CerberusApp, Notice, NoticeKind, amount_input, key_field_id, key_label, key_status_line, wipe_key_field};
+use crate::cards::{
+    inert_limits_hint, should_commit, update_settings, with_baseline, with_chosen_language, with_limits, with_topup,
+    without_topup,
+};
 use crate::paths_ui::{PathsAction, RowNote};
 use crate::pricing::format_usd;
 use crate::secrets::Slot;
-use crate::settings::TopUp;
+use crate::settings::{Settings, TopUp};
 use crate::view::drawer_width;
 
 /// Fill of the drawer panel (a shade lighter than the cockpit behind the backdrop).
@@ -48,6 +52,8 @@ pub enum NoteKey {
     Obsidian,
     Logs,
     Updates,
+    Language,
+    Plaintext,
 }
 
 pub type Notes = HashMap<NoteKey, Notice>;
@@ -79,13 +85,53 @@ impl SettingsAction {
     }
 }
 
-/// "Einstellungen: <path> · Keys: …". Never contains a key; says why when there is no path.
-pub fn footer_text(settings_path: Option<&Path>) -> String {
+/// "Einstellungen: <path> · Keys: in dieser Datei, …". Never contains a key; says why when there is no path.
+pub fn footer_text(settings_path: Option<&Path>, keys_plaintext: bool) -> String {
     let place = match settings_path {
         Some(p) => p.display().to_string(),
         None => "nicht verfügbar (LOCALAPPDATA ist nicht gesetzt)".to_string(),
     };
-    format!("Einstellungen: {place} · Keys: Windows-Anmeldeinformationsspeicher")
+    let form = if keys_plaintext { "im Klartext" } else { "verschlüsselt" };
+    format!("Einstellungen: {place} · Keys: in dieser Datei, {form}")
+}
+
+/// Warning shown before keys are written as plain text. Says what changes and what the default protects against.
+pub const PLAINTEXT_WARNING: &str = "Die Keys stehen danach lesbar in der Einstellungsdatei, auch in Backups und Kopien. Wer die Datei bekommt, kann die Keys benutzen. Dafür lässt sich die Datei auf einen anderen PC mitnehmen. Beide gespeicherten Keys werden sofort umgewandelt.";
+
+/// Under the switch: the default and its honest limit.
+pub const PLAINTEXT_HINT: &str = "Standard ist verschlüsselt (Windows, nur dieser Benutzer auf diesem PC). Das schützt davor, dass die Datei mitgenommen oder versehentlich geteilt wird. Programme, die unter deinem Windows-Benutzer laufen, können die Keys trotzdem lesen. Für einen Umzug auf einen anderen PC: Klartext einschalten, Datei kopieren, dort wieder ausschalten.";
+
+/// Applies a language choice: the language changes at once for this session; saving it into the
+/// settings file is a second step that may fail (broken file, no path). On failure the text says that
+/// the choice only holds until the app is closed.
+pub fn choose_language(settings_path: Option<&Path>, code: &str) -> Result<Settings, String> {
+    crate::i18n::set_language(Some(code));
+    let Some(path) = settings_path else {
+        return Err("Die Sprache gilt nur bis zum Beenden der App. Einstellungen sind nicht verfügbar.".to_string());
+    };
+    update_settings(path, |s| Ok(with_chosen_language(s, code)))
+        .map_err(|e| format!("Die Sprache gilt nur bis zum Beenden der App, gespeichert wurde sie nicht. {e}"))
+}
+
+/// The command that opens a folder in Explorer. The folder is one plain argument, never a shell string.
+pub fn explorer_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("explorer.exe");
+    cmd.arg(dir);
+    cmd
+}
+
+/// Creates the folder if it is missing and returns the command that opens it.
+pub fn open_folder_command(dir: &Path) -> Result<Command, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Der Sprachordner lässt sich nicht anlegen ({}).", e.kind()))?;
+    Ok(explorer_command(dir))
+}
+
+fn open_lang_folder() -> Result<(), String> {
+    let dir = crate::i18n::app_lang_dir().ok_or_else(|| "Der Sprachordner ist nicht bekannt.".to_string())?;
+    open_folder_command(&dir)?
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Der Explorer lässt sich nicht starten ({}).", e.kind()))
 }
 
 /// Cubic ease-out of the slide.
@@ -206,6 +252,72 @@ impl CerberusApp {
         }
     }
 
+    /// Reads the language folder again. Only when the drawer opens, never per frame.
+    fn rescan_languages(&mut self) {
+        self.lang_problems = crate::i18n::app_lang_dir().as_deref().map(crate::i18n::scan_folder).unwrap_or_default();
+        self.languages = crate::i18n::available();
+    }
+
+    fn apply_language(&mut self, code: &str) {
+        match choose_language(self.state.settings_path.as_deref(), code) {
+            Ok(settings) => {
+                self.state.settings = settings;
+                self.notes.remove(&NoteKey::Language);
+            }
+            Err(text) => self.set_note(NoteKey::Language, NoticeKind::Error, text),
+        }
+    }
+
+    /// Switches how keys are stored, at once, in both directions. On error nothing changed.
+    fn apply_plaintext(&mut self, on: bool) {
+        let Some(path) = self.state.settings_path.clone() else {
+            self.set_note(NoteKey::Plaintext, NoticeKind::Error, "Einstellungen sind nicht verfügbar.");
+            return;
+        };
+        match crate::config_store::set_plaintext(&path, on) {
+            Ok(settings) => {
+                self.state.settings = settings;
+                let text = if on {
+                    "Die Keys stehen jetzt im Klartext in der Einstellungsdatei."
+                } else {
+                    "Die Keys sind jetzt verschlüsselt gespeichert."
+                };
+                self.set_note(NoteKey::Plaintext, NoticeKind::Info, text);
+            }
+            Err(text) => self.set_note(NoteKey::Plaintext, NoticeKind::Error, text),
+        }
+    }
+
+    /// The warning before plain text is switched on, in the style of the update confirmation.
+    pub(super) fn draw_plaintext_confirm(&mut self, ctx: &egui::Context) {
+        if !self.plaintext_confirm_open {
+            return;
+        }
+        let mut answer = None;
+        egui::Modal::new(egui::Id::unique("confirm-plaintext")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Keys im Klartext speichern?");
+            ui.label(PLAINTEXT_WARNING);
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Im Klartext speichern").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Abbrechen").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        match answer {
+            Some(true) => {
+                self.plaintext_confirm_open = false;
+                self.apply_plaintext(true);
+            }
+            Some(false) => self.plaintext_confirm_open = false,
+            None => {}
+        }
+    }
+
     /// "Nach Updates suchen" applies at once, through the same safe save as every other setting.
     fn apply_check_updates(&mut self, on: bool) {
         let Some(path) = self.state.settings_path.clone() else {
@@ -273,6 +385,10 @@ impl CerberusApp {
 
     /// Backdrop and panel. `body` is the area below the top bar and the banner strip.
     pub(super) fn draw_drawer(&mut self, ctx: &egui::Context, body: egui::Rect) {
+        if self.drawer_open && !self.drawer_was_open {
+            self.rescan_languages();
+        }
+        self.drawer_was_open = self.drawer_open;
         let t = ctx.animate_bool_with_time(egui::Id::unique("settings-drawer"), self.drawer_open, SLIDE_SECONDS);
         if t <= 0.0 {
             return;
@@ -317,7 +433,7 @@ impl CerberusApp {
         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
         // Footer first (bottom-up), so the scroll area takes the rest.
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.add(egui::Label::new(RichText::new(footer_text(self.state.settings_path.as_deref())).size(11.0).color(MUTED)));
+            ui.add(egui::Label::new(RichText::new(footer_text(self.state.settings_path.as_deref(), self.state.settings.keys_plaintext)).size(11.0).color(MUTED)));
             ui.add(egui::Separator::default().spacing(4.0));
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.horizontal(|ui| {
@@ -354,6 +470,10 @@ impl CerberusApp {
             warn(ui, "Speichern nicht möglich: Die Umgebungsvariable LOCALAPPDATA ist nicht gesetzt, es gibt keinen Ort für die Einstellungen.");
         }
 
+        // -- Sprache
+        section_title(ui, "Sprache");
+        self.draw_language_section(ui);
+
         // -- Schlüssel
         section_title(ui, "Schlüssel");
         ui.label("API-Key");
@@ -363,6 +483,19 @@ impl CerberusApp {
         ui.label("Admin-Key");
         self.draw_key_row(ui, Slot::AdminKey, "sk-ant-admin01-…");
         hint(ui, "Nur für die Kosten-API, braucht ein Organisations-Konto. Liefert die echten Kosten von Anthropic.");
+        ui.add_space(6.0);
+        ui.add_enabled_ui(can_save, |ui| {
+            let mut on = self.state.settings.keys_plaintext;
+            if ui.checkbox(&mut on, "Keys im Klartext speichern").changed() {
+                if on {
+                    self.plaintext_confirm_open = true;
+                } else {
+                    self.apply_plaintext(false);
+                }
+            }
+        });
+        hint(ui, PLAINTEXT_HINT);
+        field_note(ui, self.note(NoteKey::Plaintext));
 
         // -- Guthaben
         let title = section_title(ui, "Guthaben");
@@ -401,16 +534,63 @@ impl CerberusApp {
         ui.add_space(8.0);
     }
 
+    fn draw_language_section(&mut self, ui: &mut egui::Ui) {
+        let current = crate::i18n::current_code();
+        let shown = self
+            .languages
+            .iter()
+            .find(|l| l.code.eq_ignore_ascii_case(&current))
+            .map_or_else(|| current.clone(), |l| l.name.clone());
+        let saved = self.state.settings.language.clone();
+        let mut chosen = None;
+        let mut open_folder = false;
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("language-choice").selected_text(shown).width(170.0).show_ui(ui, |ui| {
+                for lang in &self.languages {
+                    let is_current = lang.code.eq_ignore_ascii_case(&current);
+                    if ui.selectable_label(is_current, &lang.name).clicked() {
+                        // A pick of the language already saved is not a change; a pick of the one in use
+                        // that is not saved yet (system default) pins it.
+                        if !saved.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&lang.code)) {
+                            chosen = Some(lang.code.clone());
+                        }
+                    }
+                }
+            });
+            open_folder = ui.button("Sprachordner öffnen").clicked();
+        });
+        if let Some(code) = chosen {
+            self.apply_language(&code);
+        }
+        if open_folder {
+            match open_lang_folder() {
+                Ok(()) => {
+                    self.notes.remove(&NoteKey::Language);
+                }
+                Err(text) => self.set_note(NoteKey::Language, NoticeKind::Error, text),
+            }
+        }
+        field_note(ui, self.note(NoteKey::Language));
+        for problem in &self.lang_problems {
+            ui.add(egui::Label::new(RichText::new(format!("{}: {}", problem.file, problem.reason)).size(12.0).color(AMBER)));
+        }
+        hint(ui, "Eigene Sprachdateien (.json) kommen in den Sprachordner und erscheinen, sobald die Einstellungen neu geöffnet werden.");
+    }
+
     fn draw_key_row(&mut self, ui: &mut egui::Ui, slot: Slot, hint_text: &str) {
-        let (stored, id) = (
-            match slot {
-                Slot::ApiKey => self.state.key_stored,
-                Slot::AdminKey => self.state.admin_key_stored,
-            },
-            key_field_id(slot),
-        );
-        let status_color = if stored == Some(true) { CYAN } else { MUTED };
-        ui.label(RichText::new(key_status_text(stored)).color(status_color));
+        let (stored, undecryptable) = match slot {
+            Slot::ApiKey => (self.state.key_stored, self.state.key_undecryptable),
+            Slot::AdminKey => (self.state.admin_key_stored, self.state.admin_key_undecryptable),
+        };
+        let id = key_field_id(slot);
+        let status_color = if undecryptable {
+            AMBER
+        } else if stored == Some(true) {
+            CYAN
+        } else {
+            MUTED
+        };
+        ui.add(egui::Label::new(RichText::new(key_status_line(stored, undecryptable)).color(status_color)));
         let mut save = false;
         let mut delete = false;
         let input = self.input_mut(slot);
@@ -518,14 +698,78 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn footer_names_the_file_and_the_store_and_never_a_key() {
+    fn footer_names_the_config_not_the_credential_store() {
         let p = PathBuf::from(r"C:\Users\x\AppData\Local\CerberusUsage\settings.json");
-        let text = footer_text(Some(&p));
+        let text = footer_text(Some(&p), false);
         assert!(text.starts_with("Einstellungen: C:\\Users\\x"), "{text}");
-        assert!(text.contains("settings.json") && text.ends_with("Keys: Windows-Anmeldeinformationsspeicher"), "{text}");
-        assert!(!text.contains("sk-ant"));
-        let none = footer_text(None);
-        assert!(none.contains("LOCALAPPDATA") && none.contains("Keys: Windows-Anmeldeinformationsspeicher"), "{none}");
+        assert!(text.contains("settings.json") && text.ends_with("Keys: in dieser Datei, verschlüsselt"), "{text}");
+        assert!(!text.contains("sk-ant") && !text.contains("Anmeldeinformationsspeicher"));
+        assert!(footer_text(Some(&p), true).ends_with("Keys: in dieser Datei, im Klartext"));
+        let none = footer_text(None, false);
+        assert!(none.contains("LOCALAPPDATA") && none.contains("Keys: in dieser Datei"), "{none}");
+        assert!(!none.contains("Anmeldeinformationsspeicher"), "{none}");
+    }
+
+    #[test]
+    fn plaintext_texts_are_honest_about_what_encryption_protects_against() {
+        // The warning names what becomes readable and where the copies end up.
+        assert!(PLAINTEXT_WARNING.contains("lesbar") && PLAINTEXT_WARNING.contains("Backups"));
+        // The default does not claim protection from other programs of the same Windows user.
+        assert!(PLAINTEXT_HINT.contains("mitgenommen") && PLAINTEXT_HINT.contains("trotzdem lesen"));
+        assert!(!PLAINTEXT_HINT.contains('\u{2014}') && !PLAINTEXT_WARNING.contains('\u{2014}'));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cu-drawer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_language_choice_applies_at_once_and_is_saved() {
+        crate::i18n::isolate();
+        let dir = temp_dir("choice-ok");
+        let path = dir.join("settings.json");
+        let saved = choose_language(Some(&path), "en").unwrap();
+        assert_eq!(saved.language.as_deref(), Some("en"));
+        assert_eq!(crate::i18n::current_code(), "en");
+        assert_eq!(crate::settings::load(&path).0.language.as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_still_changes_the_language_for_the_session_and_says_so() {
+        crate::i18n::isolate();
+        let dir = temp_dir("choice-broken");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = choose_language(Some(&path), "en").unwrap_err();
+        assert!(err.contains("nur bis zum Beenden"), "{err}");
+        assert_eq!(crate::i18n::current_code(), "en");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "a broken file is never overwritten");
+        let none = choose_language(None, "en").unwrap_err();
+        assert!(none.contains("nur bis zum Beenden"), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explorer_gets_the_folder_as_one_plain_argument() {
+        let weird = PathBuf::from(r"C:\Users\a b\x & calc.exe\lang");
+        let cmd = explorer_command(&weird);
+        assert_eq!(cmd.get_program(), "explorer.exe");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, [weird.as_os_str()]);
+    }
+
+    #[test]
+    fn opening_the_language_folder_creates_it_when_missing() {
+        let dir = temp_dir("open").join("lang");
+        assert!(!dir.exists());
+        let cmd = open_folder_command(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(cmd.get_args().count(), 1);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]

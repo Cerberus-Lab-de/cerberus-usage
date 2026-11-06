@@ -97,6 +97,9 @@ pub struct AppState {
     /// Content of the masked admin-key field; same rules as `key_input`.
     pub admin_key_input: String,
     pub admin_key_stored: Option<bool>,
+    /// The stored key is in the settings file but cannot be decrypted here (other PC or user).
+    pub key_undecryptable: bool,
+    pub admin_key_undecryptable: bool,
     /// Last settings read from the file (for the cards and the lists in the settings panel).
     pub settings: Settings,
     pub settings_path: Option<PathBuf>,
@@ -133,6 +136,8 @@ impl AppState {
             key_stored: None,
             admin_key_input: String::new(),
             admin_key_stored: None,
+            key_undecryptable: false,
+            admin_key_undecryptable: false,
             settings: Settings::default(),
             settings_path: None,
             baseline_input: String::new(),
@@ -181,7 +186,9 @@ impl AppState {
 
     /// Shows the one-time note from loading the saved state, unless a notice is already up.
     pub fn show_state_note_once(&mut self, note: Option<&str>) {
-        if self.state_note_shown {
+        // An existing notice (for example "move failed, key not lost") is never replaced; the note
+        // waits and is shown once the notice is gone.
+        if self.state_note_shown || self.notice.is_some() {
             return;
         }
         if let Some(text) = note {
@@ -324,9 +331,28 @@ fn move_notice_text(result: &MigrationResult) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
-/// Presence check only; the value is dropped immediately.
+/// Start-up language: reads the language folder, then applies the saved choice. A choice without a
+/// matching file (removed or broken) falls back to the default language and leaves the settings
+/// file untouched, so the choice comes back when the file does. Returns the files that were skipped.
+fn apply_startup_language(settings: &Settings, dir: Option<&Path>) -> Vec<crate::i18n::LangProblem> {
+    let problems = dir.map(crate::i18n::scan_folder).unwrap_or_default();
+    crate::i18n::set_language(settings.language.as_deref());
+    problems
+}
+
+/// Presence check only; the value is dropped immediately. (The app uses [`key_check`]; tests use this.)
+#[cfg(test)]
 fn key_stored(store: &dyn SecretStore, slot: Slot) -> Option<bool> {
     store.get(slot).ok().map(|v| v.is_some())
+}
+
+/// Presence check plus whether the key is there but cannot be decrypted. The value is dropped at once.
+fn key_check(store: &dyn SecretStore, slot: Slot) -> (Option<bool>, bool) {
+    match store.get(slot) {
+        Ok(v) => (Some(v.is_some()), false),
+        Err(SecretError::NotDecryptable) => (None, true),
+        Err(_) => (None, false),
+    }
 }
 
 /// Fixed id of a key field, so its widget state can be found again.
@@ -359,6 +385,15 @@ fn amount_input(nano: Option<u64>) -> String {
 
 /// Status line of a key slot. An unreadable store must not look like "no key".
 pub fn key_status_text(stored: Option<bool>) -> &'static str {
+    key_status_line(stored, false)
+}
+
+/// Like [`key_status_text`], but a key that is stored and cannot be decrypted on this PC or user says so
+/// and asks for a new input instead of looking like an unreadable store.
+pub fn key_status_line(stored: Option<bool>, undecryptable: bool) -> &'static str {
+    if undecryptable {
+        return "gespeichert, aber hier nicht entschlüsselbar (anderer PC oder Benutzer). Bitte neu eingeben";
+    }
     match stored {
         Some(true) => "gespeichert",
         Some(false) => "nicht gespeichert",
@@ -526,6 +561,13 @@ pub struct CerberusApp {
     grow: GrowState,
     /// Last state of the update checker and its dialogs.
     update: updates::UpdateUi,
+    /// The warning before keys are stored as plain text is open.
+    plaintext_confirm_open: bool,
+    /// Languages offered in the drawer and files that were skipped; read when the drawer opens.
+    languages: Vec<crate::i18n::LangInfo>,
+    lang_problems: Vec<crate::i18n::LangProblem>,
+    /// The drawer was open in the previous frame (a change to open triggers the folder scan).
+    drawer_was_open: bool,
 }
 
 /// A request younger than this may not have reached the window yet.
@@ -582,13 +624,15 @@ impl CerberusApp {
         // Read once here; the per-frame code only looks at the cached flags.
         let store = key_store(settings_path.as_deref());
         let mut state = AppState::new();
-        state.key_stored = key_stored(&*store, Slot::ApiKey);
-        state.admin_key_stored = key_stored(&*store, Slot::AdminKey);
+        (state.key_stored, state.key_undecryptable) = key_check(&*store, Slot::ApiKey);
+        (state.admin_key_stored, state.admin_key_undecryptable) = key_check(&*store, Slot::AdminKey);
         state.settings_path = settings_path.clone();
         if let Some(text) = move_notice_text(&failed_moves) {
             state.set_notice(Some(Notice { kind: NoticeKind::Error, text }));
         }
         state.reload_settings();
+        // Reads the language folder once and picks the language; never writes the settings file.
+        let lang_problems = apply_startup_language(&state.settings, crate::i18n::app_lang_dir().as_deref());
         let paths = PathsPanel::new(&state.settings);
         let logo = cc.egui_ctx.load_texture(
             "logo",
@@ -623,6 +667,10 @@ impl CerberusApp {
             requested_at: None,
             grow: GrowState::default(),
             update: updates::UpdateUi::new(update_tx, update_rx, launch_flag),
+            plaintext_confirm_open: false,
+            languages: crate::i18n::available(),
+            lang_problems,
+            drawer_was_open: false,
         }
     }
 
@@ -722,8 +770,8 @@ impl CerberusApp {
 
     fn set_stored(&mut self, slot: Slot, stored: bool) {
         match slot {
-            Slot::ApiKey => self.state.key_stored = Some(stored),
-            Slot::AdminKey => self.state.admin_key_stored = Some(stored),
+            Slot::ApiKey => (self.state.key_stored, self.state.key_undecryptable) = (Some(stored), false),
+            Slot::AdminKey => (self.state.admin_key_stored, self.state.admin_key_undecryptable) = (Some(stored), false),
         }
     }
 }
@@ -785,6 +833,7 @@ impl eframe::App for CerberusApp {
         self.draw_confirm(&ctx);
         let launch_running = self.launch_running();
         self.update.draw_confirm(&ctx, launch_running);
+        self.draw_plaintext_confirm(&ctx);
         self.text_focused_last_frame = ctx.egui_wants_keyboard_input();
     }
 }
@@ -836,11 +885,13 @@ impl CerberusApp {
             return;
         }
         match esc_target(
+            self.plaintext_confirm_open,
             self.update.confirm_is_open(),
             self.state.confirm.is_some(),
             self.drawer_open,
             self.detail.is_some(),
         ) {
+            EscTarget::PlaintextConfirm => self.plaintext_confirm_open = false,
             EscTarget::UpdateConfirm => self.update.cancel_confirm(),
             EscTarget::Confirm => self.state.confirm = None,
             EscTarget::Drawer => self.drawer_open = false,
@@ -1247,6 +1298,72 @@ mod tests {
         s.notice = None;
         s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
         assert!(s.notice.is_none(), "dismissed notes do not come back with every snapshot");
+    }
+
+    #[test]
+    fn an_existing_notice_is_not_replaced_by_the_state_note() {
+        let mut s = AppState::new();
+        s.set_notice(Some(Notice { kind: NoticeKind::Error, text: "Umzug nicht gelungen, Key geht nicht verloren".to_string() }));
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "Umzug nicht gelungen, Key geht nicht verloren");
+        assert_eq!(s.notice.as_ref().unwrap().kind, NoticeKind::Error);
+        // The note was not used up: it shows once the notice is gone.
+        s.dismiss_notice();
+        s.show_state_note_once(Some("alte Datei zur Seite gelegt"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "alte Datei zur Seite gelegt");
+    }
+
+    #[test]
+    fn key_field_says_when_a_key_cannot_be_read() {
+        let text = key_status_line(None, true);
+        assert!(text.contains("nicht entschlüsselbar") && text.contains("neu eingeben"), "{text}");
+        assert_ne!(text, key_status_text(None), "not the generic unreadable-store text");
+        assert_eq!(key_status_line(Some(true), false), "gespeichert");
+        assert_eq!(key_status_line(None, false), "Speicher nicht lesbar");
+    }
+
+    #[test]
+    fn a_foreign_key_is_told_apart_from_an_unreadable_store() {
+        struct Scripted(SecretError);
+        impl SecretStore for Scripted {
+            fn get(&self, _s: Slot) -> Result<Option<String>, SecretError> {
+                Err(self.0)
+            }
+            fn set(&self, _s: Slot, _v: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+            fn delete(&self, _s: Slot) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        assert_eq!(key_check(&Scripted(SecretError::NotDecryptable), Slot::ApiKey), (None, true));
+        assert_eq!(key_check(&Scripted(SecretError::ConfigUnreadable), Slot::ApiKey), (None, false));
+    }
+
+    #[test]
+    fn missing_language_file_leaves_the_config_alone() {
+        crate::i18n::isolate();
+        let dir = std::env::temp_dir().join(format!("cu-startup-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let raw = br#"{"language":"xx","check_updates":false}"#;
+        std::fs::write(&path, raw).unwrap();
+        let (settings, error) = crate::settings::load(&path);
+        assert!(error.is_none());
+        assert_eq!(settings.language.as_deref(), Some("xx"));
+
+        // No lang folder next to the test either.
+        let problems = apply_startup_language(&settings, Some(&dir.join("lang")));
+        assert!(problems.is_empty());
+        // Falls back to a shipped language and keeps answering.
+        let code = crate::i18n::current_code();
+        assert!(code == "de" || code == "en", "{code}");
+        assert!(!crate::i18n::tr("format.date").is_empty());
+        assert_ne!(crate::i18n::tr("format.date"), "format.date");
+        // The choice stays in the file, byte for byte, so it returns with the language file.
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -222,6 +222,11 @@ pub fn with_topup(s: &Settings, input: &str, now: DateTime<Utc>) -> Result<Setti
     Ok(out)
 }
 
+/// The settings with the language the user picked in the drawer. Nothing else changes.
+pub fn with_chosen_language(s: &Settings, code: &str) -> Settings {
+    Settings { language: Some(code.to_string()), ..s.clone() }
+}
+
 /// Removes the first top-up equal to `entry`. `None` when the file no longer has it (changed meanwhile).
 pub fn without_topup(s: &Settings, entry: &TopUp) -> Option<Settings> {
     let index = s.topups.iter().position(|t| t == entry)?;
@@ -266,6 +271,18 @@ pub fn update_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choosing_a_language_stores_its_code() {
+        let before = Settings { keys_plaintext: true, monthly_budget_nano: Some(5), ..Settings::default() };
+        let after = with_chosen_language(&before, "en");
+        assert_eq!(after.language.as_deref(), Some("en"));
+        // Everything else is carried over untouched.
+        assert!(after.keys_plaintext);
+        assert_eq!(after.monthly_budget_nano, Some(5));
+        assert_eq!(with_chosen_language(&after, "de").language.as_deref(), Some("de"));
+        assert_eq!(before.language, None, "the input is not changed");
+    }
     use crate::analytics::{ApiError, ApiStatus};
     use crate::balance::{Alert, BalanceStatus};
     use crate::settings::{Baseline, Settings, TopUp};
