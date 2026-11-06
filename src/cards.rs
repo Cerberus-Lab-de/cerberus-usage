@@ -177,8 +177,17 @@ pub fn alert_banner_text(alert: &Alert) -> Option<&'static str> {
 
 /// Whether a text field commits now: only a user-edited, changed value, and only on Enter or blur.
 /// Half-typed input never reaches the file because nothing commits while the field has focus.
+/// "Changed" compares the parsed amounts, so `65,03` against a stored `65.03` is no change.
 pub fn should_commit(edited: bool, lost_focus: bool, enter: bool, input: &str, current: &str) -> bool {
-    edited && input != current && (lost_focus || enter)
+    edited && !same_amount(input, current) && (lost_focus || enter)
+}
+
+/// True when both texts are valid amounts with the same nano value, or are the same text.
+fn same_amount(input: &str, current: &str) -> bool {
+    match (parse_committed_nano(input), parse_committed_nano(current)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => input == current,
+    }
 }
 
 /// Amount for a *commit* (baseline, top-up, limits). Stricter than [`parse_usd_nano`]: a dangling
@@ -512,6 +521,13 @@ mod tests {
     fn commit_only_on_enter_or_blur_with_change() {
         // Unchanged text that loses focus: nothing to save.
         assert!(!should_commit(true, true, false, "65.03", "65.03"));
+        // Same value in the other decimal notation: no commit, so the baseline date stays.
+        assert!(!should_commit(true, true, false, "65,03", "65.03"));
+        assert!(!should_commit(true, false, true, "65.03", "65,03"));
+        assert!(!should_commit(true, true, false, "65,30", "65.3"));
+        assert!(should_commit(true, true, false, "65,04", "65.03"));
+        // Not a valid amount is never "the same": it commits so the error is shown.
+        assert!(should_commit(true, true, false, "65.", "65"));
         // Changed but still typing: no commit.
         assert!(!should_commit(true, false, false, "65.0", "65.03"));
         // Changed and Enter / blur: commit.
