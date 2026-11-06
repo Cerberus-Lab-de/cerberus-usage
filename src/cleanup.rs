@@ -49,13 +49,21 @@ pub fn data_dir() -> std::path::PathBuf {
     default_data_dir().unwrap_or_else(|| std::env::temp_dir().join("CerberusUsage"))
 }
 
+/// Process exit code of `--uninstall-cleanup`: 0 when everything was removed, 1 otherwise. The
+/// uninstaller shows a message for any other code than 0.
+pub fn exit_code(problems: &[String]) -> i32 {
+    if problems.is_empty() { 0 } else { 1 }
+}
+
 /// Entry point for `--uninstall-cleanup`: runs the cleanup and logs leftovers to `crash.log`
 /// only when the data folder survived (otherwise there would be nowhere to put the log).
-pub fn run_uninstall_cleanup() {
-    let Some(dir) = default_data_dir() else { return };
+/// Returns the exit code for the uninstaller (see [`exit_code`]).
+pub fn run_uninstall_cleanup() -> i32 {
+    let Some(dir) = default_data_dir() else { return 1 };
     let problems = uninstall_cleanup(&crate::secrets::KeyringStore::new(), &dir);
+    let code = exit_code(&problems);
     if problems.is_empty() || !dir.exists() {
-        return;
+        return code;
     }
     if let Some(log) = crate::crash::log_path() {
         let now = chrono::Local::now();
@@ -63,6 +71,7 @@ pub fn run_uninstall_cleanup() {
             let _ = crate::crash::append_entry(&log, &crate::crash::format_entry(now, None, &line));
         }
     }
+    code
 }
 
 #[cfg(test)]
@@ -106,6 +115,17 @@ mod tests {
         assert!(!data.exists());
         assert!(sibling.exists(), "sibling directory must stay");
         assert_eq!(*store.deleted.borrow(), vec![Slot::ApiKey, Slot::AdminKey]);
+    }
+
+    #[test]
+    fn exit_code_is_zero_only_without_problems() {
+        assert_eq!(exit_code(&[]), 0);
+        assert_eq!(exit_code(&["Datenordner konnte nicht gelöscht werden".to_string()]), 1);
+        // A failed cleanup run reports a non-zero code through the same path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FakeStore { fail: true, ..Default::default() };
+        let problems = uninstall_cleanup(&store, &tmp.path().join("CerberusUsage"));
+        assert_eq!(exit_code(&problems), 1);
     }
 
     #[test]

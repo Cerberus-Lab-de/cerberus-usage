@@ -5,8 +5,7 @@ use cerberus_usage::{cleanup, crash, single_instance, ui};
 fn main() -> eframe::Result {
     // Only flag: run by the uninstaller after the user agreed. No window, no single-instance lock.
     if std::env::args_os().nth(1).is_some_and(|a| a == "--uninstall-cleanup") {
-        cleanup::run_uninstall_cleanup();
-        return Ok(());
+        std::process::exit(cleanup::run_uninstall_cleanup());
     }
     crash::install_panic_hook();
     if !single_instance::acquire_app() {

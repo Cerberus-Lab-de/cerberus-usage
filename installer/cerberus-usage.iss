@@ -49,6 +49,8 @@ german.AskRemoveData=Einstellungen, Zählerstand und gespeicherte Keys ebenfalls
 english.TaskAutostart=Start Cerberus Usage with Windows
 english.RunApp=Start Cerberus Usage
 english.AskRemoveData=Also remove settings, balance data and stored keys?
+german.CleanupFailed=Einstellungen oder gespeicherte Keys konnten nicht vollständig entfernt werden. Bitte prüfen: Ordner AppData\Local\CerberusUsage und im Windows-Anmeldeinformationsspeicher die Einträge „cerberus-usage“.
+english.CleanupFailed=Settings or stored keys could not be removed completely. Please check the folder AppData\Local\CerberusUsage and the "cerberus-usage" entries in the Windows Credential Manager.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -82,9 +84,11 @@ function IsAppRunning: Boolean;
 var
   ResultCode: Integer;
 begin
-  // find sets errorlevel 0 when the image name is listed.
+  // find sets errorlevel 0 when the image name is listed. Both tools by full System32 path: a
+  // lookalike earlier in PATH (Unix tools) must not decide whether the app is running. The doubled
+  // quote at the start and the single one at the end are cmd's own outer pair.
   Result := Exec(ExpandConstant('{cmd}'),
-    '/C tasklist /FI "IMAGENAME eq {#AppExe}" /NH | find /I "{#AppExe}" >nul',
+    ExpandConstant('/C ""{sys}\tasklist.exe" /FI "IMAGENAME eq {#AppExe}" /NH | "{sys}\find.exe" /I "{#AppExe}" >nul"'),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
@@ -127,7 +131,12 @@ begin
     if not UninstallSilent then
     begin
       if MsgBox(ExpandConstant('{cm:AskRemoveData}'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-        Exec(ExpandConstant('{app}\{#AppExe}'), '--uninstall-cleanup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      begin
+        // Exit code 0 = everything removed. A failed start or any other code is shown, not swallowed.
+        if not (Exec(ExpandConstant('{app}\{#AppExe}'), '--uninstall-cleanup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+                and (ResultCode = 0)) then
+          MsgBox(ExpandConstant('{cm:CleanupFailed}'), mbError, MB_OK);
+      end;
     end;
   end;
 end;
