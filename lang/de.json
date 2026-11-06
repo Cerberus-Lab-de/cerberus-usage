@@ -1,0 +1,6 @@
+{
+  "_meta": { "code": "de", "name": "Deutsch", "format": 1 },
+  "format.thousands": ".",
+  "format.date": "%d.%m.%Y",
+  "format.datetime": "%d.%m.%Y %H:%M:%S"
+}
