@@ -128,6 +128,15 @@ fn bucket_lines(b: &Bucket) -> Vec<(String, bool)> {
     lines
 }
 
+/// Lines of the 5-hour card: its own first line, plus the unpriced hint when a number is too low.
+fn last_5h_lines(b: &Bucket, first: String) -> Vec<(String, bool)> {
+    let mut lines = vec![(first, false)];
+    if let Some(text) = unpriced_text(b.unpriced_requests) {
+        lines.push((text, true));
+    }
+    lines
+}
+
 /// The four cards: Heute, Monat, Guthaben, Max (or the pause). `balance_issue`: the balance has a
 /// note or an error that the opened area explains.
 pub fn figures(report: &Report, balance: &BalanceCard, balance_issue: bool) -> Vec<Figure> {
@@ -156,14 +165,14 @@ pub fn figures(report: &Report, balance: &BalanceCard, balance_issue: bool) -> V
             label: "MAX",
             value: "pausiert".to_string(),
             value_warn: true,
-            lines: vec![(format!("letzte 5 Std. {}", figure_value(&report.last_5h)), false)],
+            lines: last_5h_lines(&report.last_5h, format!("letzte 5 Std. {}", figure_value(&report.last_5h))),
         },
         None => Figure {
             kind: DetailKind::Max,
             label: "LETZTE 5 STD.",
             value: figure_value(&report.last_5h),
             value_warn: false,
-            lines: vec![(format!("{} Anfragen", format_count(report.last_5h.requests)), false)],
+            lines: last_5h_lines(&report.last_5h, format!("{} Anfragen", format_count(report.last_5h.requests))),
         },
     };
     vec![
@@ -361,6 +370,21 @@ mod tests {
         assert!(f[0].lines.iter().any(|(t, _)| t == COST_NOTE));
         assert!(!f[0].lines.iter().any(|(_, warn)| *warn), "today had every request priced");
         assert!(f[1].lines.iter().any(|(t, warn)| *warn && t == "2 Anfragen nicht bewertet"));
+    }
+
+    #[test]
+    fn the_five_hour_card_carries_the_unpriced_hint_too() {
+        let mut r = report();
+        let clean = figures(&r, &estimate(true), false);
+        assert!(!clean[3].lines.iter().any(|(_, warn)| *warn));
+        r.last_5h.unpriced_requests = 3;
+        let f = figures(&r, &estimate(true), false);
+        assert_eq!(f[3].label, "LETZTE 5 STD.");
+        assert!(f[3].lines.iter().any(|(t, warn)| *warn && t == "3 Anfragen nicht bewertet"));
+        // The paused Max card shows the same number, so it carries the hint as well.
+        r.pause = Some(Pause { until: Utc::now(), limit_type: "five_hour".into() });
+        let paused = figures(&r, &estimate(true), false);
+        assert!(paused[3].lines.iter().any(|(t, warn)| *warn && t == "3 Anfragen nicht bewertet"));
     }
 
     #[test]
