@@ -1,7 +1,11 @@
 [package]
 name = "cerberus-usage"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Windows tray app that starts Obsidian with a Claude Max subscription or an API key and shows usage and cost."
+license = "MIT"
+repository = "https://github.com/Cerberus-Lab-de/cerberus-usage"
+rust-version = "1.95"
 
 [lib]
 name = "cerberus_usage"
@@ -11,6 +15,10 @@ path = "src/lib.rs"
 name = "cerberus-usage"
 path = "src/main.rs"
 
+[[bin]]
+name = "sign-release"
+path = "src/bin/sign-release.rs"
+
 [dependencies]
 eframe = "0.37"
 tray-icon = "0.26"
@@ -19,5 +27,17 @@ ureq = { version = "3", features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+memchr = "2"
+rfd = "0.17"
+ed25519-dalek = "3"
+sha2 = "0.11"
+semver = { version = "1", features = ["serde"] }
+zeroize = "1"
+getrandom = "0.4"
 
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+winresource = "0.1"
