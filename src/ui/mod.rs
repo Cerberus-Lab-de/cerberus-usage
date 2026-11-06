@@ -530,6 +530,9 @@ impl CerberusApp {
             },
             Box::new(move || notify_ctx.request_repaint()),
         );
+        // The previous update's installer is no longer needed (best effort; a setup that is still
+        // shutting down may hold it, then the next start gets it).
+        crate::update::clean_update_dir(&data_dir);
         let update_ctx = ctx.clone();
         let launch_flag = Arc::new(AtomicBool::new(false));
         let (update_tx, update_rx) = spawn_update_checker(
@@ -996,8 +999,7 @@ fn format_time(t: DateTime<Local>) -> String {
 // ---- startup -------------------------------------------------------------------------------------
 
 fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("CerberusUsage")
+    crate::cleanup::data_dir()
 }
 
 /// Opens the window and the tray icon and runs until "Beenden".

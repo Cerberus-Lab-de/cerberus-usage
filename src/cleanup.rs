@@ -44,6 +44,11 @@ pub fn default_data_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|p| std::path::PathBuf::from(p).join("CerberusUsage"))
 }
 
+/// The app's data folder; without `LOCALAPPDATA` a folder below the system temp directory.
+pub fn data_dir() -> std::path::PathBuf {
+    default_data_dir().unwrap_or_else(|| std::env::temp_dir().join("CerberusUsage"))
+}
+
 /// Entry point for `--uninstall-cleanup`: runs the cleanup and logs leftovers to `crash.log`
 /// only when the data folder survived (otherwise there would be nowhere to put the log).
 pub fn run_uninstall_cleanup() {

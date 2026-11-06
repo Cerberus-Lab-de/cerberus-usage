@@ -213,10 +213,19 @@ const USER_AGENT: &str = concat!("cerberus-usage/", env!("CARGO_PKG_VERSION"));
 pub const MAX_JSON_BYTES: usize = 1024 * 1024;
 /// Largest accepted installer.
 pub const MAX_INSTALLER_BYTES: usize = 200 * 1024 * 1024;
+/// Overall limit for the small requests (release lookup, manifest).
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overall limit for the installer download (7-8 MB; must work on a slow line).
+const INSTALLER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Which overall limit a request gets: JSON-sized bodies 60 s, installer-sized bodies 30 min.
+fn request_timeout(max_bytes: usize) -> Duration {
+    if max_bytes > MAX_JSON_BYTES { INSTALLER_TIMEOUT } else { UPDATE_TIMEOUT }
+}
 const INSTALLER_PREFIX: &str = "CerberusUsage-Setup-";
 
-/// HTTP client for updates: HTTPS only, up to 5 redirects, 60 s overall, bounded bodies.
+/// HTTP client for updates: HTTPS only, up to 5 redirects, 60 s overall (30 min for the installer),
+/// bounded bodies.
 /// It never sends credentials: `get_bytes` forwards exactly the headers it is given and adds none
 /// itself (no cookies, no auth, no default headers configured on the agent).
 pub struct UpdateHttp {
@@ -254,7 +263,12 @@ impl Http for UpdateHttp {
         headers: &[(&str, &str)],
         max_bytes: usize,
     ) -> Result<(u16, Vec<u8>), NetError> {
-        let mut request = self.agent.get(url);
+        let mut request = self
+            .agent
+            .get(url)
+            .config()
+            .timeout_global(Some(request_timeout(max_bytes)))
+            .build();
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -366,14 +380,20 @@ pub fn latest_release(http: &dyn Http, current: &Version) -> Result<Option<Relea
     Ok(Some(Release { version, notes_url: dto.html_url, installer_url, manifest_url }))
 }
 
-/// `%TEMP%\CerberusUsage-update` below the given temp directory.
-pub fn update_dir_in(temp: &Path) -> PathBuf {
-    temp.join("CerberusUsage-update")
+/// `updates` below the given data directory (`%LOCALAPPDATA%\CerberusUsage\updates`).
+pub fn update_dir_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("updates")
 }
 
-/// Download directory below the system temp directory.
+/// Download directory below the app's data directory.
 pub fn default_update_dir() -> PathBuf {
-    update_dir_in(&std::env::temp_dir())
+    update_dir_in(&crate::cleanup::data_dir())
+}
+
+/// Deletes the download folder at app start (best effort, errors are ignored: a setup that is
+/// still shutting down may hold its file). Only `updates` below the given data directory.
+pub fn clean_update_dir(data_dir: &Path) {
+    let _ = std::fs::remove_dir_all(update_dir_in(data_dir));
 }
 
 fn is_old_installer(name: &str) -> bool {
@@ -469,9 +489,22 @@ pub fn recheck_installer(path: &Path, sha256: &str) -> Result<(), UpdateError> {
     Err(UpdateError::ChecksumMismatch)
 }
 
-/// Silent installer switches; `/UPDATE=1` tells the setup that this is an update.
-pub fn installer_args() -> [&'static str; 5] {
-    ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/UPDATE=1"]
+/// Silent installer switches; `/UPDATE=1` tells the setup that this is an update, `/LOG=` makes it
+/// write a log (a failing silent install is otherwise invisible: the app has already quit).
+pub fn installer_args(log: &Path) -> Vec<String> {
+    vec![
+        "/VERYSILENT".to_string(),
+        "/SUPPRESSMSGBOXES".to_string(),
+        "/NORESTART".to_string(),
+        "/CLOSEAPPLICATIONS".to_string(),
+        "/UPDATE=1".to_string(),
+        format!("/LOG=\"{}\"", log.display()),
+    ]
+}
+
+/// `%LOCALAPPDATA%\CerberusUsage\update-install.log`.
+fn installer_log_path() -> PathBuf {
+    crate::cleanup::data_dir().join("update-install.log")
 }
 
 /// Starts the verified installer (no shell, fixed arguments) and does not wait for it.
@@ -481,7 +514,13 @@ pub fn run_installer(path: &Path) -> io::Result<()> {
     if !path.is_absolute() || !name_ok {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "ungültiger Installer-Pfad"));
     }
-    std::process::Command::new(path).args(installer_args()).spawn().map(|_| ())
+    use std::os::windows::process::CommandExt;
+    let log = installer_log_path();
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // raw_arg: the installer wants `/LOG="path"` with the quotes around the path only.
+    std::process::Command::new(path).raw_arg(installer_args(&log).join(" ")).spawn().map(|_| ())
 }
 
 #[cfg(test)]
@@ -970,13 +1009,45 @@ mod tests {
 
     #[test]
     fn installer_args_and_dirs() {
+        let log = Path::new(r"C:\Users\x y\AppData\Local\CerberusUsage\update-install.log");
         assert_eq!(
-            installer_args(),
-            ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/UPDATE=1"]
+            installer_args(log),
+            [
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/CLOSEAPPLICATIONS",
+                "/UPDATE=1",
+                r#"/LOG="C:\Users\x y\AppData\Local\CerberusUsage\update-install.log""#,
+            ]
         );
-        let d = update_dir_in(Path::new("C:\\Temp"));
-        assert!(d.ends_with("CerberusUsage-update"));
+        let d = update_dir_in(Path::new(r"C:\Data\CerberusUsage"));
+        assert_eq!(d, Path::new(r"C:\Data\CerberusUsage\updates"));
         assert!(default_update_dir().is_absolute());
+        assert!(default_update_dir().ends_with(r"CerberusUsage\updates"));
+        assert!(installer_log_path().ends_with(r"CerberusUsage\update-install.log"));
+    }
+
+    #[test]
+    fn installer_download_gets_a_long_limit_and_small_requests_keep_sixty_seconds() {
+        assert_eq!(request_timeout(MAX_JSON_BYTES), Duration::from_secs(60));
+        assert_eq!(request_timeout(MAX_INSTALLER_BYTES), Duration::from_secs(30 * 60));
+        assert_eq!(request_timeout(0), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_the_updates_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let updates = update_dir_in(data.path());
+        std::fs::create_dir_all(&updates).unwrap();
+        std::fs::write(updates.join("CerberusUsage-Setup-1.0.1.exe"), b"old").unwrap();
+        std::fs::write(data.path().join("settings.json"), b"{}").unwrap();
+        clean_update_dir(data.path());
+        assert!(!updates.exists());
+        assert!(data.path().join("settings.json").exists());
+        // Nothing to delete is fine too.
+        clean_update_dir(data.path());
+        clean_update_dir(&data.path().join("missing"));
     }
 
     #[test]
